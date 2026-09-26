@@ -134,3 +134,14 @@ jobs:
           cmake -S tests/sync_stress -B build-sync -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
           cmake --build build-sync --target test_cond_semantics
           ctest --test-dir build-sync -R "^cond_" --output-on-failure
+
+      - name: Build eboot_port (Game Port)
+        run: |
+          cmake -S eboot_port -B eboot_port/build -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          cmake --build eboot_port/build
+
+      - name: Upload eboot_port Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MyGameRecomp-Windows-${{ matrix.build_type }}
+          path: eboot_port/build/MyGameRecomp.exe
