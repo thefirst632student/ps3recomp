@@ -1056,3 +1056,10 @@ s32 cellAudioUnsetPersonalDevice(s32 iPersonalStream)
     printf("[cellAudio] UnsetPersonalDevice(stream=%d) - stub\n", iPersonalStream);
     return CELL_OK;
 }
+
+s32 cellAudioSetPortLevel(u32 portNum, float level)
+{
+    (void)portNum;
+    (void)level;
+    return CELL_OK;
+}

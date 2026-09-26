@@ -114,6 +114,7 @@ s32 cellAudioSetPersonalDevice(s32 iPersonalStream, s32 iDevice);
 
 /* NID: 0x28BC1409 */
 s32 cellAudioUnsetPersonalDevice(s32 iPersonalStream);
+s32 cellAudioSetPortLevel(u32 portNum, float level);
 
 #ifdef __cplusplus
 }

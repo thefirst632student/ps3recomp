@@ -100,6 +100,34 @@ s32 cellRescGetNumColorBuffers(u32 displayMode, u32 palTemporalMode, u32* numBuf
     return CELL_OK;
 }
 
+s32 cellRescVideoOutResolutionId2RescBufferMode(u32 resolutionId, u32* bufferMode)
+{
+    if (!bufferMode)
+        return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
+
+    u32 mode = CELL_RESC_1280x720;
+    switch (resolutionId) {
+    case 1: /* CELL_VIDEO_OUT_RESOLUTION_1080 */
+        mode = CELL_RESC_1920x1080;
+        break;
+    case 2: /* CELL_VIDEO_OUT_RESOLUTION_720 */
+        mode = CELL_RESC_1280x720;
+        break;
+    case 4: /* CELL_VIDEO_OUT_RESOLUTION_480 */
+        mode = CELL_RESC_720x480;
+        break;
+    case 5: /* CELL_VIDEO_OUT_RESOLUTION_576 */
+        mode = CELL_RESC_720x576;
+        break;
+    default:
+        mode = CELL_RESC_1280x720;
+        break;
+    }
+
+    vm_write32((uint32_t)(uintptr_t)bufferMode, mode);
+    return CELL_OK;
+}
+
 s32 cellRescGetBufferSize(u32* colorBufSize, u32* vertexBufSize, u32* fragmentBufSize)
 {
     if (!s_initialized)

@@ -93,6 +93,7 @@ void cellRescExit(void);
 
 s32 cellRescSetDisplayMode(u32 displayMode);
 s32 cellRescGetNumColorBuffers(u32 displayMode, u32 palTemporalMode, u32* numBufs);
+s32 cellRescVideoOutResolutionId2RescBufferMode(u32 resolutionId, u32* bufferMode);
 
 s32 cellRescGetBufferSize(u32* colorBufSize, u32* vertexBufSize, u32* fragmentBufSize);
 s32 cellRescSetBufferAddress(void* colorBuf, void* vertexBuf, void* fragmentBuf);

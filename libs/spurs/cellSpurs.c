@@ -3048,3 +3048,11 @@ s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea)
     if (_n++ < 8) printf("[cellSpurs] LFQueueAttachLv2EventQueue(q=0x%08X)\n", (u32)queue_ea);
     return CELL_OK;
 }
+
+s32 _cellSpursLFQueuePushBody(u64 queue_ea, u64 buffer_ea, u32 is_blocking)
+{
+    (void)queue_ea;
+    (void)buffer_ea;
+    (void)is_blocking;
+    return CELL_OK;
+}
