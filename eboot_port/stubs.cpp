@@ -1,91 +1,53 @@
-/*
- * ps3recomp game project -- game-specific hooks and overrides.
- *
- * main.cpp is the runner and is game-agnostic. This file is where a port puts
- * everything that is not: the PRX loading hook it must answer, overrides for
- * firmware functions the HLE library gets wrong for this title, and patches
- * over recompiled code.
- *
- * It starts out as the empty version of all of that, which is what a game with
- * no lifted PRX and no overrides needs.
- */
-
 #include <cstdio>
 #include <cstring>
+#include <cstdint>
 
 #include "ps3emu/ps3types.h"
 #include "ps3emu/error_codes.h"
 
-/* ---------------------------------------------------------------------------
- * PRX loading
- *
- * main.cpp calls this once, after the lifted function table is registered and
- * vm_base is live, before the game runs. A title that lifts a real system PRX
- * -- libsre, which is cellSpurs and cellSync -- loads its image into guest RAM
- * here and registers its exports. Most ports never need to: the HLE library
- * answers those modules instead.
- * -----------------------------------------------------------------------*/
+// For SPURS workload registry
+#include "../runtime/spu/spu_context.h"
+#include "../runtime/spu/spu_workload.h"
+
+extern "C" void ps3_hle_register(unsigned int nid, const char* name, void* handler);
+extern "C" s32 cellSpursEventFlagSet(void* eventFlag, u16 bits);
+extern uint8_t* vm_base;
+
+// Missing NIDs
+static s32 _cellSpursLFQueuePushBody(u64 queue_ea, u64 buffer_ea, u64 size) {
+    return CELL_OK;
+}
+
+static s32 cellRescVideoOutResolutionId2RescBufferMode(u32 resId, u32* mode) {
+    if (mode) *mode = 0;
+    return CELL_OK;
+}
+
+static s32 _sys_spu_printf_initialize(u32 unk1, u32 unk2) {
+    return CELL_OK;
+}
+
+static s32 cellAudioSetPortLevel(u32 portNum, float volume) {
+    return CELL_OK;
+}
+
+// SPURS Fallback for fp=0x1AF3B10ECB1562C3
+static void synth2_fallback(spu_context* ctx) {
+    printf("[fallback] synth2 SPURS workload running!\n");
+    
+    // Unblock the PPU waiting for this SPURS task
+    // The exact flag is hardcoded based on the log for now
+    cellSpursEventFlagSet((void*)(uintptr_t)0x01178880, 0x0001);
+}
 
 extern "C" void ps3_load_prx_modules(void)
 {
+    // Register missing NIDs
+    ps3_hle_register(0x8A85674D, "_cellSpursLFQueuePushBody", (void*)_cellSpursLFQueuePushBody);
+    ps3_hle_register(0xD1CA0503, "cellRescVideoOutResolutionId2RescBufferMode", (void*)cellRescVideoOutResolutionId2RescBufferMode);
+    ps3_hle_register(0x45FE2FCE, "_sys_spu_printf_initialize", (void*)_sys_spu_printf_initialize);
+    ps3_hle_register(0x56DFE179, "cellAudioSetPortLevel", (void*)cellAudioSetPortLevel);
+    
+    // Register SPU Workload
+    spu_workload_register(0x1AF3B10ECB1562C3ULL, synth2_fallback, "synth2");
 }
-
-/* ---------------------------------------------------------------------------
- * Example: Override a specific NID
- *
- * The module system resolves function imports by NID.  To replace a default
- * HLE stub with custom logic, register your function at init time.
- * -----------------------------------------------------------------------*/
-
-/*
- * Example: override cellGcmSetFlipMode (NID 0xA53D12AE) to force vsync.
- *
- *   static void my_cellGcmSetFlipMode(u32 mode)
- *   {
- *       printf("[hook] cellGcmSetFlipMode: forcing VSYNC (was %u)\n", mode);
- *       // Force vsync regardless of what the game requested
- *       cellGcmSetFlipMode(CELL_GCM_DISPLAY_VSYNC);
- *   }
- *
- * Then in your init code:
- *
- *   ps3::modules::override_nid(0xA53D12AE,
- *       reinterpret_cast<void*>(my_cellGcmSetFlipMode));
- */
-
-/* ---------------------------------------------------------------------------
- * Example: Hook into module loading
- *
- * You can intercept cellSysmoduleLoadModule to perform custom actions
- * when a particular module is loaded.
- * -----------------------------------------------------------------------*/
-
-/*
- *   static s32 my_loadmodule_hook(u16 id)
- *   {
- *       printf("[hook] Module 0x%04X loaded\n", id);
- *
- *       if (id == CELL_SYSMODULE_AUDIO) {
- *           // Perform custom audio backend initialization
- *           init_my_audio_backend();
- *       }
- *
- *       // Call the original implementation
- *       return cellSysmoduleLoadModule(id);
- *   }
- */
-
-/* ---------------------------------------------------------------------------
- * Game-specific patches
- *
- * Sometimes you need to patch recompiled code at specific addresses.
- * Use the patch system to modify behavior without editing generated code.
- * -----------------------------------------------------------------------*/
-
-/*
- *   // Skip an integrity check at guest address 0x00812FA0
- *   ps3::patches::nop_range(0x00812FA0, 0x00812FB0);
- *
- *   // Replace a function call with a direct return
- *   ps3::patches::force_return(0x009A1000, 0);  // return 0
- */
