@@ -8,7 +8,6 @@
 // For SPURS workload registry
 #include "spu_context.h"
 #include "spu_workload.h"
-#include "ppu_memory.h"
 
 extern "C" void ps3_hle_register(unsigned int nid, const char* name, void* handler);
 extern "C" s32 cellSpursEventFlagSet(void* eventFlag, u16 bits);
