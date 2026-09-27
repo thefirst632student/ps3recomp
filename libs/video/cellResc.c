@@ -160,9 +160,43 @@ s32 cellRescSetBufferAddress(void* colorBuf, void* vertexBuf, void* fragmentBuf)
     return CELL_OK;
 }
 
+s32 cellRescGcmSurface2RescSrc(const void* surface, CellRescSrc* src)
+{
+    if (!surface || !src)
+        return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
+
+    uint32_t surf_ea = GUEST_EA(surface);
+    uint32_t src_ea  = GUEST_EA(src);
+
+    uint32_t format = (uint32_t)vm_read8(surf_ea + 0x01);
+    uint32_t pitch  = vm_read32(surf_ea + 0x08);
+    uint32_t offset = vm_read32(surf_ea + 0x18);
+    uint32_t width  = (uint32_t)vm_read16(surf_ea + 0x34);
+    uint32_t height = (uint32_t)vm_read16(surf_ea + 0x36);
+
+    {
+        static int n = 0;
+        if (n++ < 8)
+            printf("[cellResc] GcmSurface2RescSrc: surf=0x%08X fmt=%u %ux%u pitch=%u off=0x%08X -> src=0x%08X\n",
+                   surf_ea, format, width, height, pitch, offset, src_ea);
+    }
+
+    vm_write32(src_ea + 0x00, format);
+    vm_write32(src_ea + 0x04, pitch);
+    vm_write32(src_ea + 0x08, width);
+    vm_write32(src_ea + 0x0C, height);
+    vm_write32(src_ea + 0x10, offset);
+
+    return CELL_OK;
+}
+
 s32 cellRescSetSrc(s32 index, const CellRescSrc* src)
 {
-    printf("[cellResc] SetSrc(index=%d)\n", index);
+    {
+        static int n = 0;
+        if (n++ < 8)
+            printf("[cellResc] SetSrc(index=%d)\n", index);
+    }
 
     if (!s_initialized)
         return (s32)CELL_RESC_ERROR_NOT_INITIALIZED;
@@ -176,7 +210,11 @@ s32 cellRescSetSrc(s32 index, const CellRescSrc* src)
 
 s32 cellRescSetDsts(u32 displayMode, const CellRescDsts* dsts)
 {
-    printf("[cellResc] SetDsts(mode=0x%x)\n", displayMode);
+    {
+        static int n = 0;
+        if (n++ < 8)
+            printf("[cellResc] SetDsts(mode=0x%x)\n", displayMode);
+    }
 
     if (!s_initialized)
         return (s32)CELL_RESC_ERROR_NOT_INITIALIZED;
@@ -194,8 +232,12 @@ s32 cellRescSetDsts(u32 displayMode, const CellRescDsts* dsts)
     return CELL_OK;
 }
 
-s32 cellRescSetConvertAndFlip(s32 index)
+s32 cellRescSetConvertAndFlip(void* context, s32 index)
 {
+    (void)context;
+    if (index < 0 || index >= 8)
+        index = 0;
+
     if (!s_initialized)
         return (s32)CELL_RESC_ERROR_NOT_INITIALIZED;
 
@@ -246,13 +288,21 @@ s32 cellRescSetConvertAndFlip(s32 index)
     s_last_flip_time++;
 
     { static int n = 0;
-      if (n++ < 4)
+      if (n++ < 8)
           printf("[cellResc] SetConvertAndFlip(src=%d) -> flip, %u display buffer(s)\n",
                  index, nbuf); }
 
     if (s_flip_handler_opd)
         ps3_invoke_guest(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
 
+    return CELL_OK;
+}
+
+s32 cellRescSetWaitFlip(void* context)
+{
+    (void)context;
+    extern void cellGcmSetWaitFlip(void);
+    cellGcmSetWaitFlip();
     return CELL_OK;
 }
 

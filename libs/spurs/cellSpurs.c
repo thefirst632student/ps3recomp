@@ -3049,6 +3049,12 @@ s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea)
     return CELL_OK;
 }
 
+s32 cellSpursLFQueueDetachLv2EventQueue(u64 queue_ea)
+{
+    (void)queue_ea;
+    return CELL_OK;
+}
+
 s32 _cellSpursLFQueuePushBody(u64 queue_ea, u64 buffer_ea, u32 is_blocking)
 {
     (void)queue_ea;

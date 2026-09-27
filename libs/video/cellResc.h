@@ -98,9 +98,11 @@ s32 cellRescVideoOutResolutionId2RescBufferMode(u32 resolutionId, u32* bufferMod
 s32 cellRescGetBufferSize(u32* colorBufSize, u32* vertexBufSize, u32* fragmentBufSize);
 s32 cellRescSetBufferAddress(void* colorBuf, void* vertexBuf, void* fragmentBuf);
 
+s32 cellRescGcmSurface2RescSrc(const void* surface, CellRescSrc* src);
 s32 cellRescSetSrc(s32 index, const CellRescSrc* src);
 s32 cellRescSetDsts(u32 displayMode, const CellRescDsts* dsts);
-s32 cellRescSetConvertAndFlip(s32 index);
+s32 cellRescSetConvertAndFlip(void* context, s32 index);
+s32 cellRescSetWaitFlip(void* context);
 
 s32 cellRescSetFlipHandler(void (*handler)(u32));
 s32 cellRescSetVBlankHandler(void (*handler)(u32));
