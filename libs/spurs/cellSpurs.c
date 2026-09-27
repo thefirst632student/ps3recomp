@@ -64,6 +64,7 @@ typedef struct {
     s32         exitCode;
     void*       entryPoint;
     u64         argA;
+    u32         taskset_ea;
 } SpursTask;
 
 /* Global workload table (per-SPURS instance in a real system, simplified) */
@@ -717,12 +718,22 @@ s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
 
 s32 cellSpursDestroyTaskset(CellSpursTaskset* taskset)
 {
+    uint32_t taskset_ea = (uint32_t)(uintptr_t)taskset;
     taskset = GUEST_PTR(taskset, CellSpursTaskset*);
     if (!taskset)
         return CELL_SPURS_TASK_ERROR_NULL_POINTER;
 
-    printf("[cellSpurs] DestroyTaskset()\n");
+    printf("[cellSpurs] DestroyTaskset(ea=0x%08X)\n", taskset_ea);
+    for (u32 i = 0; i < CELL_SPURS_MAX_TASK; i++) {
+        if (s_tasks[i].in_use && s_tasks[i].taskset_ea == taskset_ea) {
+            s_tasks[i].in_use = 0;
+            s_tasks[i].active = 0;
+            s_tasks[i].completed = 1;
+            s_tasks[i].taskset_ea = 0;
+        }
+    }
     taskset->initialized = 0;
+    taskset->taskCount = 0;
     return CELL_OK;
 }
 
@@ -739,12 +750,21 @@ s32 cellSpursShutdownTaskset(CellSpursTaskset* taskset)
 
 s32 cellSpursJoinTaskset(CellSpursTaskset* taskset)
 {
+    uint32_t taskset_ea = (uint32_t)(uintptr_t)taskset;
     taskset = GUEST_PTR(taskset, CellSpursTaskset*);
     if (!taskset)
         return CELL_SPURS_TASK_ERROR_NULL_POINTER;
 
-    printf("[cellSpurs] JoinTaskset()\n");
-    /* In a full implementation, wait for all tasks to complete */
+    printf("[cellSpurs] JoinTaskset(ea=0x%08X)\n", taskset_ea);
+    for (u32 i = 0; i < CELL_SPURS_MAX_TASK; i++) {
+        if (s_tasks[i].in_use && s_tasks[i].taskset_ea == taskset_ea) {
+            s_tasks[i].in_use = 0;
+            s_tasks[i].active = 0;
+            s_tasks[i].completed = 1;
+            s_tasks[i].taskset_ea = 0;
+        }
+    }
+    taskset->taskCount = 0;
     return CELL_OK;
 }
 
@@ -814,14 +834,33 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
     }
 
     /* Find a free task slot */
+    u32 slot = 0xFFFFFFFFu;
     for (u32 i = 0; i < CELL_SPURS_MAX_TASK; i++) {
         if (!s_tasks[i].in_use) {
-            s_tasks[i].in_use = 1;
-            s_tasks[i].id = s_next_task_id++;
-            s_tasks[i].active = 1;
-            s_tasks[i].completed = 0;
-            s_tasks[i].exitCode = 0;
-            s_tasks[i].entryPoint = elf;
+            slot = i;
+            break;
+        }
+    }
+    if (slot == 0xFFFFFFFFu) {
+        for (u32 i = 0; i < CELL_SPURS_MAX_TASK; i++) {
+            if (s_tasks[i].completed) {
+                slot = i;
+                break;
+            }
+        }
+    }
+    if (slot == 0xFFFFFFFFu) {
+        slot = s_next_task_id % CELL_SPURS_MAX_TASK;
+    }
+
+    u32 i = slot;
+    s_tasks[i].in_use = 1;
+    s_tasks[i].taskset_ea = taskset_ea;
+    s_tasks[i].id = s_next_task_id++;
+    s_tasks[i].active = 1;
+    s_tasks[i].completed = 0;
+    s_tasks[i].exitCode = 0;
+    s_tasks[i].entryPoint = elf;
 
             /* The guest reads this out-param BIG-ENDIAN, and a native store
              * put it in host order: task 1 came back to the game as 0x01000000,
@@ -926,10 +965,6 @@ s32 cellSpursCreateTask(CellSpursTaskset* taskset, CellSpursTaskId* taskId,
                                                 (uint32_t)(uintptr_t)context);
             }
             return CELL_OK;
-        }
-    }
-
-    return CELL_SPURS_TASK_ERROR_NOMEM;
 }
 
 /* The SDK's versioned task-attribute initializer. ABI (8 GPR args):

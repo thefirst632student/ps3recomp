@@ -169,16 +169,22 @@ s32 cellRescGcmSurface2RescSrc(const void* surface, CellRescSrc* src)
     uint32_t src_ea  = GUEST_EA(src);
 
     uint32_t format = (uint32_t)vm_read8(surf_ea + 0x01);
-    uint32_t pitch  = vm_read32(surf_ea + 0x08);
-    uint32_t offset = vm_read32(surf_ea + 0x18);
+    uint32_t offset = vm_read32(surf_ea + 0x08);
+    uint32_t pitch  = vm_read32(surf_ea + 0x18);
     uint32_t width  = (uint32_t)vm_read16(surf_ea + 0x34);
     uint32_t height = (uint32_t)vm_read16(surf_ea + 0x36);
 
     {
         static int n = 0;
-        if (n++ < 8)
-            printf("[cellResc] GcmSurface2RescSrc: surf=0x%08X fmt=%u %ux%u pitch=%u off=0x%08X -> src=0x%08X\n",
-                   surf_ea, format, width, height, pitch, offset, src_ea);
+        if (n++ < 8) {
+            printf("[cellResc] GcmSurface2RescSrc: surf=0x%08X off=0x%08X pitch=%u %ux%u fmt=%u -> src=0x%08X\n",
+                   surf_ea, offset, pitch, width, height, format, src_ea);
+            printf("[cellResc] surf dwords: %08X %08X %08X %08X %08X %08X %08X %08X\n",
+                   vm_read32(surf_ea + 0x00), vm_read32(surf_ea + 0x04),
+                   vm_read32(surf_ea + 0x08), vm_read32(surf_ea + 0x0C),
+                   vm_read32(surf_ea + 0x10), vm_read32(surf_ea + 0x14),
+                   vm_read32(surf_ea + 0x18), vm_read32(surf_ea + 0x1C));
+        }
     }
 
     vm_write32(src_ea + 0x00, format);
@@ -205,6 +211,14 @@ s32 cellRescSetSrc(s32 index, const CellRescSrc* src)
         return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
 
     guest_struct_load(&s_src[index], GUEST_EA(src), sizeof(s_src[index]));
+
+    if (s_src[index].width > 0 && s_src[index].height > 0) {
+        extern s32 cellGcmSetDisplayBuffer(u32 bufferId, u32 offset, u32 pitch,
+                                           u32 width, u32 height);
+        cellGcmSetDisplayBuffer((u32)index, s_src[index].offset,
+                                s_src[index].pitch,
+                                s_src[index].width, s_src[index].height);
+    }
     return CELL_OK;
 }
 
