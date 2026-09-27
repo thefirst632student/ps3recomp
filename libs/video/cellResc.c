@@ -8,6 +8,7 @@
 
 #include "cellResc.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: translate + byte-swap */
+#include "../guest_struct.h"                /* guest_struct_load: BE struct word-swap */
 #include "ps3emu/guest_call.h"   /* ps3_invoke_guest: handlers are guest OPDs */
 #include <stdio.h>
 #include <string.h>
@@ -48,7 +49,7 @@ s32 cellRescInit(const CellRescInitConfig* initConfig)
     if (!initConfig)
         return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
 
-    s_config = *GUEST_PTR(initConfig, const CellRescInitConfig*);
+    guest_struct_load(&s_config, GUEST_EA(initConfig), sizeof(s_config));
     memset(s_src, 0, sizeof(s_src));
     memset(s_dsts, 0, sizeof(s_dsts));
     s_flip_handler_opd = 0;
@@ -169,7 +170,7 @@ s32 cellRescSetSrc(s32 index, const CellRescSrc* src)
     if (!src || index < 0 || index >= 8)
         return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
 
-    s_src[index] = *GUEST_PTR(src, const CellRescSrc*);
+    guest_struct_load(&s_src[index], GUEST_EA(src), sizeof(s_src[index]));
     return CELL_OK;
 }
 
@@ -189,7 +190,7 @@ s32 cellRescSetDsts(u32 displayMode, const CellRescDsts* dsts)
     else if (displayMode & CELL_RESC_1280x720) idx = 2;
     else if (displayMode & CELL_RESC_1920x1080) idx = 3;
 
-    s_dsts[idx] = *GUEST_PTR(dsts, const CellRescDsts*);
+    guest_struct_load(&s_dsts[idx], GUEST_EA(dsts), sizeof(s_dsts[idx]));
     return CELL_OK;
 }
 
@@ -211,9 +212,31 @@ s32 cellRescSetConvertAndFlip(s32 index)
      * title registered, the way RESC's own double/triple buffering does. Emit a
      * real conversion draw if a title ever needs RESC's PAL/interlace modes
      * rather than a plain scale. */
+    extern s32 cellGcmSetDisplayBuffer(u32 bufferId, u32 offset, u32 pitch,
+                                       u32 width, u32 height);
     extern s32 cellGcmSetFlipCommand(u32 bufferId);
     extern u32 cellGcm_display_buffer_count(void);
     u32 nbuf = cellGcm_display_buffer_count();
+
+    /* RESC-only games (White Album 2, etc.) never call cellGcmSetDisplayBuffer
+     * themselves. On real hardware RESC internally allocates output buffers and
+     * manages the flip. Here we auto-register each RESC source surface as a GCM
+     * display buffer so:
+     *   (a) cellGcmOffsetIsDisplay returns true for the render target offset,
+     *       which makes the D3D12 backend classify draws as on-screen, and
+     *   (b) cellGcmSetFlipCommand has a valid buffer to flip. */
+    if (nbuf == 0) {
+        for (int i = 0; i < 8; i++) {
+            if (s_src[i].width > 0 && s_src[i].height > 0) {
+                cellGcmSetDisplayBuffer((u32)i, s_src[i].offset,
+                                        s_src[i].pitch,
+                                        s_src[i].width, s_src[i].height);
+            }
+        }
+        nbuf = cellGcm_display_buffer_count();
+        printf("[cellResc] auto-registered %u RESC source(s) as display buffer(s)\n", nbuf);
+    }
+
     if (nbuf) {
         cellGcmSetFlipCommand(s_flip_target % nbuf);
         s_flip_target = (u32)((s_flip_target + 1) % nbuf);
