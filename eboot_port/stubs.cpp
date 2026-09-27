@@ -23,18 +23,24 @@ extern "C" {
     s32 cellSpursLFQueueDetachLv2EventQueue(u64 queue_ea);
 }
 
-// SPURS Fallback for fp=0x1AF3B10ECB1562C3
-static void synth2_fallback(spu_context* ctx) {
-    printf("[fallback] synth2 SPURS workload running!\n");
-    
-    // Unblock the PPU waiting for this SPURS task
+// SPURS Fallback for fp=0x1AF3B10ECB1562C3 (Sony Edge LZMA Task)
+static void edgelzma_fallback(spu_context* ctx) {
+    (void)ctx;
+    // Unblock the PPU waiting for this SPURS task if any
     cellSpursEventFlagSet((void*)(uintptr_t)0x01178880, 0x0001);
+}
+
+// Raw SPU fallback for fp=0x5009AA16A26A8923 (synth2 audio mixer)
+static void synth2_fallback(spu_context* ctx) {
+    (void)ctx;
+    printf("[fallback] synth2 raw SPU workload registered\n");
 }
 
 extern "C" void ps3_load_prx_modules(void)
 {
-    // Register SPURS Workload fallback
-    spu_workload_register(0x1AF3B10ECB1562C3ULL, synth2_fallback, "synth2");
+    // Register SPURS Workload fallbacks
+    spu_workload_register(0x1AF3B10ECB1562C3ULL, edgelzma_fallback, "edgelzma");
+    spu_workload_register(0x5009AA16A26A8923ULL, synth2_fallback, "synth2");
 
     // Critical NIDs registered here to guarantee resolution on any build
     ps3_hle_register(0x01220224u, "cellRescGcmSurface2RescSrc", (void*)cellRescGcmSurface2RescSrc);

@@ -465,6 +465,17 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         spu_dispatch_frame_by_queue(queue_id, 0);
     }
 
+    /* synth2 SPU simulation: unblock thread waiting on Queue 3 for completion from SPU thread 0x2000 */
+    if (queue_id == 3 && timeout_us == 0 && q->count == 0) {
+        sys_event_t syn_evt;
+        syn_evt.source = 0xFFFFFFFF53505501ULL;
+        syn_evt.data1  = (0x3AULL << 32);
+        syn_evt.data2  = 0;
+        syn_evt.data3  = 0;
+        event_queue_push(q, &syn_evt);
+        fprintf(stderr, "[evt] queue_receive(q=3): injected synth2 SPU completion event\n");
+    }
+
 #ifdef _WIN32
     EnterCriticalSection(&q->lock);
 
@@ -970,6 +981,20 @@ int64_t sys_event_port_send(ppu_context* ctx)
     evt.data1  = data1;
     evt.data2  = data2;
     evt.data3  = data3;
+
+    /* White Album 2 / synth2 SPU simulation:
+     * When PPU sends audio command to port 1 (Queue 4), unlifted SPU thread 0x2000
+     * does not run. The PPU audio thread (tid=6) immediately waits on Queue 3
+     * for completion from SPU thread 0x2000 with source 0xFFFFFFFF53505501ULL.
+     * Deliver completion to Queue 3 and avoid filling Queue 4.
+     */
+    if (port_id == 1) {
+        if (g_sys_event_queues[2].active) {
+            sys_event_queue_push_by_id(3, 0xFFFFFFFF53505501ULL, (0x3AULL << 32), 0, 0);
+            fprintf(stderr, "[evt] port_send(port=1): synth2 SPU completion pushed to Queue 3\n");
+        }
+        return CELL_OK;
+    }
 
     /* Per-frame sim-SPU trigger: the game sends the work-descriptor EA (data2) to
      * a "start" queue and waits on the SPU's completion queue (start+1). Re-run

@@ -19,6 +19,7 @@
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
 #include <stdint.h>
+#include "edge_lzma.h"
 
 /* Bridge the real (BE) taskset EA + selected taskId from CreateTask to the image-22
  * SPU dispatch (spu_workload.c), so spurs_pm_build_context can build the leaf's
@@ -3093,7 +3094,6 @@ s32 cellSpursLFQueueDetachLv2EventQueue(u64 queue_ea)
 s32 _cellSpursLFQueuePushBody(u64 queue_ea, u64 buffer_ea, u32 is_blocking)
 {
     (void)queue_ea;
-    (void)buffer_ea;
     (void)is_blocking;
-    return CELL_OK;
+    return edge_lzma_process_element(buffer_ea);
 }
