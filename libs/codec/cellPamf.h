@@ -34,6 +34,8 @@ extern "C" {
 #define CELL_PAMF_STREAM_TYPE_PAMF_LPCM      3   /* LPCM audio */
 #define CELL_PAMF_STREAM_TYPE_AC3            4   /* AC3 audio */
 #define CELL_PAMF_STREAM_TYPE_USER_DATA      5   /* User data */
+#define CELL_PAMF_STREAM_TYPE_VIDEO          20  /* Any video stream (AVC/M2V) */
+#define CELL_PAMF_STREAM_TYPE_AUDIO          21  /* Any audio stream (ATRAC3+/LPCM/AC3) */
 
 /* Codec type constants */
 #define CELL_PAMF_CODEC_TYPE_AVC             0x1B
@@ -60,26 +62,58 @@ typedef struct CellPamfReader {
     u32   streamTableOffset; /* offset to stream descriptor table */
     u8    numStreams;      /* number of streams */
     u8    currentStream;  /* current stream index */
-    u8    reserved[2];
+    u8    streamDescSize; /* stream descriptor stride (24 or 48) */
+    u8    reserved;
     u32   currentEP;      /* current entry point */
 } CellPamfReader;
 
 typedef struct CellPamfAvcInfo {
     u8   profileIdc;
     u8   levelIdc;
-    u16  horizontalSize;
-    u16  verticalSize;
-    u8   frameCropLeftOffset;
-    u8   frameCropRightOffset;
-    u8   frameCropTopOffset;
-    u8   frameCropBottomOffset;
     u8   frameMbsOnlyFlag;
     u8   videoSignalInfoFlag;
-    u8   frameRateCode;
+    u8   frameRateInfo;
     u8   aspectRatioIdc;
     u16  sarWidth;
     u16  sarHeight;
+    u16  horizontalSize;
+    u16  verticalSize;
+    u16  frameCropLeftOffset;
+    u16  frameCropRightOffset;
+    u16  frameCropTopOffset;
+    u16  frameCropBottomOffset;
+    u8   videoFormat;
+    u8   videoFullRangeFlag;
+    u8   colourPrimaries;
+    u8   transferCharacteristics;
+    u8   matrixCoefficients;
+    u8   entropyCodingModeFlag;
+    u8   deblockingFilterFlag;
+    u8   minNumSlicePerPictureIdc;
+    u8   nfwIdc;
+    u8   maxMeanBitrate;
 } CellPamfAvcInfo;
+
+typedef struct CellPamfM2vInfo {
+    u8   profileAndLevelIndication;
+    u8   progressiveSequence;
+    u8   videoSignalInfoFlag;
+    u8   frameRateInfo;
+    u8   aspectRatioIdc;
+    u8   reserved;
+    u16  sarWidth;
+    u16  sarHeight;
+    u16  horizontalSize;
+    u16  verticalSize;
+    u16  horizontalSizeValue;
+    u16  verticalSizeValue;
+    u8   videoFormat;
+    u8   videoFullRangeFlag;
+    u8   colourPrimaries;
+    u8   transferCharacteristics;
+    u8   matrixCoefficients;
+    u8   pad;
+} CellPamfM2vInfo;
 
 typedef struct CellPamfAtrac3plusInfo {
     u32 samplingFrequency;
@@ -136,6 +170,13 @@ s32 cellPamfStreamTypeToEsFilterId(u8 streamType, u8 streamIndex,
 /* Entry point navigation */
 s32 cellPamfReaderGetNumberOfEp(CellPamfReader* reader, s32* numEp);
 s32 cellPamfReaderGetEp(CellPamfReader* reader, u32 epIndex, CellPamfEp* ep);
+
+/* Header and stream queries */
+s32 cellPamfGetHeaderSize(const void* pamfAddr, u64 fileSize, u64* headerSize);
+s32 cellPamfGetStreamOffsetAndSize(const void* pamfAddr, u64 fileSize, u64* streamOffset, u64* streamSize);
+s32 cellPamfVerify(const void* pamfAddr, u64 fileSize);
+s32 cellPamfReaderSetStreamWithTypeAndIndex(CellPamfReader* reader, u8 streamType, u32 streamIndex);
+s32 cellPamfReaderGetStreamTypeAndChannel(CellPamfReader* reader, u8* pStreamType, u8* pCh);
 
 #ifdef __cplusplus
 }

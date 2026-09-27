@@ -21,6 +21,35 @@ extern "C" {
     s32 _sys_spu_printf_initialize(const char* name, int prio);
     s32 _cellSpursLFQueuePushBody(u64 queue_ea, u64 buffer_ea, u32 is_blocking);
     s32 cellSpursLFQueueDetachLv2EventQueue(u64 queue_ea);
+
+    s32 cellPamfGetHeaderSize(const void* pamfAddr, u64 fileSize, u64* headerSize);
+    s32 cellPamfGetStreamOffsetAndSize(const void* pamfAddr, u64 fileSize, u64* streamOffset, u64* streamSize);
+    s32 cellPamfReaderSetStreamWithTypeAndIndex(void* reader, u8 streamType, u32 streamIndex);
+    s32 cellPamfReaderGetStreamTypeAndChannel(void* reader, u8* pStreamType, u8* pCh);
+
+    s32 cellAtracSetDataAndGetMemSize(void* handle, void* pucBufferAddr, u32 uiReadByte, u32 uiBufferByte, u32* puiWorkMemSize);
+    s32 cellAtracCreateDecoder(void* handle, void* pucWorkMem, u32 uiPpuThreadPriority, u32 uiSpuThreadPriority);
+    s32 cellAtracCreateDecoderExt(void* handle, void* pucWorkMem, u32 uiWorkMemSize, void* pExtRes);
+    s32 cellAtracDeleteDecoder(void* handle);
+    s32 cellAtracDecode(void* handle, float* pOutPcm, u32* puiSamples, u32* puiFinishFlag, s32* piRemainFrame);
+    s32 cellAtracAddStreamData(void* handle, u32 uiAddByte);
+    s32 cellAtracGetSecondBufferInfo(void* handle, u32* puiReadPosition, u32* puiWritableByte);
+    s32 cellAtracSetSecondBuffer(void* handle, void* pucSecondBufferAddr, u32 uiSecondBufferByte);
+    s32 cellAtracGetRemainFrame(void* handle, s32* piRemainFrame);
+    s32 cellAtracGetVacantSize(void* handle, u32* puiVacantSize);
+    s32 cellAtracGetStreamDataInfo(void* handle, void** ppucWriteAddr, u32* puiWritableByte, u32* puiReadPosition);
+    s32 cellAtracGetChannel(void* handle, u32* puiChannel);
+    s32 cellAtracGetMaxSample(void* handle, u32* puiMaxSample);
+    s32 cellAtracGetNextSample(void* handle, u32* puiNextSample);
+    s32 cellAtracGetSoundInfo(void* handle, s32* piEndSample, s32* piLoopStartSample, s32* piLoopEndSample);
+    s32 cellAtracGetNextDecodePosition(void* handle, u32* puiNextDecodePosition);
+    s32 cellAtracGetBitrate(void* handle, u32* puiBitrate);
+    s32 cellAtracGetLoopInfo(void* handle, s32* piLoopNum, u32* puiLoopStatus);
+    s32 cellAtracIsSecondBufferNeeded(void* handle);
+    s32 cellAtracSetLoopNum(void* handle, s32 nLoopNum);
+    s32 cellAtracGetBufferInfoForResetting(void* handle, u32 uiSample, void* pBufferInfo);
+    s32 cellAtracResetPlayPosition(void* handle, u32 uiSample, u32 uiWriteByte);
+    s32 cellAtracGetInternalErrorInfo(void* handle, s32* piResult);
 }
 
 // SPURS Fallback for fp=0x1AF3B10ECB1562C3 (Sony Edge LZMA Task)
@@ -50,4 +79,22 @@ extern "C" void ps3_load_prx_modules(void)
     ps3_hle_register(0x45FE2FCEu, "_sys_spu_printf_initialize", (void*)_sys_spu_printf_initialize);
     ps3_hle_register(0x8A85674Du, "_cellSpursLFQueuePushBody", (void*)_cellSpursLFQueuePushBody);
     ps3_hle_register(0x73E06F91u, "cellSpursLFQueueDetachLv2EventQueue", (void*)cellSpursLFQueueDetachLv2EventQueue);
+
+    ps3_hle_register(0xCA8181C1u, "cellPamfGetHeaderSize", (void*)cellPamfGetHeaderSize);
+    ps3_hle_register(0x44F5C9E3u, "cellPamfGetStreamOffsetAndSize", (void*)cellPamfGetStreamOffsetAndSize);
+    ps3_hle_register(0x28B4E2C1u, "cellPamfReaderSetStreamWithTypeAndIndex", (void*)cellPamfReaderSetStreamWithTypeAndIndex);
+    ps3_hle_register(0x9AB20793u, "cellPamfReaderGetStreamTypeAndChannel", (void*)cellPamfReaderGetStreamTypeAndChannel);
+
+    ps3_hle_register(0x0F9667B6u, "cellAtracGetChannel", (void*)cellAtracGetChannel);
+    ps3_hle_register(0x2642D4CCu, "cellAtracCreateDecoderExt", (void*)cellAtracCreateDecoderExt);
+    ps3_hle_register(0x2BFFF084u, "cellAtracGetStreamDataInfo", (void*)cellAtracGetStreamDataInfo);
+    ps3_hle_register(0x46CFC013u, "cellAtracAddStreamData", (void*)cellAtracAddStreamData);
+    ps3_hle_register(0x66AFC68Eu, "cellAtracSetDataAndGetMemSize", (void*)cellAtracSetDataAndGetMemSize);
+    ps3_hle_register(0x761CB9BEu, "cellAtracDeleteDecoder", (void*)cellAtracDeleteDecoder);
+    ps3_hle_register(0x78BA5C41u, "cellAtracSetLoopNum", (void*)cellAtracSetLoopNum);
+    ps3_hle_register(0x8EB0E65Fu, "cellAtracDecode", (void*)cellAtracDecode);
+    ps3_hle_register(0xAB6B6DBFu, "cellAtracGetLoopInfo", (void*)cellAtracGetLoopInfo);
+    ps3_hle_register(0xB5C11938u, "cellAtracGetInternalErrorInfo", (void*)cellAtracGetInternalErrorInfo);
+    ps3_hle_register(0xCF01D5D4u, "cellAtracGetSoundInfo", (void*)cellAtracGetSoundInfo);
+    ps3_hle_register(0xDFAB73AAu, "cellAtracGetRemainFrame", (void*)cellAtracGetRemainFrame);
 }
