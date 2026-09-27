@@ -348,14 +348,6 @@ s32 cellPamfReaderSetStreamWithIndex(CellPamfReader* reader, u32 streamIndex)
 /* ---------------------------------------------------------------------------
  * Sample rate / channel lookup helpers for audio descriptors
  * -----------------------------------------------------------------------*/
-static u32 audio_sample_rate(u8 code)
-{
-    switch (code) {
-    case 1: return 44100;
-    case 2: return 48000;
-    default: return 48000;
-    }
-}
 
 static u8 audio_channels(u8 code)
 {
@@ -368,12 +360,12 @@ static u8 audio_channels(u8 code)
     }
 }
 
-static u8 lpcm_bits(u8 code)
+static u16 lpcm_bits(u8 code)
 {
     switch (code) {
-    case 1: return 16;
-    case 2: return 24;
-    default: return 16;
+    case 1: return CELL_PAMF_BIT_LENGTH_16;
+    case 2: return CELL_PAMF_BIT_LENGTH_24;
+    default: return CELL_PAMF_BIT_LENGTH_16;
     }
 }
 
@@ -521,46 +513,41 @@ s32 cellPamfReaderGetStreamInfo(CellPamfReader* reader, void* info, u32 infoSize
     }
 
     case CELL_PAMF_STREAM_TYPE_ATRAC3PLUS: {
-        u32 srate = 48000;
         u8 ch = 2;
         if (reader->streamDescSize == 48) {
             if (desc[0x12] > 0) ch = desc[0x12];
         } else {
             ch = audio_channels(desc[10]);
-            srate = audio_sample_rate(desc[12]);
         }
-        vm_write32(ea + 0, srate);
+        vm_write32(ea + 0, CELL_PAMF_FS_48kHz);
         vm_write8(ea + 4, ch);
-        printf("[cellPamf] ATRAC3+ info: %u ch, %u Hz\n", ch, srate);
+        printf("[cellPamf] ATRAC3+ info: %u ch, fs=CELL_PAMF_FS_48kHz (%u)\n", ch, CELL_PAMF_FS_48kHz);
         break;
     }
 
     case CELL_PAMF_STREAM_TYPE_PAMF_LPCM: {
-        u32 srate = 48000;
         u8 ch = 2;
-        u8 bits = 16;
+        u16 bits = CELL_PAMF_BIT_LENGTH_16;
         if (reader->streamDescSize != 48) {
             ch = audio_channels(desc[10]);
             bits = lpcm_bits(desc[11]);
-            srate = audio_sample_rate(desc[12]);
         }
-        vm_write32(ea + 0, srate);
+        vm_write32(ea + 0, CELL_PAMF_FS_48kHz);
         vm_write8(ea + 4, ch);
+        vm_write8(ea + 5, 0);
         vm_write16(ea + 6, bits);
-        printf("[cellPamf] LPCM info: %u ch, %u Hz, %u bits\n", ch, srate, bits);
+        printf("[cellPamf] LPCM info: %u ch, fs=CELL_PAMF_FS_48kHz (%u), bits=%u\n", ch, CELL_PAMF_FS_48kHz, bits);
         break;
     }
 
     case CELL_PAMF_STREAM_TYPE_AC3: {
-        u32 srate = 48000;
         u8 ch = 2;
         if (reader->streamDescSize != 48) {
             ch = audio_channels(desc[10]);
-            srate = audio_sample_rate(desc[12]);
         }
-        vm_write32(ea + 0, srate);
+        vm_write32(ea + 0, CELL_PAMF_FS_48kHz);
         vm_write8(ea + 4, ch);
-        printf("[cellPamf] AC3 info: %u ch, %u Hz\n", ch, srate);
+        printf("[cellPamf] AC3 info: %u ch, fs=CELL_PAMF_FS_48kHz (%u)\n", ch, CELL_PAMF_FS_48kHz);
         break;
     }
 

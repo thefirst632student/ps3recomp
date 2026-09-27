@@ -44,6 +44,11 @@ extern "C" {
 #define CELL_PAMF_CODEC_TYPE_LPCM            0x80
 #define CELL_PAMF_CODEC_TYPE_AC3             0x81
 
+/* Audio constants */
+#define CELL_PAMF_FS_48kHz                   1
+#define CELL_PAMF_BIT_LENGTH_16              1
+#define CELL_PAMF_BIT_LENGTH_24              3
+
 /* ---------------------------------------------------------------------------
  * PAMF header magic
  * -----------------------------------------------------------------------*/
@@ -116,19 +121,22 @@ typedef struct CellPamfM2vInfo {
 } CellPamfM2vInfo;
 
 typedef struct CellPamfAtrac3plusInfo {
-    u32 samplingFrequency;
-    u8  numberOfChannels;
+    u32 samplingFrequency; /* +0: CELL_PAMF_FS_* */
+    u8  numberOfChannels;  /* +4 */
+    u8  pad[3];            /* +5 */
 } CellPamfAtrac3plusInfo;
 
 typedef struct CellPamfLpcmInfo {
-    u32 samplingFrequency;
-    u8  numberOfChannels;
-    u8  bitsPerSample;
+    u32 samplingFrequency; /* +0: CELL_PAMF_FS_* */
+    u8  numberOfChannels;  /* +4 */
+    u8  reserved;          /* +5 */
+    u16 bitsPerSample;     /* +6: CELL_PAMF_BIT_LENGTH_* */
 } CellPamfLpcmInfo;
 
 typedef struct CellPamfAc3Info {
-    u32 samplingFrequency;
-    u8  numberOfChannels;
+    u32 samplingFrequency; /* +0: CELL_PAMF_FS_* */
+    u8  numberOfChannels;  /* +4 */
+    u8  pad[3];            /* +5 */
 } CellPamfAc3Info;
 
 typedef struct CellPamfEp {
