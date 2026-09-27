@@ -94,18 +94,119 @@ void ps3_vfs_ps3game_fallback(char* path, size_t cap)
     struct stat st;
     if (!path || !*path || stat(path, &st) == 0)
         return;
-    char* p = strstr(path, "/PS3_GAME/");
-    if (!p)
+
+    char norm[1024];
+    strncpy(norm, path, sizeof(norm) - 1);
+    norm[sizeof(norm) - 1] = '\0';
+    for (char* c = norm; *c; c++) if (*c == '\\') *c = '/';
+
+    /* Find /USRDIR in the path */
+    const char* u = strstr(norm, "/USRDIR");
+    if (!u) u = strstr(norm, "/usrdir");
+    if (!u) {
+        /* Non-USRDIR paths (e.g. PARAM.SFO, ICON0.PNG): drop /PS3_GAME/ if present */
+        char* p = strstr(norm, "/PS3_GAME/");
+        if (!p) p = strstr(norm, "/ps3_game/");
+        if (p) {
+            char alt[1024];
+            size_t head = (size_t)(p - norm);
+            if (head + 1 < sizeof(alt)) {
+                memcpy(alt, norm, head);
+                snprintf(alt + head, sizeof(alt) - head, "/%s", p + 10);
+                if (stat(alt, &st) == 0) {
+                    snprintf(path, cap, "%s", alt);
+                    return;
+                }
+            }
+        }
         return;
+    }
+
+    const char* sub = u + 7; /* "/subpath" or "" */
+
+    /* Extract root by stripping /PS3_GAME or /game/<dir> before /USRDIR */
+    char root[1024];
+    size_t prefix_len = (size_t)(u - norm);
+    if (prefix_len >= sizeof(root)) prefix_len = sizeof(root) - 1;
+    memcpy(root, norm, prefix_len);
+    root[prefix_len] = '\0';
+
+    char* pg = strstr(root, "/PS3_GAME");
+    if (!pg) pg = strstr(root, "/ps3_game");
+    if (pg && pg[9] == '\0') {
+        *pg = '\0';
+    } else {
+        char* g = strstr(root, "/game/");
+        if (!g) g = strstr(root, "/GAME/");
+        if (g) {
+            *g = '\0';
+        }
+    }
+
     char alt[1024];
-    size_t head = (size_t)(p - path);
-    if (head + 1 >= sizeof alt)
+
+    /* 1. Try <root>/PS3_GAME/USRDIR<subpath> */
+    snprintf(alt, sizeof(alt), "%s/PS3_GAME/USRDIR%s", root, sub);
+    if (stat(alt, &st) == 0) {
+        snprintf(path, cap, "%s", alt);
         return;
-    memcpy(alt, path, head);
-    snprintf(alt + head, sizeof alt - head, "/%s", p + 10);
-    if (stat(alt, &st) != 0)
+    }
+
+    /* 2. Try <root>/game/BLJM60571/USRDIR<subpath> */
+    snprintf(alt, sizeof(alt), "%s/game/BLJM60571/USRDIR%s", root, sub);
+    if (stat(alt, &st) == 0) {
+        snprintf(path, cap, "%s", alt);
         return;
-    snprintf(path, cap, "%s", alt);
+    }
+
+#ifdef _WIN32
+    {
+        char search[1024];
+        snprintf(search, sizeof(search), "%s/game/*", root);
+        struct __finddata64_t fd;
+        intptr_t h = _findfirst64(search, &fd);
+        if (h != -1) {
+            do {
+                if (fd.name[0] == '.') continue;
+                if (fd.attrib & _A_SUBDIR) {
+                    snprintf(alt, sizeof(alt), "%s/game/%s/USRDIR%s", root, fd.name, sub);
+                    if (stat(alt, &st) == 0) {
+                        _findclose(h);
+                        snprintf(path, cap, "%s", alt);
+                        return;
+                    }
+                }
+            } while (_findnext64(h, &fd) == 0);
+            _findclose(h);
+        }
+    }
+#else
+    {
+        char gpath[1024];
+        snprintf(gpath, sizeof(gpath), "%s/game", root);
+        DIR* d = opendir(gpath);
+        if (d) {
+            struct dirent* de;
+            while ((de = readdir(d)) != NULL) {
+                if (de->d_name[0] == '.') continue;
+                snprintf(alt, sizeof(alt), "%s/game/%s/USRDIR%s", root, de->d_name, sub);
+                if (stat(alt, &st) == 0) {
+                    closedir(d);
+                    snprintf(path, cap, "%s", alt);
+                    return;
+                }
+            }
+            closedir(d);
+        }
+    }
+#endif
+
+    /* 3. Try flattened <root>/USRDIR<subpath> */
+    snprintf(alt, sizeof(alt), "%s/USRDIR%s", root, sub);
+    if (stat(alt, &st) == 0) {
+        snprintf(path, cap, "%s", alt);
+        return;
+    }
 }
 
 void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size)
