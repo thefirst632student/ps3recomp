@@ -83,20 +83,13 @@ static u16 be16(const void* p)
  * -----------------------------------------------------------------------*/
 static s32 raw_type_to_sdk(u8 rawType)
 {
-    switch (rawType) {
-    case PAMF_RAW_TYPE_AVC:
-    case CELL_PAMF_CODEC_TYPE_AVC:        return CELL_PAMF_STREAM_TYPE_AVC;
-    case PAMF_RAW_TYPE_M2V:
-    case CELL_PAMF_CODEC_TYPE_M2V:        return CELL_PAMF_STREAM_TYPE_M2V;
-    case PAMF_RAW_TYPE_ATRAC3PLUS:
-    case CELL_PAMF_CODEC_TYPE_ATRAC3PLUS: return CELL_PAMF_STREAM_TYPE_ATRAC3PLUS;
-    case PAMF_RAW_TYPE_AC3:
-    case CELL_PAMF_CODEC_TYPE_AC3:        return CELL_PAMF_STREAM_TYPE_AC3;
-    case PAMF_RAW_TYPE_LPCM:
-    case CELL_PAMF_CODEC_TYPE_LPCM:       return CELL_PAMF_STREAM_TYPE_PAMF_LPCM;
-    case PAMF_RAW_TYPE_USERDATA:          return CELL_PAMF_STREAM_TYPE_USER_DATA;
-    default:                              return -1;
-    }
+    if (rawType == PAMF_RAW_TYPE_AVC || rawType == CELL_PAMF_CODEC_TYPE_AVC) return CELL_PAMF_STREAM_TYPE_AVC;
+    if (rawType == PAMF_RAW_TYPE_M2V || rawType == CELL_PAMF_CODEC_TYPE_M2V) return CELL_PAMF_STREAM_TYPE_M2V;
+    if (rawType == PAMF_RAW_TYPE_ATRAC3PLUS || rawType == CELL_PAMF_CODEC_TYPE_ATRAC3PLUS) return CELL_PAMF_STREAM_TYPE_ATRAC3PLUS;
+    if (rawType == PAMF_RAW_TYPE_AC3 || rawType == CELL_PAMF_CODEC_TYPE_AC3) return CELL_PAMF_STREAM_TYPE_AC3;
+    if (rawType == PAMF_RAW_TYPE_LPCM || rawType == CELL_PAMF_CODEC_TYPE_LPCM) return CELL_PAMF_STREAM_TYPE_PAMF_LPCM;
+    if (rawType == PAMF_RAW_TYPE_USERDATA) return CELL_PAMF_STREAM_TYPE_USER_DATA;
+    return -1;
 }
 
 static int is_matching_stream_type(s32 sdkType, u8 requestedType)
