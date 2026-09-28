@@ -116,14 +116,18 @@ int64_t sys_timer_usleep(ppu_context* ctx)
      * at lr=0x0008681C (frame presentation) and lr=0x00086F88 (exit flush).
      * Clear label 128 immediately so vdisp can advance without spinning. */
     if ((uint32_t)ctx->lr == 0x0008681CU || (uint32_t)ctx->lr == 0x00086F88U) {
-        if (vm_is_valid_addr(0x003F3C08)) {
-            uint32_t lbl_ptr = vm_read32(0x003F3C08);
-            if (lbl_ptr && vm_is_valid_addr(lbl_ptr)) {
-                vm_write32(lbl_ptr, 0);
+        if (!cellVdec_is_seq_active()) {
+            extern uint8_t* vm_base;
+            if (vm_base) {
+                const uint8_t* p = vm_base + 0x003F3C08;
+                uint32_t lbl_ptr = (uint32_t)(((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]);
+                if (lbl_ptr) {
+                    uint8_t* lbl = vm_base + lbl_ptr;
+                    lbl[0] = lbl[1] = lbl[2] = lbl[3] = 0;
+                }
+                uint8_t* lbl2 = vm_base + 0x20000800;
+                lbl2[0] = lbl2[1] = lbl2[2] = lbl2[3] = 0;
             }
-        }
-        if (vm_is_valid_addr(0x20000800)) {
-            vm_write32(0x20000800, 0);
         }
     }
     /* PS3_WAIT_OBJ=<lr-hex>: when a usleep spin is reached from this return
