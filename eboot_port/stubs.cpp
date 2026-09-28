@@ -56,7 +56,8 @@ extern "C" {
     s32 cellDmuxOpen(const void* type, const void* res, const void* cb, void* handle);
     s32 cellDmuxClose(u32 handle);
     s32 cellDmuxEnableEs(u32 handle, const void* filterId, const void* res, const void* esCb, const void* esSpecificInfo, void* esHandle);
-    s32 cellDmuxDisableEs(u32 handle, u32 esHandle);
+    s32 cellDmuxDisableEs(u32 esHandle);
+    s32 cellDmuxReleaseAu(u32 esHandle);
     s32 cellDmuxSetStream(u32 handle, const void* streamAddr, u32 streamSize, u64 userData);
     s32 cellDmuxResetStream(u32 handle);
     s32 cellDmuxGetAu(u32 handle, u32 esHandle, void* auInfo);
@@ -148,7 +149,7 @@ extern "C" void ps3_load_prx_modules(void)
     ps3_hle_register(0x8C692521u, "cellDmuxClose", (void*)cellDmuxClose);
     ps3_hle_register(0x7B56DC3Fu, "cellDmuxEnableEs", (void*)cellDmuxEnableEs);
     ps3_hle_register(0x05371C8Du, "cellDmuxDisableEs", (void*)cellDmuxDisableEs);
-    ps3_hle_register(0x24EA6474u, "cellDmuxDisableEs", (void*)cellDmuxDisableEs);
+    ps3_hle_register(0x24EA6474u, "cellDmuxReleaseAu", (void*)cellDmuxReleaseAu);
     ps3_hle_register(0x04E7499Fu, "cellDmuxSetStream", (void*)cellDmuxSetStream);
     ps3_hle_register(0x5D345DE9u, "cellDmuxResetStream", (void*)cellDmuxResetStream);
     ps3_hle_register(0x42C716B5u, "cellDmuxGetAu", (void*)cellDmuxGetAu);
