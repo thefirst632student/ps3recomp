@@ -34,6 +34,8 @@ typedef struct {
     u32 auSeqNo;        /* running AU sequence counter */
 } DmuxSlot;
 
+#define DMUX_AU_QUEUE_CAP 16
+
 typedef struct {
     int in_use;
     u32 dmuxId;
@@ -42,8 +44,10 @@ typedef struct {
     u32 esCbArg;
     u32 memAddr;
     u32 memSize;
-    CellDmuxAuInfo currentAu;
-    int hasAu;
+    CellDmuxAuInfo queue[DMUX_AU_QUEUE_CAP];
+    int qHead;
+    int qCount;
+    int acquired;
 } DmuxEsSlot;
 
 static DmuxSlot s_dmux[CELL_DMUX_MAX_HANDLES];
@@ -193,11 +197,14 @@ s32 cellDmuxEnableEs(CellDmuxHandle handle, const CellDmuxEsFilterId* esFilterId
             s_es[i].esCbArg = esCbArg;
             s_es[i].memAddr = memAddr;
             s_es[i].memSize = memSize;
-            s_es[i].hasAu = 0;
-            memset(&s_es[i].currentAu, 0, sizeof(CellDmuxAuInfo));
+            s_es[i].qHead = 0;
+            s_es[i].qCount = 0;
+            s_es[i].acquired = 0;
+            memset(s_es[i].queue, 0, sizeof(s_es[i].queue));
             vm_write32((u32)(uintptr_t)esHandle, (u32)i);
-            printf("[cellDmux] EnableEs -> esHandle=%u, esCbFunc=0x%08X, esCbArg=0x%08X, memAddr=0x%08X\n",
-                   i, esCbFunc, esCbArg, memAddr);
+            printf("[cellDmux] EnableEs -> esHandle=%u filter=%02X/%02X avc=%u, esCbFunc=0x%08X, esCbArg=0x%08X, memAddr=0x%08X\n",
+                   i, s_es[i].filterId.filterIdMajor, s_es[i].filterId.filterIdMinor,
+                   s_es[i].filterId.supplementalInfo1, esCbFunc, esCbArg, memAddr);
             return CELL_OK;
         }
     }
@@ -240,7 +247,7 @@ s32 cellDmuxSetStream(CellDmuxHandle handle, u32 streamAddr, u32 streamSize,
         dmux->auSeqNo = 0;
         for (int i = 0; i < CELL_DMUX_MAX_ES; i++) {
             if (s_es[i].in_use && s_es[i].dmuxId == handle)
-                s_es[i].hasAu = 0;
+                s_es[i].qHead = s_es[i].qCount = s_es[i].acquired = 0;
         }
     }
 
@@ -257,18 +264,29 @@ s32 cellDmuxSetStream(CellDmuxHandle handle, u32 streamAddr, u32 streamSize,
 
         DmuxEsSlot* es = &s_es[i];
 
-        /* Fill in AU info */
-        es->currentAu.auAddr = streamAddr;
-        es->currentAu.auSize = streamSize;
-        es->currentAu.pts    = (u64)dmux->auSeqNo * 3003; /* ~29.97 fps tick */
-        es->currentAu.dts    = es->currentAu.pts;
-        es->currentAu.userData = userData;
-        es->currentAu.isRap  = (dmux->auSeqNo == 0) ? 1 : 0;
-        es->currentAu.reserved = 0;
-        es->hasAu = 1;
+        if (es->qCount >= DMUX_AU_QUEUE_CAP) {
+            printf("[cellDmux] ES %d: AU queue full; refusing to overwrite pending AU\n", i);
+            continue;
+        }
 
-        printf("[cellDmux] ES %d: AU_FOUND (addr=0x%X, size=%u, pts=%llu)\n",
-               i, streamAddr, streamSize, (unsigned long long)es->currentAu.pts);
+        /* Preserve each submitted buffer as a distinct AU.  This is still a
+         * lightweight PAMF demux compatibility path, but unlike the old
+         * single-slot stub it cannot lose AU #1 when SetStream(AU #2) races
+         * the decoder thread. */
+        int pos = (es->qHead + es->qCount) % DMUX_AU_QUEUE_CAP;
+        CellDmuxAuInfo* au = &es->queue[pos];
+        memset(au, 0, sizeof(*au));
+        au->auAddr = streamAddr;
+        au->auSize = streamSize;
+        au->auMaxSize = streamSize;
+        au->pts = (u64)dmux->auSeqNo * 3003; /* ~29.97 fps tick */
+        au->dts = au->pts;
+        au->userData = userData;
+        au->isRap = (dmux->auSeqNo == 0) ? 1 : 0;
+        es->qCount++;
+
+        printf("[cellDmux] ES %d: AU_FOUND queued=%d (addr=0x%X, size=%u, pts=%llu)\n",
+               i, es->qCount, streamAddr, streamSize, (unsigned long long)au->pts);
 
         /* Fire AU_FOUND callback to guest */
         if (es->esCbFunc && g_ps3_guest_caller) {
@@ -311,7 +329,7 @@ s32 cellDmuxResetStream(CellDmuxHandle handle)
     /* Clear pending AUs from all ES handles and reset stream tracking */
     for (int i = 0; i < CELL_DMUX_MAX_ES; i++) {
         if (s_es[i].in_use && s_es[i].dmuxId == handle)
-            s_es[i].hasAu = 0;
+            s_es[i].qHead = s_es[i].qCount = s_es[i].acquired = 0;
     }
     s_dmux[handle].streamAddr = 0;
     s_dmux[handle].streamSize = 0;
@@ -329,58 +347,64 @@ s32 cellDmuxResetStreamAndWaitDone(CellDmuxHandle handle)
  * AU retrieval
  * -----------------------------------------------------------------------*/
 
-static s32 write_au_info(CellDmuxEsHandle esHandle, void* auInfo, u32* auInfoNum, int is_ex)
+static s32 write_au_info(CellDmuxEsHandle esHandle, void* auInfo,
+                         void* auSpecificInfo, int consume, int is_ex)
 {
+    (void)is_ex;
     if (esHandle >= CELL_DMUX_MAX_ES || !s_es[esHandle].in_use)
         return (s32)CELL_DMUX_ERROR_ARG;
 
-    if (!s_es[esHandle].hasAu)
+    DmuxEsSlot* es = &s_es[esHandle];
+    if (!es->qCount || (consume && es->acquired))
         return (s32)CELL_DMUX_ERROR_EMPTY;
 
-    DmuxEsSlot* es = &s_es[esHandle];
+    CellDmuxAuInfo* au = &es->queue[es->qHead];
     u32 guest_au_addr = es->memAddr;
-    if (guest_au_addr) {
-        vm_write32(guest_au_addr + 0x00, es->currentAu.auAddr);
-        vm_write32(guest_au_addr + 0x04, es->currentAu.auSize);
-        vm_write32(guest_au_addr + 0x08, 0);
-        vm_write32(guest_au_addr + 0x0C, 0);
-        vm_write64(guest_au_addr + 0x10, es->currentAu.dts);
-        vm_write64(guest_au_addr + 0x18, es->currentAu.pts);
-        vm_write64(guest_au_addr + 0x20, es->currentAu.userData);
-        vm_write32(guest_au_addr + 0x28, es->currentAu.isRap);
-        vm_write32(guest_au_addr + 0x2C, 0);
-        if (is_ex) {
-            vm_write32(guest_au_addr + 0x30, 0);
-        }
-        if (auInfo) {
-            vm_write32((u32)(uintptr_t)auInfo, guest_au_addr);
-        }
-    }
+    if (!guest_au_addr)
+        return (s32)CELL_DMUX_ERROR_FATAL;
 
-    if (auInfoNum)
-        vm_write32((u32)(uintptr_t)auInfoNum, (u32)1);
+    /* CellDmuxAuInfo / Ex ABI (matches SDK/RPCS3). */
+    vm_write32(guest_au_addr + 0x00, au->auAddr);
+    vm_write32(guest_au_addr + 0x04, au->auSize);
+    vm_write32(guest_au_addr + 0x08, au->auMaxSize);
+    vm_write8 (guest_au_addr + 0x0C, (u8)(au->isRap ? 1 : 0));
+    vm_write8 (guest_au_addr + 0x0D, 0);
+    vm_write8 (guest_au_addr + 0x0E, 0);
+    vm_write8 (guest_au_addr + 0x0F, 0);
+    vm_write64(guest_au_addr + 0x10, au->userData);
+    vm_write64(guest_au_addr + 0x18, au->pts);
+    vm_write64(guest_au_addr + 0x20, au->dts);
 
+    if (auInfo)
+        vm_write32(GUEST_EA(auInfo), guest_au_addr);
+    if (auSpecificInfo)
+        vm_write32(GUEST_EA(auSpecificInfo), 0);
+    if (consume)
+        es->acquired = 1;
+
+    printf("[cellDmux] %sAu(es=%u) -> info=0x%08X data=0x%08X size=%u queued=%d\n",
+           consume ? "Get" : "Peek", esHandle, guest_au_addr, au->auAddr, au->auSize, es->qCount);
     return CELL_OK;
 }
 
-s32 cellDmuxGetAu(CellDmuxEsHandle esHandle, void* auInfo, u32* auInfoNum)
+s32 cellDmuxGetAu(CellDmuxEsHandle esHandle, void* auInfo, void* auSpecificInfo)
 {
-    return write_au_info(esHandle, auInfo, auInfoNum, 0);
+    return write_au_info(esHandle, auInfo, auSpecificInfo, 1, 0);
 }
 
-s32 cellDmuxGetAuEx(CellDmuxEsHandle esHandle, void* auInfoEx, u32* auInfoNum)
+s32 cellDmuxGetAuEx(CellDmuxEsHandle esHandle, void* auInfoEx, void* auSpecificInfo)
 {
-    return write_au_info(esHandle, auInfoEx, auInfoNum, 1);
+    return write_au_info(esHandle, auInfoEx, auSpecificInfo, 1, 1);
 }
 
-s32 cellDmuxPeekAu(CellDmuxEsHandle esHandle, void* auInfo, u32* auInfoNum)
+s32 cellDmuxPeekAu(CellDmuxEsHandle esHandle, void* auInfo, void* auSpecificInfo)
 {
-    return write_au_info(esHandle, auInfo, auInfoNum, 0);
+    return write_au_info(esHandle, auInfo, auSpecificInfo, 0, 0);
 }
 
-s32 cellDmuxPeekAuEx(CellDmuxEsHandle esHandle, void* auInfoEx, u32* auInfoNum)
+s32 cellDmuxPeekAuEx(CellDmuxEsHandle esHandle, void* auInfoEx, void* auSpecificInfo)
 {
-    return write_au_info(esHandle, auInfoEx, auInfoNum, 1);
+    return write_au_info(esHandle, auInfoEx, auSpecificInfo, 0, 1);
 }
 
 s32 cellDmuxReleaseAu(CellDmuxEsHandle esHandle)
@@ -388,7 +412,13 @@ s32 cellDmuxReleaseAu(CellDmuxEsHandle esHandle)
     if (esHandle >= CELL_DMUX_MAX_ES || !s_es[esHandle].in_use)
         return (s32)CELL_DMUX_ERROR_ARG;
 
-    s_es[esHandle].hasAu = 0;
+    DmuxEsSlot* es = &s_es[esHandle];
+    if (!es->qCount) return (s32)CELL_DMUX_ERROR_EMPTY;
+    memset(&es->queue[es->qHead], 0, sizeof(es->queue[es->qHead]));
+    es->qHead = (es->qHead + 1) % DMUX_AU_QUEUE_CAP;
+    es->qCount--;
+    es->acquired = 0;
+    printf("[cellDmux] ReleaseAu(es=%u) remaining=%d\n", esHandle, es->qCount);
     return CELL_OK;
 }
 
@@ -399,7 +429,9 @@ s32 cellDmuxFlushEs(CellDmuxEsHandle esHandle)
     if (esHandle >= CELL_DMUX_MAX_ES || !s_es[esHandle].in_use)
         return (s32)CELL_DMUX_ERROR_ARG;
 
-    s_es[esHandle].hasAu = 0;
+    /* Do not discard already announced AUs.  FLUSH_DONE means no more input
+     * is pending, not that AU_FOUND entries may be destroyed underneath the
+     * decoder thread. */
 
     if (s_es[esHandle].esCbFunc && g_ps3_guest_caller) {
         u32 es_msg_ea = s_es[esHandle].memAddr ? (s_es[esHandle].memAddr + 0x40) : 0;

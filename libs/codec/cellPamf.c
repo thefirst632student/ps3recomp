@@ -567,16 +567,48 @@ s32 cellPamfReaderGetStreamIndex(CellPamfReader* reader)
     return reader->currentStream;
 }
 
-s32 cellPamfStreamTypeToEsFilterId(u8 streamType, u8 streamIndex,
+s32 cellPamfStreamTypeToEsFilterId(u8 streamType, u8 channel,
                                      void* esFilterId)
 {
-    (void)streamType; (void)streamIndex;
     if (!esFilterId)
         return (s32)CELL_PAMF_ERROR_INVALID_ARG;
 
+    /* CellCodecEsFilterId is four BE u32 fields, not four bytes.
+     * PAMF maps video to MPEG-PS stream 0xE0..0xEF and audio/user data to
+     * private_stream_1 (0xBD) with a codec-specific substream id.
+     * supplementalInfo1 selects AVC (1) vs MPEG-2 video (0). */
+    u32 major = 0, minor = 0, supplemental1 = 0;
+    switch (streamType) {
+    case CELL_PAMF_STREAM_TYPE_AVC:
+        major = 0xE0u | (channel & 0x0Fu);
+        supplemental1 = 1;
+        break;
+    case CELL_PAMF_STREAM_TYPE_M2V:
+        major = 0xE0u | (channel & 0x0Fu);
+        break;
+    case CELL_PAMF_STREAM_TYPE_ATRAC3PLUS:
+        major = 0xBD; minor = channel & 0x0F;
+        break;
+    case CELL_PAMF_STREAM_TYPE_PAMF_LPCM:
+        major = 0xBD; minor = 0x40u | (channel & 0x0Fu);
+        break;
+    case CELL_PAMF_STREAM_TYPE_AC3:
+        major = 0xBD; minor = 0x30u | (channel & 0x0Fu);
+        break;
+    case CELL_PAMF_STREAM_TYPE_USER_DATA:
+        major = 0xBD; minor = 0x20u | (channel & 0x0Fu);
+        break;
+    default:
+        return (s32)CELL_PAMF_ERROR_INVALID_ARG;
+    }
+
     u32 ea = (u32)(uintptr_t)esFilterId;
-    vm_write8(ea + 0, streamType);
-    vm_write8(ea + 1, streamIndex);
+    vm_write32(ea + 0x00, major);
+    vm_write32(ea + 0x04, minor);
+    vm_write32(ea + 0x08, supplemental1);
+    vm_write32(ea + 0x0C, 0);
+    printf("[cellPamf] StreamTypeToEsFilterId(type=%u ch=%u) -> %02X/%02X avc=%u\n",
+           streamType, channel, major, minor, supplemental1);
     return CELL_OK;
 }
 

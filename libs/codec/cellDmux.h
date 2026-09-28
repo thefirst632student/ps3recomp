@@ -31,7 +31,9 @@ extern "C" {
 #define CELL_DMUX_MAX_ES               16
 
 /* Demux types */
-#define CELL_DMUX_TYPE_PAMF            0
+#define CELL_DMUX_STREAM_TYPE_UNDEFINED  0
+#define CELL_DMUX_STREAM_TYPE_PAMF       1
+#define CELL_DMUX_TYPE_PAMF              CELL_DMUX_STREAM_TYPE_PAMF
 
 /* ES message types (delivered via callback) */
 #define CELL_DMUX_MSG_TYPE_DEMUX_DONE      0
@@ -63,10 +65,10 @@ typedef struct CellDmuxResource {
 } CellDmuxResource;
 
 typedef struct CellDmuxEsFilterId {
-    u8 filterIdMajor;
-    u8 filterIdMinor;
-    u8 supplementalInfo1;
-    u8 supplementalInfo2;
+    u32 filterIdMajor;
+    u32 filterIdMinor;
+    u32 supplementalInfo1;
+    u32 supplementalInfo2;
 } CellDmuxEsFilterId;
 
 typedef struct CellDmuxEsResource {
@@ -74,26 +76,20 @@ typedef struct CellDmuxEsResource {
     u32 memSize;
 } CellDmuxEsResource;
 
+/* Logical host representation. Guest ABI is written explicitly in cellDmux.c:
+ *   +0x00 auAddr, +0x04 auSize, +0x08 auMaxSize/reserved, +0x0c isRap,
+ *   +0x10 userData, +0x18 pts, +0x20 dts.
+ * CellDmuxAuInfoEx uses the same base layout on the PS3 ABI. */
 typedef struct CellDmuxAuInfo {
     u32 auAddr;
     u32 auSize;
-    u64 pts;
-    u64 dts;
-    u64 userData;
-    u32 isRap;       /* random access point */
-    u32 reserved;
-} CellDmuxAuInfo;
-
-typedef struct CellDmuxAuInfoEx {
-    u32 auAddr;
-    u32 auSize;
-    u64 pts;
-    u64 dts;
-    u64 userData;
+    u32 auMaxSize;
     u32 isRap;
-    u32 reserved;
-    u32 auSpecificInfo;
-} CellDmuxAuInfoEx;
+    u64 userData;
+    u64 pts;
+    u64 dts;
+} CellDmuxAuInfo;
+typedef CellDmuxAuInfo CellDmuxAuInfoEx;
 
 typedef struct CellDmuxCb {
     u32 cbFunc;
@@ -148,10 +144,10 @@ s32 cellDmuxResetStream(CellDmuxHandle handle);
 s32 cellDmuxResetStreamAndWaitDone(CellDmuxHandle handle);
 
 /* AU retrieval */
-s32 cellDmuxGetAu(CellDmuxEsHandle esHandle, void* auInfo, u32* auInfoNum);
-s32 cellDmuxGetAuEx(CellDmuxEsHandle esHandle, void* auInfoEx, u32* auInfoNum);
-s32 cellDmuxPeekAu(CellDmuxEsHandle esHandle, void* auInfo, u32* auInfoNum);
-s32 cellDmuxPeekAuEx(CellDmuxEsHandle esHandle, void* auInfoEx, u32* auInfoNum);
+s32 cellDmuxGetAu(CellDmuxEsHandle esHandle, void* auInfo, void* auSpecificInfo);
+s32 cellDmuxGetAuEx(CellDmuxEsHandle esHandle, void* auInfoEx, void* auSpecificInfo);
+s32 cellDmuxPeekAu(CellDmuxEsHandle esHandle, void* auInfo, void* auSpecificInfo);
+s32 cellDmuxPeekAuEx(CellDmuxEsHandle esHandle, void* auInfoEx, void* auSpecificInfo);
 s32 cellDmuxReleaseAu(CellDmuxEsHandle esHandle);
 s32 cellDmuxFlushEs(CellDmuxEsHandle esHandle);
 

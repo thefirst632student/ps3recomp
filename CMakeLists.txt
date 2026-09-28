@@ -265,8 +265,10 @@ if(PS3RECOMP_ENABLE_FFMPEG)
         target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_HAVE_FFMPEG=1)
         message(STATUS "  FFmpeg:       cellVdec real AVC/MPEG-2 decode enabled")
     else()
-        message(STATUS "  FFmpeg:       not found; cellVdec builds without real decode")
+        message(WARNING "  FFmpeg: not found; cellVdec will use synthetic PICOUT fallback (movie pixels are not decoded)")
     endif()
+else()
+    message(STATUS "  FFmpeg:       disabled; cellVdec synthetic PICOUT fallback enabled")
 endif()
 
 # ---------------------------------------------------------------------------

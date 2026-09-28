@@ -34,16 +34,19 @@ extern ps3_guest_caller_fn g_ps3_guest_caller;
 #define PICITEM_SIZE 0x80u
 #define PICINFO_OFFSET 0x80u
 
-#ifdef PS3RECOMP_HAVE_FFMPEG
 typedef struct {
+#ifdef PS3RECOMP_HAVE_FFMPEG
     AVFrame* frame;
+#endif
+    u32 width;
+    u32 height;
     u64 pts;
     u64 dts;
     u64 userData;
     u32 auNum;
     int picItemReceived;
+    int synthetic;
 } VdecFrame;
-#endif
 
 typedef struct {
     int in_use;
@@ -55,13 +58,13 @@ typedef struct {
     int seqStarted;
     u32 auCount;
     u32 frameRateCode;
+    VdecFrame queue[VDEC_QUEUE_CAP];
+    int qHead;
+    int qCount;
 #ifdef PS3RECOMP_HAVE_FFMPEG
     const AVCodec* codec;
     AVCodecContext* ctx;
     struct SwsContext* sws;
-    VdecFrame queue[VDEC_QUEUE_CAP];
-    int qHead;
-    int qCount;
 #endif
 } VdecSlot;
 
@@ -75,17 +78,36 @@ static void callback(VdecSlot* v, u32 handle, u32 type, s32 status)
     }
 }
 
-#ifdef PS3RECOMP_HAVE_FFMPEG
 static void clear_queue(VdecSlot* v)
 {
     for (int i = 0; i < VDEC_QUEUE_CAP; ++i) {
+#ifdef PS3RECOMP_HAVE_FFMPEG
         if (v->queue[i].frame) av_frame_free(&v->queue[i].frame);
+#endif
         memset(&v->queue[i], 0, sizeof(v->queue[i]));
     }
     v->qHead = 0;
     v->qCount = 0;
 }
 
+static int queue_synthetic(VdecSlot* v, const CellVdecAuInfo* au, u32 width, u32 height)
+{
+    if (v->qCount >= VDEC_QUEUE_CAP) return -1;
+    int pos = (v->qHead + v->qCount) % VDEC_QUEUE_CAP;
+    VdecFrame* q = &v->queue[pos];
+    memset(q, 0, sizeof(*q));
+    q->width = width ? width : 1280;
+    q->height = height ? height : 720;
+    q->pts = au->pts;
+    q->dts = au->dts;
+    q->userData = au->userData;
+    q->auNum = v->auCount;
+    q->synthetic = 1;
+    v->qCount++;
+    return 0;
+}
+
+#ifdef PS3RECOMP_HAVE_FFMPEG
 static int ffmpeg_open(VdecSlot* v)
 {
     enum AVCodecID id = AV_CODEC_ID_NONE;
@@ -168,6 +190,8 @@ static int queue_frame(VdecSlot* v, AVFrame* f, const CellVdecAuInfo* au)
     VdecFrame* q = &v->queue[pos];
     memset(q, 0, sizeof(*q));
     q->frame = f;
+    q->width = (u32)f->width;
+    q->height = (u32)f->height;
     q->pts = f->pts != AV_NOPTS_VALUE ? (u64)f->pts : au->pts;
     q->dts = f->pkt_dts != AV_NOPTS_VALUE ? (u64)f->pkt_dts : au->dts;
     q->userData = au->userData;
@@ -249,6 +273,8 @@ s32 cellVdecClose(CellVdecHandle handle)
     if (handle >= MAX_VDEC || !s_vdec[handle].in_use) return (s32)CELL_VDEC_ERROR_ARG;
 #ifdef PS3RECOMP_HAVE_FFMPEG
     ffmpeg_close(&s_vdec[handle]);
+#else
+    clear_queue(&s_vdec[handle]);
 #endif
     memset(&s_vdec[handle], 0, sizeof(s_vdec[handle]));
     return CELL_OK;
@@ -259,8 +285,9 @@ s32 cellVdecStartSeq(CellVdecHandle handle)
     if (handle >= MAX_VDEC || !s_vdec[handle].in_use) return (s32)CELL_VDEC_ERROR_ARG;
     VdecSlot* v = &s_vdec[handle];
     v->seqStarted = 1; v->auCount = 0;
+    clear_queue(v);
 #ifdef PS3RECOMP_HAVE_FFMPEG
-    clear_queue(v); avcodec_flush_buffers(v->ctx);
+    avcodec_flush_buffers(v->ctx);
 #endif
     return CELL_OK;
 }
@@ -324,18 +351,36 @@ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auIn
     }
     for (int i = before; i < v->qCount; ++i) callback(v, handle, CELL_VDEC_MSG_TYPE_PICOUT, CELL_OK);
 #else
+    /* Keep cellVdec callback semantics alive even on builds where libavcodec
+     * was not detected.  The old no-FFmpeg path emitted AUDONE only, so the
+     * movie display thread waited forever for PICOUT.  A neutral black frame
+     * is preferable to deadlocking the title; the log makes this fallback
+     * explicit so it cannot be mistaken for real decoding. */
+    if (queue_synthetic(v, &au, 1280, 720) < 0) {
+        callback(v, handle, CELL_VDEC_MSG_TYPE_AUDONE, CELL_VDEC_ERROR_BUSY);
+        return (s32)CELL_VDEC_ERROR_BUSY;
+    }
+    printf("[cellVdec] DecodeAu #%u: FFmpeg=no, synthetic PICOUT 1280x720 (addr=0x%08X size=%u)\n",
+           v->auCount, au.startAddr, au.size);
     callback(v, handle, CELL_VDEC_MSG_TYPE_AUDONE, CELL_OK);
+    callback(v, handle, CELL_VDEC_MSG_TYPE_PICOUT, CELL_OK);
 #endif
     return CELL_OK;
 }
 
-#ifdef PS3RECOMP_HAVE_FFMPEG
 static void write_pic_item(VdecSlot* v, VdecFrame* q, u32 item)
 {
-    AVFrame* f = q->frame;
     u32 info = item + PICINFO_OFFSET;
-    int bufSize = av_image_get_buffer_size((enum AVPixelFormat)f->format, f->width, f->height, 1);
-    if (bufSize < 0) bufSize = f->width * f->height * 3 / 2;
+    u32 width = q->width ? q->width : 1280;
+    u32 height = q->height ? q->height : 720;
+    u32 bufSize = width * height * 3 / 2;
+#ifdef PS3RECOMP_HAVE_FFMPEG
+    if (q->frame && !q->synthetic) {
+        int realSize = av_image_get_buffer_size((enum AVPixelFormat)q->frame->format,
+                                                q->frame->width, q->frame->height, 1);
+        if (realSize > 0) bufSize = (u32)realSize;
+    }
+#endif
 
     vm_write32(item + 0x00, v->codecType);
     vm_write32(item + 0x04, 0x00000123);
@@ -349,17 +394,15 @@ static void write_pic_item(VdecSlot* v, VdecFrame* q, u32 item)
     vm_write32(item + 0x40, CELL_OK); vm_write32(item + 0x44, 0);
     vm_write32(item + 0x48, info);
 
-    memset(GUEST_PTR((void*)(uintptr_t)info, void*), 0, 0x180);
+    for (u32 off = 0; off < 0x180; off += 4) vm_write32(info + off, 0);
     /* AVC/MPEG2 info both begin with horizontalSize/verticalSize in the SDK. */
-    vm_write16(info + 0x00, (u16)f->width);
-    vm_write16(info + 0x02, (u16)f->height);
+    vm_write16(info + 0x00, (u16)width);
+    vm_write16(info + 0x02, (u16)height);
 }
-#endif
 
 s32 cellVdecGetPicItem(CellVdecHandle handle, void* picItem)
 {
     if (handle >= MAX_VDEC || !s_vdec[handle].in_use || !picItem) return (s32)CELL_VDEC_ERROR_ARG;
-#ifdef PS3RECOMP_HAVE_FFMPEG
     VdecSlot* v = &s_vdec[handle];
     for (int n = 0; n < v->qCount; ++n) {
         int idx = (v->qHead + n) % VDEC_QUEUE_CAP;
@@ -369,53 +412,96 @@ s32 cellVdecGetPicItem(CellVdecHandle handle, void* picItem)
             write_pic_item(v, q, item);
             q->picItemReceived = 1;
             vm_write32(GUEST_EA(picItem), item);
+            printf("[cellVdec] GetPicItem -> item=0x%08X frame=%ux%u synthetic=%d qCount=%d\n",
+                   item, q->width, q->height, q->synthetic, v->qCount);
             return CELL_OK;
         }
     }
-#endif
     return (s32)CELL_VDEC_ERROR_EMPTY;
 }
 
 s32 cellVdecGetPicture(CellVdecHandle handle, const CellVdecPicFormat* format, void* outBuff)
 {
     if (handle >= MAX_VDEC || !s_vdec[handle].in_use || !format) return (s32)CELL_VDEC_ERROR_ARG;
-#ifdef PS3RECOMP_HAVE_FFMPEG
     VdecSlot* v = &s_vdec[handle];
     if (!v->qCount) return (s32)CELL_VDEC_ERROR_EMPTY;
     VdecFrame* q = &v->queue[v->qHead];
-    AVFrame* f = q->frame;
+    u32 width = q->width ? q->width : 1280;
+    u32 height = q->height ? q->height : 720;
+    u32 fmtEa = GUEST_EA(format);
+    u32 fmt = vm_read32(fmtEa + 0);
+
     if (outBuff) {
-        u32 fmtEa = GUEST_EA(format);
-        u32 fmt = vm_read32(fmtEa + 0);
-        enum AVPixelFormat dstFmt;
-        int stride;
-        switch (fmt) {
-            case CELL_VDEC_PICFMT_ARGB32_ILV: dstFmt = AV_PIX_FMT_ARGB; stride = f->width * 4; break;
-            case CELL_VDEC_PICFMT_RGBA32_ILV: dstFmt = AV_PIX_FMT_RGBA; stride = f->width * 4; break;
-            case CELL_VDEC_PICFMT_UYVY422_ILV: dstFmt = AV_PIX_FMT_UYVY422; stride = f->width * 2; break;
-            case CELL_VDEC_PICFMT_YUV420_PLANAR: dstFmt = AV_PIX_FMT_YUV420P; stride = f->width; break;
-            default: return (s32)CELL_VDEC_ERROR_ARG;
-        }
-        v->sws = sws_getCachedContext(v->sws, f->width, f->height, (enum AVPixelFormat)f->format,
-                                      f->width, f->height, dstFmt, SWS_POINT, NULL, NULL, NULL);
-        if (!v->sws) return (s32)CELL_VDEC_ERROR_FATAL;
         u8* base = GUEST_PTR(outBuff, u8*);
-        u8* dst[4] = { base, NULL, NULL, NULL };
-        int lines[4] = { stride, 0, 0, 0 };
-        if (dstFmt == AV_PIX_FMT_YUV420P) {
-            dst[1] = base + f->width * f->height;
-            dst[2] = dst[1] + (f->width / 2) * (f->height / 2);
-            lines[1] = lines[2] = f->width / 2;
-        }
-        sws_scale(v->sws, (const u8* const*)f->data, f->linesize, 0, f->height, dst, lines);
-    }
-    av_frame_free(&q->frame); memset(q, 0, sizeof(*q));
-    v->qHead = (v->qHead + 1) % VDEC_QUEUE_CAP; v->qCount--;
-    return CELL_OK;
-#else
-    (void)outBuff;
-    return (s32)CELL_VDEC_ERROR_EMPTY;
+#ifdef PS3RECOMP_HAVE_FFMPEG
+        if (q->frame && !q->synthetic) {
+            AVFrame* f = q->frame;
+            enum AVPixelFormat dstFmt;
+            int stride;
+            switch (fmt) {
+                case CELL_VDEC_PICFMT_ARGB32_ILV: dstFmt = AV_PIX_FMT_ARGB; stride = f->width * 4; break;
+                case CELL_VDEC_PICFMT_RGBA32_ILV: dstFmt = AV_PIX_FMT_RGBA; stride = f->width * 4; break;
+                case CELL_VDEC_PICFMT_UYVY422_ILV: dstFmt = AV_PIX_FMT_UYVY422; stride = f->width * 2; break;
+                case CELL_VDEC_PICFMT_YUV420_PLANAR: dstFmt = AV_PIX_FMT_YUV420P; stride = f->width; break;
+                default: return (s32)CELL_VDEC_ERROR_ARG;
+            }
+            v->sws = sws_getCachedContext(v->sws, f->width, f->height, (enum AVPixelFormat)f->format,
+                                          f->width, f->height, dstFmt, SWS_POINT, NULL, NULL, NULL);
+            if (!v->sws) return (s32)CELL_VDEC_ERROR_FATAL;
+            u8* dst[4] = { base, NULL, NULL, NULL };
+            int lines[4] = { stride, 0, 0, 0 };
+            if (dstFmt == AV_PIX_FMT_YUV420P) {
+                dst[1] = base + f->width * f->height;
+                dst[2] = dst[1] + (f->width / 2) * (f->height / 2);
+                lines[1] = lines[2] = f->width / 2;
+            }
+            sws_scale(v->sws, (const u8* const*)f->data, f->linesize, 0, f->height, dst, lines);
+        } else
 #endif
+        {
+            /* Synthetic fallback: write a standards-shaped neutral black frame
+             * in the exact format requested by the game/vpost pipeline. */
+            u8 alpha = vm_read8(fmtEa + offsetof(CellVdecPicFormat, alpha));
+            switch (fmt) {
+                case CELL_VDEC_PICFMT_ARGB32_ILV:
+                    for (u32 i = 0, pixels = width * height; i < pixels; ++i) {
+                        base[i * 4 + 0] = alpha;
+                        base[i * 4 + 1] = 0; base[i * 4 + 2] = 0; base[i * 4 + 3] = 0;
+                    }
+                    break;
+                case CELL_VDEC_PICFMT_RGBA32_ILV:
+                    for (u32 i = 0, pixels = width * height; i < pixels; ++i) {
+                        base[i * 4 + 0] = 0; base[i * 4 + 1] = 0; base[i * 4 + 2] = 0; base[i * 4 + 3] = alpha;
+                    }
+                    break;
+                case CELL_VDEC_PICFMT_UYVY422_ILV:
+                    for (u32 i = 0, pairs = width * height / 2; i < pairs; ++i) {
+                        base[i * 4 + 0] = 128; base[i * 4 + 1] = 16;
+                        base[i * 4 + 2] = 128; base[i * 4 + 3] = 16;
+                    }
+                    break;
+                case CELL_VDEC_PICFMT_YUV420_PLANAR: {
+                    size_t ysz = (size_t)width * height;
+                    size_t csz = (size_t)(width / 2) * (height / 2);
+                    memset(base, 16, ysz);
+                    memset(base + ysz, 128, csz * 2);
+                    break;
+                }
+                default:
+                    return (s32)CELL_VDEC_ERROR_ARG;
+            }
+        }
+    }
+
+    printf("[cellVdec] GetPicture <- frame=%ux%u fmt=%u synthetic=%d qCount=%d\n",
+           width, height, fmt, q->synthetic, v->qCount);
+#ifdef PS3RECOMP_HAVE_FFMPEG
+    if (q->frame) av_frame_free(&q->frame);
+#endif
+    memset(q, 0, sizeof(*q));
+    v->qHead = (v->qHead + 1) % VDEC_QUEUE_CAP;
+    v->qCount--;
+    return CELL_OK;
 }
 
 s32 cellVdecSetFrameRate(CellVdecHandle handle, u32 frameRateCode)
