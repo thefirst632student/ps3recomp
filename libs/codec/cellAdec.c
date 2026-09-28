@@ -106,6 +106,21 @@ static void adec_notify(CellAdecHandle handle, u32 msg_type, s32 msg_data)
  * API implementations
  * -----------------------------------------------------------------------*/
 
+s32 cellAdecQueryAttr(const CellAdecType* type, CellAdecAttr* attr)
+{
+    u32 codec_type = type ? vm_read32(GUEST_EA(type)) : 0;
+    printf("[cellAdec] QueryAttr(codecType=%u)\n", codec_type);
+
+    if (!type || !attr)
+        return (s32)CELL_ADEC_ERROR_ARG;
+
+    u32 ea = GUEST_EA(attr);
+    vm_write32(ea + (u32)offsetof(CellAdecAttr, memSize), 64 * 1024);
+    vm_write32(ea + (u32)offsetof(CellAdecAttr, decoderVerUpper), 1);
+    vm_write32(ea + (u32)offsetof(CellAdecAttr, decoderVerLower), 0);
+    return CELL_OK;
+}
+
 /* cellAdecOpen(type, res, cb, handle) -- FOUR arguments.
  *
  * This took five, splitting the guest's CellAdecCb struct into cbFunc + cbArg,

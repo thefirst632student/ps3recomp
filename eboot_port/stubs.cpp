@@ -84,6 +84,15 @@ extern "C" {
     s32 cellVpostEnd(u32 handle);
     s32 cellVpostClose(u32 handle);
     s32 cellVpostExec(u32 handle, const void* inPicBuf, const void* picInfo, void* outPicBuf, const void* ctrlParam);
+
+    s32 cellAdecQueryAttr(const void* type, void* attr);
+    s32 cellAdecOpen(const void* type, const void* res, const void* cb, void* handle);
+    s32 cellAdecClose(u32 handle);
+    s32 cellAdecStartSeq(u32 handle, void* param);
+    s32 cellAdecEndSeq(u32 handle);
+    s32 cellAdecDecodeAu(u32 handle, const void* auInfo);
+    s32 cellAdecGetPcm(u32 handle, void* outBuffer);
+    s32 cellAdecGetPcmItem(u32 handle, void* pcmItem);
 }
 
 // SPURS Fallback for fp=0x1AF3B10ECB1562C3 (Sony Edge LZMA Task)
@@ -169,4 +178,14 @@ extern "C" void ps3_load_prx_modules(void)
     ps3_hle_register(0x0DCB4249u, "cellVpostEnd", (void*)cellVpostEnd);
     ps3_hle_register(0x10EF39F6u, "cellVpostClose", (void*)cellVpostClose);
     ps3_hle_register(0xABB8CC3Du, "cellVpostExec", (void*)cellVpostExec);
+
+    // cellAdec
+    ps3_hle_register(0x7E4A4A49u, "cellAdecQueryAttr", (void*)cellAdecQueryAttr);
+    ps3_hle_register(0xD00A6988u, "cellAdecOpen", (void*)cellAdecOpen);
+    ps3_hle_register(0x847D2380u, "cellAdecClose", (void*)cellAdecClose);
+    ps3_hle_register(0x487B613Eu, "cellAdecStartSeq", (void*)cellAdecStartSeq);
+    ps3_hle_register(0xE2EA549Bu, "cellAdecEndSeq", (void*)cellAdecEndSeq);
+    ps3_hle_register(0x1529E506u, "cellAdecDecodeAu", (void*)cellAdecDecodeAu);
+    ps3_hle_register(0x97FF2AF1u, "cellAdecGetPcm", (void*)cellAdecGetPcm);
+    ps3_hle_register(0xBD75F78Bu, "cellAdecGetPcmItem", (void*)cellAdecGetPcmItem);
 }
