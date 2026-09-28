@@ -235,6 +235,41 @@ if(UNIX)
 endif()
 
 # ---------------------------------------------------------------------------
+# FFmpeg video decode backend (cellVdec)
+# ---------------------------------------------------------------------------
+option(PS3RECOMP_ENABLE_FFMPEG "Enable real cellVdec decoding through FFmpeg" ON)
+set(PS3RECOMP_FFMPEG_ROOT "" CACHE PATH "Optional FFmpeg install prefix")
+if(PS3RECOMP_ENABLE_FFMPEG)
+    set(PS3RECOMP_FFMPEG_OK OFF)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND AND NOT PS3RECOMP_FFMPEG_ROOT)
+        pkg_check_modules(PS3FF QUIET IMPORTED_TARGET libavcodec libavutil libswscale)
+        if(PS3FF_FOUND)
+            target_link_libraries(ps3recomp_runtime PRIVATE PkgConfig::PS3FF)
+            set(PS3RECOMP_FFMPEG_OK ON)
+        endif()
+    endif()
+    if(NOT PS3RECOMP_FFMPEG_OK)
+        find_path(PS3FF_INCLUDE libavcodec/avcodec.h
+                  HINTS "${PS3RECOMP_FFMPEG_ROOT}/include")
+        find_library(PS3FF_AVCODEC avcodec HINTS "${PS3RECOMP_FFMPEG_ROOT}/lib" "${PS3RECOMP_FFMPEG_ROOT}/bin")
+        find_library(PS3FF_AVUTIL avutil HINTS "${PS3RECOMP_FFMPEG_ROOT}/lib" "${PS3RECOMP_FFMPEG_ROOT}/bin")
+        find_library(PS3FF_SWSCALE swscale HINTS "${PS3RECOMP_FFMPEG_ROOT}/lib" "${PS3RECOMP_FFMPEG_ROOT}/bin")
+        if(PS3FF_INCLUDE AND PS3FF_AVCODEC AND PS3FF_AVUTIL AND PS3FF_SWSCALE)
+            target_include_directories(ps3recomp_runtime PRIVATE "${PS3FF_INCLUDE}")
+            target_link_libraries(ps3recomp_runtime PRIVATE "${PS3FF_AVCODEC}" "${PS3FF_AVUTIL}" "${PS3FF_SWSCALE}")
+            set(PS3RECOMP_FFMPEG_OK ON)
+        endif()
+    endif()
+    if(PS3RECOMP_FFMPEG_OK)
+        target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_HAVE_FFMPEG=1)
+        message(STATUS "  FFmpeg:       cellVdec real AVC/MPEG-2 decode enabled")
+    else()
+        message(STATUS "  FFmpeg:       not found; cellVdec builds without real decode")
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # Compiler flags
 # ---------------------------------------------------------------------------
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")

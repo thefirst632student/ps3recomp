@@ -74,7 +74,7 @@ extern "C" {
     s32 cellVdecStartSeq(u32 handle);
     s32 cellVdecEndSeq(u32 handle);
     s32 cellVdecDecodeAu(u32 handle, s32 mode, const void* auInfo);
-    s32 cellVdecGetPicture(u32 handle, void* picItem);
+    s32 cellVdecGetPicture(u32 handle, const void* format, void* outBuff);
     s32 cellVdecGetPicItem(u32 handle, void* picItem);
     s32 cellVdecSetFrameRate(u32 handle, u32 frameRateCode);
 
