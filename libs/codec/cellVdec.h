@@ -122,6 +122,8 @@ s32 cellVdecGetPicItem(CellVdecHandle handle, void* picItem);
 
 s32 cellVdecSetFrameRate(CellVdecHandle handle, u32 frameRateCode);
 
+int cellVdec_is_seq_active(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -139,6 +139,7 @@ s32 cellVdecEndSeq(CellVdecHandle handle)
         return (s32)CELL_VDEC_ERROR_ARG;
 
     s_vdec[handle].seqStarted = 0;
+    s_vdec[handle].hasPic = 0;
 
     /* Notify sequence done */
     if (s_vdec[handle].cbFunc && g_ps3_guest_caller) {
@@ -229,6 +230,15 @@ s32 cellVdecGetPicture(CellVdecHandle handle, void* picItem)
         return (s32)CELL_VDEC_ERROR_ARG;
 
     VdecSlot* v = &s_vdec[handle];
+    if (!v->seqStarted) {
+        printf("[cellVdec] GetPicture(handle=%u) -> CELL_VDEC_ERROR_EMPTY (seq not started/ended)\n", handle);
+        return (s32)CELL_VDEC_ERROR_EMPTY;
+    }
+    if (!v->hasPic) {
+        printf("[cellVdec] GetPicture(handle=%u) -> CELL_VDEC_ERROR_EMPTY (no pic)\n", handle);
+        return (s32)CELL_VDEC_ERROR_EMPTY;
+    }
+
     u32 item_ea = v->resMemAddr ? v->resMemAddr : 0x40000000;
     write_pic_item(v, item_ea);
 
@@ -254,4 +264,9 @@ s32 cellVdecSetFrameRate(CellVdecHandle handle, u32 frameRateCode)
         return (s32)CELL_VDEC_ERROR_ARG;
 
     return CELL_OK;
+}
+
+int cellVdec_is_seq_active(void)
+{
+    return s_vdec[0].in_use && s_vdec[0].seqStarted;
 }

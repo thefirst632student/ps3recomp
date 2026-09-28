@@ -128,10 +128,11 @@ int64_t sys_cond_wait(ppu_context* ctx)
      */
     uint32_t lr = (uint32_t)ctx->lr;
     uint32_t sp = (uint32_t)ctx->gpr[1];
-    if (lr != 0x0007EB6CU && sp && vm_is_valid_addr(sp + 0x90 + 8)) {
+    uint32_t stack_lr = 0;
+    if (sp && vm_is_valid_addr(sp + 0x90 + 8)) {
         const uint8_t* stk = (const uint8_t*)vm_to_host(sp + 0x90);
-        uint32_t stack_lr = ((uint32_t)stk[4] << 24) | ((uint32_t)stk[5] << 16) |
-                            ((uint32_t)stk[6] << 8)  | (uint32_t)stk[7];
+        stack_lr = ((uint32_t)stk[4] << 24) | ((uint32_t)stk[5] << 16) |
+                   ((uint32_t)stk[6] << 8)  | (uint32_t)stk[7];
         if (stack_lr == 0x0007EB6CU) {
             lr = stack_lr;
         }
@@ -157,6 +158,33 @@ int64_t sys_cond_wait(ppu_context* ctx)
                     player);
         } else {
             fprintf(stderr, "[HLE] WA2 movie audio drain bypassed at lr=0x%08X\n", lr);
+        }
+        return CELL_OK;
+    }
+
+    extern int cellVdec_is_seq_active(void);
+    if ((lr == 0x00087E20U || stack_lr == 0x00087E20U) && !cellVdec_is_seq_active()) {
+        uint32_t vpost = (uint32_t)ctx->gpr[31];
+        if (vpost && vm_is_valid_addr(vpost + 0x8C)) {
+            uint8_t* p = (uint8_t*)vm_to_host(vpost);
+            p[0x8C] = 1;
+            p[0x8D] = 0;
+            fprintf(stderr, "[HLE] WA2 vpost wait bypassed after EndSeq (vpost=0x%08X)\n", vpost);
+        } else {
+            fprintf(stderr, "[HLE] WA2 vpost wait bypassed after EndSeq at lr=0x%08X\n", lr);
+        }
+        return CELL_OK;
+    }
+
+    if ((lr == 0x0008692CU || stack_lr == 0x0008692CU) && !cellVdec_is_seq_active()) {
+        uint32_t vdisp = (uint32_t)ctx->gpr[31];
+        if (vdisp && vm_is_valid_addr(vdisp + 0x38)) {
+            uint8_t* p = (uint8_t*)vm_to_host(vdisp);
+            p[0x38] = 1;
+            p[0x39] = 0;
+            fprintf(stderr, "[HLE] WA2 vdisp wait bypassed after EndSeq (vdisp=0x%08X)\n", vdisp);
+        } else {
+            fprintf(stderr, "[HLE] WA2 vdisp wait bypassed after EndSeq at lr=0x%08X\n", lr);
         }
         return CELL_OK;
     }

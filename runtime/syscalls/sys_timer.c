@@ -111,6 +111,21 @@ int64_t sys_timer_usleep(ppu_context* ctx)
       static int n=0; if (n++ < 60)
         fprintf(stderr, "[WAIT] t=%lluus timer_usleep(%llu us) lr=0x%08llX cia=0x%08llX\n", ps3_qpc_us(),
         (unsigned long long)usec, (unsigned long long)ctx->lr, (unsigned long long)ctx->cia); }
+
+    /* WA2 movie display flip sync fence: vdispStart spins on label 128 (0x20000800)
+     * at lr=0x0008681C (frame presentation) and lr=0x00086F88 (exit flush).
+     * Clear label 128 immediately so vdisp can advance without spinning. */
+    if ((uint32_t)ctx->lr == 0x0008681CU || (uint32_t)ctx->lr == 0x00086F88U) {
+        if (vm_is_valid_addr(0x003F3C08)) {
+            uint32_t lbl_ptr = vm_read32(0x003F3C08);
+            if (lbl_ptr && vm_is_valid_addr(lbl_ptr)) {
+                vm_write32(lbl_ptr, 0);
+            }
+        }
+        if (vm_is_valid_addr(0x20000800)) {
+            vm_write32(0x20000800, 0);
+        }
+    }
     /* PS3_WAIT_OBJ=<lr-hex>: when a usleep spin is reached from this return
      * address, dump the registers and the object they point at. A poll loop
      * tells you WHERE it is spinning; this tells you WHAT it is spinning on,
