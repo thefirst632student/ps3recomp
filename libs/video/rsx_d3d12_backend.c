@@ -3252,7 +3252,11 @@ static u32 current_rt_off(u32* out_w, u32* out_h, u32 out_mrt[3])
      * draw as offscreen, has_display stays 0, and render_frame() -- which is
      * what draws ALL recorded geometry -- is never called. The backbuffer shows
      * only the clear, which looks exactly like "nothing rasterizes". */
-    { static int _bs = -1; if (_bs < 0) _bs = getenv("RT_DISPLAY_BY_SIZE") ? 1 : 0;
+    { static int _bs = -1;
+      if (_bs < 0) {
+          const char* e = getenv("RT_DISPLAY_BY_SIZE");
+          _bs = (e && *e) ? atoi(e) : 1;
+      }
       if (_bs && st->color_target < 0x13 &&
           st->surface_clip_w == s_d3d.width && st->surface_clip_h == s_d3d.height)
           return 0; }
@@ -5124,6 +5128,7 @@ static void d3d12_end_frame(void* ud)
 
 static u32 s_dbg_clears_since_present = 0;   /* CELLMARK_BLINKDBG */
 static u32 s_clear_presents = 0;   /* presents issued at clear (frame boundary) */
+static unsigned s_last_present_flip = 0;
 
 /* FRAME_BUDGET=1: how much geometry a guest frame actually asks for, versus
  * what the per-frame vertex buffer can hold. A frame that overflows is silently
@@ -5242,7 +5247,6 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
     if (s_d3d.draw_count > s_frame_draws_max) s_frame_draws_max = s_d3d.draw_count;
     {
         extern unsigned cellGcm_flip_request_count(void);
-        static unsigned s_last_present_flip = 0;
         unsigned fc = cellGcm_flip_request_count();
         if (fc != 0) {
             if (fc == s_last_present_flip)
@@ -6697,9 +6701,16 @@ int rsx_d3d12_backend_pump_messages(void)
 
 void rsx_d3d12_backend_present(void)
 {
+    extern unsigned cellGcm_flip_request_count(void);
+    static int s_seen_content = 0;
+    unsigned fc = cellGcm_flip_request_count();
+    int is_flip_present = (fc != 0 && fc != s_last_present_flip);
+    int has_display;
+    u32 di;
+
     if (blink_dbg())
-        printf("[PRESENT] draws=%u clears_since_last=%u clear_presents=%u\n",
-               s_d3d.draw_count, s_dbg_clears_since_present, s_clear_presents);
+        printf("[PRESENT] draws=%u clears_since_last=%u clear_presents=%u flip=%u (is_flip=%d)\n",
+               s_d3d.draw_count, s_dbg_clears_since_present, s_clear_presents, fc, is_flip_present);
     s_dbg_clears_since_present = 0;
 
     /* Once frame-boundary presents are active (d3d12_clear presents each
@@ -6707,8 +6718,9 @@ void rsx_d3d12_backend_present(void)
      * present would only ever show the partially-accumulated NEXT frame --
      * that partial present right after the FIFO ring recycle was the visible
      * blink. Keep the ticker present solely as the boot-time fallback (before
-     * the first framed clear arrives). */
-    if (s_clear_presents > 0)
+     * the first framed clear arrives), UNLESS this present was triggered by
+     * a guest flip request (for games like White Album 2 that flip without clears). */
+    if (s_clear_presents > 0 && !is_flip_present)
         return;
 
     /* Same display gate as d3d12_present: a batch of offscreen pass work only
@@ -6716,13 +6728,16 @@ void rsx_d3d12_backend_present(void)
      * Empty batches present only until the first real frame -- after that an
      * empty present is a flip/drain race and wipes the screen for a frame
      * (wave: black flashes and layout flicker between frames). */
-    static int s_seen_content = 0;
-    int has_display = (s_d3d.draw_count == 0 && !s_seen_content);
-    for (u32 _i = 0; _i < s_d3d.draw_count && _i < MAX_DRAWS; _i++)
-        if (!s_d3d.draws[_i].is_clear && s_d3d.draws[_i].rt_off == 0) {
+    has_display = (s_d3d.draw_count == 0 && !s_seen_content);
+    for (di = 0; di < s_d3d.draw_count && di < MAX_DRAWS; di++) {
+        if (!s_d3d.draws[di].is_clear && s_d3d.draws[di].rt_off == 0) {
             has_display = 1;
             break;
         }
+    }
+    if (is_flip_present && s_d3d.draw_count > 0)
+        has_display = 1;
+
     /* The guest-framebuffer present needs the pass to run at all. */
     { static int gfb = -1;
       if (gfb < 0) { const char* e = getenv("GCM_GUEST_FB"); gfb = e ? 1 : 0; }
@@ -6780,8 +6795,19 @@ void rsx_d3d12_backend_present(void)
           if (remap < 0) { const char* e = getenv("TEX_REMAP"); remap = e ? atoi(e) : 0; }
           if (remap) rsx_reset_upload_claims(); }
         s_present_this_frame = has_display;
+        {
+            static int s_flip_pres_log = 0;
+            if (is_flip_present && s_flip_pres_log < 10) {
+                s_flip_pres_log++;
+                printf("[D3D12] flip present #%d: fc=%u draws=%u has_display=%d\n",
+                       s_flip_pres_log, fc, s_d3d.draw_count, has_display);
+            }
+        }
         render_frame();
         s_present_this_frame = 1;
+        if (is_flip_present) {
+            s_last_present_flip = fc;
+        }
     }
 }
 
