@@ -309,6 +309,11 @@ s32 cellRescSetConvertAndFlip(void* context, s32 index)
     if (s_flip_handler_opd)
         ps3_invoke_guest(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
 
+    /* WA2: Also ensure the flip completion flag is set in guest memory */
+    if (vm_base) {
+        vm_base[0x003F3B8C] = 1;
+    }
+
     return CELL_OK;
 }
 
@@ -322,15 +327,19 @@ s32 cellRescSetWaitFlip(void* context)
 
 s32 cellRescSetFlipHandler(void (*handler)(u32))
 {
+    extern void cellGcmSetFlipHandler(void (*)(u32));
     s_flip_handler_opd = (u32)(uintptr_t)handler;
     printf("[cellResc] SetFlipHandler(opd=0x%08X)\n", s_flip_handler_opd);
+    cellGcmSetFlipHandler(handler);
     return CELL_OK;
 }
 
 s32 cellRescSetVBlankHandler(void (*handler)(u32))
 {
+    extern void cellGcmSetVBlankHandler(void (*)(u32));
     s_vblank_handler_opd = (u32)(uintptr_t)handler;
     printf("[cellResc] SetVBlankHandler(opd=0x%08X)\n", s_vblank_handler_opd);
+    cellGcmSetVBlankHandler(handler);
     return CELL_OK;
 }
 

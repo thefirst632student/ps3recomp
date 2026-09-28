@@ -131,6 +131,21 @@ int64_t sys_timer_usleep(ppu_context* ctx)
             }
         }
     }
+
+    /* WA2 main game engine VSync / Flip sync: func_0006FBA8 (cia=0x0006FBD4) and
+     * func_0006EF60 (cia=0x0006EF74) spin on sys_timer_usleep(300) waiting for the
+     * VBlank/flip handler (func_00070E24) to signal flip complete at 0x003F3B8C.
+     * Set it to 1 so the game advances to flip the frame and process input. */
+    if (usec == 300) {
+        extern uint8_t* vm_base;
+        if (vm_base) {
+            static int s_flip_wake = 0;
+            if (s_flip_wake++ < 10) {
+                fprintf(stderr, "[WA2-FLIP] sys_timer_usleep(300) -> setting flip flag 0x003F3B8C = 1\n");
+            }
+            vm_base[0x003F3B8C] = 1;
+        }
+    }
     /* PS3_WAIT_OBJ=<lr-hex>: when a usleep spin is reached from this return
      * address, dump the registers and the object they point at. A poll loop
      * tells you WHERE it is spinning; this tells you WHAT it is spinning on,
