@@ -120,6 +120,47 @@ int64_t sys_cond_destroy(ppu_context* ctx)
 
 int64_t sys_cond_wait(ppu_context* ctx)
 {
+    /* WA2 movie audio drain hook:
+     * func_0007EB28 waits on a condition variable for MovieAudioPlayer+0x1D to become 0.
+     * In HLE/recomp, movie audio playback is not drained by the synth2 mixer thread, so this
+     * condition variable is never signaled, hanging movie cleanup.
+     * Clear flags +0x1C/+0x1D and return immediately.
+     */
+    uint32_t lr = (uint32_t)ctx->lr;
+    uint32_t sp = (uint32_t)ctx->gpr[1];
+    if (lr != 0x0007EB6CU && sp && vm_is_valid_addr(sp + 0x90 + 8)) {
+        const uint8_t* stk = (const uint8_t*)vm_to_host(sp + 0x90);
+        uint32_t stack_lr = ((uint32_t)stk[4] << 24) | ((uint32_t)stk[5] << 16) |
+                            ((uint32_t)stk[6] << 8)  | (uint32_t)stk[7];
+        if (stack_lr == 0x0007EB6CU) {
+            lr = stack_lr;
+        }
+    }
+    if (lr == 0x0007EB6CU) {
+        uint32_t player = (uint32_t)ctx->gpr[31];
+        if (!player && sp && vm_is_valid_addr(sp + 0x78 + 8)) {
+            const uint8_t* stk_p = (const uint8_t*)vm_to_host(sp + 0x78);
+            player = ((uint32_t)stk_p[4] << 24) | ((uint32_t)stk_p[5] << 16) |
+                     ((uint32_t)stk_p[6] << 8)  | (uint32_t)stk_p[7];
+        }
+        if (!player && (uint32_t)ctx->gpr[30] >= 0x14) {
+            player = (uint32_t)ctx->gpr[30] - 0x14;
+        }
+        if (!player && vm_is_valid_addr(0x0117A740 + 0x1D)) {
+            player = 0x0117A740;
+        }
+        if (player && vm_is_valid_addr(player + 0x1D)) {
+            uint8_t* p = (uint8_t*)vm_to_host(player);
+            p[0x1C] = 0;
+            p[0x1D] = 0;
+            fprintf(stderr, "[HLE] WA2 movie audio drain bypassed: player=0x%08X (flags +0x1C/+0x1D set to 0)\n",
+                    player);
+        } else {
+            fprintf(stderr, "[HLE] WA2 movie audio drain bypassed at lr=0x%08X\n", lr);
+        }
+        return CELL_OK;
+    }
+
     uint64_t timeout = LV2_ARG_U64(ctx, 1);
     /* Preserve upstream's opt-in wait diagnostics across the waiter rewrite. */
     const char* peek = getenv("PS3_COND_PEEK");
