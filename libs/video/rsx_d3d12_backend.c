@@ -6378,7 +6378,7 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
       } }
 
     static int log_count = 0;
-    if (log_count < 10) {
+    if (log_count < 25) {
         printf("[D3D12] bind_texture(unit=%u, offset=0x%X, fmt=0x%02X, %ux%u)\n",
                unit, offset, format, width, height);
         log_count++;
@@ -6431,9 +6431,14 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
          * then IO table) instead of trusting the format's location bits. A
          * texture the guest built in main memory but tagged local resolves to
          * untouched VRAM and samples as all-zero -- geometry renders, flat. */
-        { static int _ra = -1; if (_ra < 0) _ra = getenv("TEX_RESOLVE_AUTO") ? 1 : 0;
+        { static int _ra = -1;
+          const char* era;
           extern u32 cellGcmResolveIO(u32);
           u32 _r = 0;
+          if (_ra < 0) {
+              era = getenv("TEX_RESOLVE_AUTO");
+              _ra = (era && *era) ? atoi(era) : 1;
+          }
           if (_ra) _r = cellGcmResolveIO(offset);          /* IO table first */
           if (!_r) _r = cellGcmResolveLocated((tex->format & 3) == 1, offset);
           /* TEX_PROBE=1: the location bits are not always right. This title
@@ -6443,20 +6448,28 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
            * black and the menu never appears. When the chosen resolution is
            * empty over a sample and the other one is not, take the other. */
           { static int _tp = -1;
-            if (_tp < 0) _tp = getenv("TEX_PROBE") ? 1 : 0;
-            if (_tp && vm_base && _r) {
+            const char* etp;
+            if (_tp < 0) {
+                etp = getenv("TEX_PROBE");
+                _tp = (etp && *etp) ? atoi(etp) : 1;
+            }
+            if (_tp && vm_base) {
                 u32 alt = cellGcmResolveLocated((tex->format & 3) != 1, offset);
-                if (alt && alt != _r && alt < 0xE0000000u && _r < 0xE0000000u) {
+                if ((!_r || _r >= 0xE0000000u) && alt && alt < 0xE0000000u) {
+                    _r = alt;
+                } else if (_r && alt && alt != _r && alt < 0xE0000000u && _r < 0xE0000000u) {
                     u32 span = width * height / 2;
-                    if (span > 4096) span = 4096;
                     u32 nz_r = 0, nz_a = 0;
-                    for (u32 i = 0; i < span; i += 7) {
+                    u32 i;
+                    if (span > 4096) span = 4096;
+                    for (i = 0; i < span; i += 7) {
                         if (vm_base[_r  + i]) nz_r++;
                         if (vm_base[alt + i]) nz_a++;
                     }
                     if (nz_r == 0 && nz_a > 0) {
                         static u32 seen[32]; static int ns = 0; int known = 0;
-                        for (int k = 0; k < ns; k++) if (seen[k] == offset) known = 1;
+                        int k;
+                        for (k = 0; k < ns; k++) if (seen[k] == offset) known = 1;
                         if (!known && ns < 32) { seen[ns++] = offset;
                             fprintf(stderr, "[TEX_PROBE] 0x%08X: %s empty, using %s"
                                             " (%u non-zero)%c", offset,
@@ -6484,7 +6497,7 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
         s_d3d.cur_texs[unit].set = 1;
     }
     if (base_fmt == 0x81 /* B8 */) {
-        s_d3d.tex_src_offset = cellGcmResolveLocated((tex->format & 3) == 1, offset);
+        s_d3d.tex_src_offset = s_d3d.cur_texs[unit].off;
         if (s_d3d.tex_w != width || s_d3d.tex_h != height) {
             /* dims changed -> resource must be (re)created in render_frame */
             s_d3d.tex_ready = 0;
@@ -6797,10 +6810,12 @@ void rsx_d3d12_backend_present(void)
         s_present_this_frame = has_display;
         {
             static int s_flip_pres_log = 0;
-            if (is_flip_present && s_flip_pres_log < 10) {
+            if (is_flip_present) {
                 s_flip_pres_log++;
-                printf("[D3D12] flip present #%d: fc=%u draws=%u has_display=%d\n",
-                       s_flip_pres_log, fc, s_d3d.draw_count, has_display);
+                if (s_flip_pres_log <= 20 || (s_flip_pres_log % 500) == 0) {
+                    printf("[D3D12] flip present #%d: fc=%u draws=%u has_display=%d\n",
+                           s_flip_pres_log, fc, s_d3d.draw_count, has_display);
+                }
             }
         }
         render_frame();
