@@ -84,6 +84,18 @@ typedef struct CellVdecPicItem {
     u16 height;
 } CellVdecPicItem;
 
+typedef struct CellVdecCb {
+    u32 cbFunc;
+    u32 cbArg;
+} CellVdecCb;
+
+typedef struct CellVdecAttr {
+    u32 memSize;
+    u8 cmdDepth;
+    u32 decoderVerUpper;
+    u32 decoderVerLower;
+} CellVdecAttr;
+
 typedef u32 (*CellVdecCbMsg)(CellVdecHandle handle, u32 msgType,
                                s32 msgData, void* cbArg);
 
@@ -91,8 +103,13 @@ typedef u32 (*CellVdecCbMsg)(CellVdecHandle handle, u32 msgType,
  * Functions
  * -----------------------------------------------------------------------*/
 
+s32 cellVdecQueryAttr(const CellVdecType* type, CellVdecAttr* attr);
+s32 cellVdecQueryAttrEx(const CellVdecType* type, CellVdecAttr* attr);
+
 s32 cellVdecOpen(const CellVdecType* type, const CellVdecResource* res,
-                  CellVdecCbMsg cbFunc, void* cbArg, CellVdecHandle* handle);
+                  const CellVdecCb* cb, CellVdecHandle* handle);
+s32 cellVdecOpenEx(const CellVdecType* type, const CellVdecResource* res,
+                    const CellVdecCb* cb, CellVdecHandle* handle);
 s32 cellVdecClose(CellVdecHandle handle);
 
 s32 cellVdecStartSeq(CellVdecHandle handle);
@@ -100,8 +117,8 @@ s32 cellVdecEndSeq(CellVdecHandle handle);
 
 s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auInfo);
 
-s32 cellVdecGetPicture(CellVdecHandle handle, const CellVdecPicItem** picItem);
-s32 cellVdecGetPicItem(CellVdecHandle handle, const CellVdecPicItem** picItem);
+s32 cellVdecGetPicture(CellVdecHandle handle, void* picItem);
+s32 cellVdecGetPicItem(CellVdecHandle handle, void* picItem);
 
 s32 cellVdecSetFrameRate(CellVdecHandle handle, u32 frameRateCode);
 

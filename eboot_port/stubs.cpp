@@ -50,6 +50,40 @@ extern "C" {
     s32 cellAtracGetBufferInfoForResetting(void* handle, u32 uiSample, void* pBufferInfo);
     s32 cellAtracResetPlayPosition(void* handle, u32 uiSample, u32 uiWriteByte);
     s32 cellAtracGetInternalErrorInfo(void* handle, s32* piResult);
+
+    s32 cellDmuxQueryAttr(const void* type, void* attr);
+    s32 cellDmuxQueryEsAttr(const void* type, const void* esFilterId, const void* esSpecificInfo, void* esAttr);
+    s32 cellDmuxOpen(const void* type, const void* res, const void* cb, void* handle);
+    s32 cellDmuxClose(u32 handle);
+    s32 cellDmuxEnableEs(u32 handle, const void* filterId, const void* res, const void* esCb, const void* esSpecificInfo, void* esHandle);
+    s32 cellDmuxDisableEs(u32 handle, u32 esHandle);
+    s32 cellDmuxSetStream(u32 handle, const void* streamAddr, u32 streamSize, u64 userData);
+    s32 cellDmuxResetStream(u32 handle);
+    s32 cellDmuxGetAu(u32 handle, u32 esHandle, void* auInfo);
+    s32 cellDmuxGetAuEx(u32 handle, u32 esHandle, void* auInfoEx);
+    s32 cellDmuxPeekAu(u32 handle, u32 esHandle, void* auInfo);
+    s32 cellDmuxPeekAuEx(u32 handle, u32 esHandle, void* auInfoEx);
+    s32 cellDmuxFlushEs(u32 handle, u32 esHandle);
+
+    s32 cellVdecQueryAttr(const void* type, void* attr);
+    s32 cellVdecQueryAttrEx(const void* type, void* attr);
+    s32 cellVdecOpen(const void* type, const void* res, const void* cb, void* handle);
+    s32 cellVdecOpenEx(const void* type, const void* res, const void* cb, void* handle);
+    s32 cellVdecClose(u32 handle);
+    s32 cellVdecStartSeq(u32 handle);
+    s32 cellVdecEndSeq(u32 handle);
+    s32 cellVdecDecodeAu(u32 handle, s32 mode, const void* auInfo);
+    s32 cellVdecGetPicture(u32 handle, void* picItem);
+    s32 cellVdecGetPicItem(u32 handle, void* picItem);
+    s32 cellVdecSetFrameRate(u32 handle, u32 frameRateCode);
+
+    s32 cellVpostQuery(const void* cfgParam, u32* memSize);
+    s32 cellVpostQueryAttr(const void* cfgParam, u32* memSize);
+    s32 cellVpostInit(const void* cfgParam, const void* resource, void* handle);
+    s32 cellVpostOpen(const void* cfgParam, const void* resource, void* handle);
+    s32 cellVpostEnd(u32 handle);
+    s32 cellVpostClose(u32 handle);
+    s32 cellVpostExec(u32 handle, const void* inPicBuf, const void* picInfo, void* outPicBuf, const void* ctrlParam);
 }
 
 // SPURS Fallback for fp=0x1AF3B10ECB1562C3 (Sony Edge LZMA Task)
@@ -97,4 +131,42 @@ extern "C" void ps3_load_prx_modules(void)
     ps3_hle_register(0xB5C11938u, "cellAtracGetInternalErrorInfo", (void*)cellAtracGetInternalErrorInfo);
     ps3_hle_register(0xCF01D5D4u, "cellAtracGetSoundInfo", (void*)cellAtracGetSoundInfo);
     ps3_hle_register(0xDFAB73AAu, "cellAtracGetRemainFrame", (void*)cellAtracGetRemainFrame);
+
+    // cellDmux
+    ps3_hle_register(0xA2D4189Bu, "cellDmuxQueryAttr", (void*)cellDmuxQueryAttr);
+    ps3_hle_register(0x02170D1Au, "cellDmuxQueryEsAttr", (void*)cellDmuxQueryEsAttr);
+    ps3_hle_register(0x68492DE9u, "cellDmuxOpen", (void*)cellDmuxOpen);
+    ps3_hle_register(0x8C692521u, "cellDmuxClose", (void*)cellDmuxClose);
+    ps3_hle_register(0x7B56DC3Fu, "cellDmuxEnableEs", (void*)cellDmuxEnableEs);
+    ps3_hle_register(0x05371C8Du, "cellDmuxDisableEs", (void*)cellDmuxDisableEs);
+    ps3_hle_register(0x24EA6474u, "cellDmuxDisableEs", (void*)cellDmuxDisableEs);
+    ps3_hle_register(0x04E7499Fu, "cellDmuxSetStream", (void*)cellDmuxSetStream);
+    ps3_hle_register(0x5D345DE9u, "cellDmuxResetStream", (void*)cellDmuxResetStream);
+    ps3_hle_register(0x42C716B5u, "cellDmuxGetAu", (void*)cellDmuxGetAu);
+    ps3_hle_register(0x2C9A5857u, "cellDmuxGetAuEx", (void*)cellDmuxGetAuEx);
+    ps3_hle_register(0x2750C5E0u, "cellDmuxPeekAu", (void*)cellDmuxPeekAu);
+    ps3_hle_register(0x002E8DA2u, "cellDmuxPeekAuEx", (void*)cellDmuxPeekAuEx);
+    ps3_hle_register(0xEBB3B2BDu, "cellDmuxFlushEs", (void*)cellDmuxFlushEs);
+
+    // cellVdec
+    ps3_hle_register(0xFF6F6EBEu, "cellVdecQueryAttr", (void*)cellVdecQueryAttr);
+    ps3_hle_register(0xC982A84Au, "cellVdecQueryAttrEx", (void*)cellVdecQueryAttrEx);
+    ps3_hle_register(0xB6BBCD5Du, "cellVdecOpen", (void*)cellVdecOpen);
+    ps3_hle_register(0x0053E2D8u, "cellVdecOpenEx", (void*)cellVdecOpenEx);
+    ps3_hle_register(0x16698E83u, "cellVdecClose", (void*)cellVdecClose);
+    ps3_hle_register(0xC757C2AAu, "cellVdecStartSeq", (void*)cellVdecStartSeq);
+    ps3_hle_register(0x824433F0u, "cellVdecEndSeq", (void*)cellVdecEndSeq);
+    ps3_hle_register(0x2BF4DDD2u, "cellVdecDecodeAu", (void*)cellVdecDecodeAu);
+    ps3_hle_register(0x807C861Au, "cellVdecGetPicture", (void*)cellVdecGetPicture);
+    ps3_hle_register(0x17C702B9u, "cellVdecGetPicItem", (void*)cellVdecGetPicItem);
+    ps3_hle_register(0xE13EF6FCu, "cellVdecSetFrameRate", (void*)cellVdecSetFrameRate);
+
+    // cellVpost
+    ps3_hle_register(0x49A099CDu, "cellVpostQuery", (void*)cellVpostQuery);
+    ps3_hle_register(0x95E788C3u, "cellVpostQueryAttr", (void*)cellVpostQueryAttr);
+    ps3_hle_register(0xC53308A9u, "cellVpostInit", (void*)cellVpostInit);
+    ps3_hle_register(0xCD33F3E2u, "cellVpostOpen", (void*)cellVpostOpen);
+    ps3_hle_register(0x0DCB4249u, "cellVpostEnd", (void*)cellVpostEnd);
+    ps3_hle_register(0x10EF39F6u, "cellVpostClose", (void*)cellVpostClose);
+    ps3_hle_register(0xABB8CC3Du, "cellVpostExec", (void*)cellVpostExec);
 }

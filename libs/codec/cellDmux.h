@@ -95,7 +95,27 @@ typedef struct CellDmuxAuInfoEx {
     u32 auSpecificInfo;
 } CellDmuxAuInfoEx;
 
-/* Callback types */
+typedef struct CellDmuxCb {
+    u32 cbFunc;
+    u32 cbArg;
+} CellDmuxCb;
+
+typedef struct CellDmuxEsCb {
+    u32 cbFunc;
+    u32 cbArg;
+} CellDmuxEsCb;
+
+typedef struct CellDmuxAttr {
+    u32 memSize;
+    u32 demuxerVerUpper;
+    u32 demuxerVerLower;
+} CellDmuxAttr;
+
+typedef struct CellDmuxEsAttr {
+    u32 memSize;
+} CellDmuxEsAttr;
+
+/* Callback types (legacy signatures kept for compatibility) */
 typedef u32 (*CellDmuxCbMsg)(u32 handle, u32 msgType, u32 msgData, void* cbArg);
 typedef u32 (*CellDmuxCbEsMsg)(u32 handle, u32 esHandle, u32 msgType,
                                  u32 msgData, void* cbArg);
@@ -104,15 +124,20 @@ typedef u32 (*CellDmuxCbEsMsg)(u32 handle, u32 esHandle, u32 msgType,
  * Functions
  * -----------------------------------------------------------------------*/
 
+/* Query attributes */
+s32 cellDmuxQueryAttr(const CellDmuxType* type, CellDmuxAttr* attr);
+s32 cellDmuxQueryEsAttr(const CellDmuxType* type, const CellDmuxEsFilterId* esFilterId,
+                         const void* esSpecificInfo, CellDmuxEsAttr* esAttr);
+
 /* Demuxer lifecycle */
 s32 cellDmuxOpen(const CellDmuxType* type, const CellDmuxResource* res,
-                  CellDmuxCbMsg cbFunc, void* cbArg, CellDmuxHandle* handle);
+                  const CellDmuxCb* cb, CellDmuxHandle* handle);
 s32 cellDmuxClose(CellDmuxHandle handle);
 
 /* ES management */
 s32 cellDmuxEnableEs(CellDmuxHandle handle, const CellDmuxEsFilterId* esFilterId,
                       const CellDmuxEsResource* esRes,
-                      CellDmuxCbEsMsg esCbFunc, void* esCbArg,
+                      const CellDmuxEsCb* esCb, const void* esSpecificInfo,
                       CellDmuxEsHandle* esHandle);
 s32 cellDmuxDisableEs(CellDmuxEsHandle esHandle);
 
@@ -123,8 +148,10 @@ s32 cellDmuxResetStream(CellDmuxHandle handle);
 s32 cellDmuxResetStreamAndWaitDone(CellDmuxHandle handle);
 
 /* AU retrieval */
-s32 cellDmuxGetAu(CellDmuxEsHandle esHandle, CellDmuxAuInfo** auInfo, u32* auInfoNum);
-s32 cellDmuxPeekAu(CellDmuxEsHandle esHandle, CellDmuxAuInfo** auInfo, u32* auInfoNum);
+s32 cellDmuxGetAu(CellDmuxEsHandle esHandle, void* auInfo, u32* auInfoNum);
+s32 cellDmuxGetAuEx(CellDmuxEsHandle esHandle, void* auInfoEx, u32* auInfoNum);
+s32 cellDmuxPeekAu(CellDmuxEsHandle esHandle, void* auInfo, u32* auInfoNum);
+s32 cellDmuxPeekAuEx(CellDmuxEsHandle esHandle, void* auInfoEx, u32* auInfoNum);
 s32 cellDmuxReleaseAu(CellDmuxEsHandle esHandle);
 s32 cellDmuxFlushEs(CellDmuxEsHandle esHandle);
 

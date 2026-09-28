@@ -79,7 +79,11 @@ typedef void (*CellVpostExecCb)(u32 handle, s32 result, void* arg);
 s32 cellVpostInit(const CellVpostCfgParam* cfgParam,
                     const CellVpostResource* resource,
                     CellVpostHandle* handle);
+s32 cellVpostOpen(const CellVpostCfgParam* cfgParam,
+                    const CellVpostResource* resource,
+                    CellVpostHandle* handle);
 s32 cellVpostEnd(CellVpostHandle handle);
+s32 cellVpostClose(CellVpostHandle handle);
 
 s32 cellVpostExec(CellVpostHandle handle,
                     const void* inPicBuf,
@@ -88,6 +92,7 @@ s32 cellVpostExec(CellVpostHandle handle,
                     const CellVpostCtrlParam* ctrlParam);
 
 s32 cellVpostQuery(const CellVpostCfgParam* cfgParam, u32* memSize);
+s32 cellVpostQueryAttr(const CellVpostCfgParam* cfgParam, u32* memSize);
 
 #ifdef __cplusplus
 }

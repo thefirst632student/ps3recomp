@@ -31,6 +31,11 @@ s32 cellVpostQuery(const CellVpostCfgParam* cfgParam, u32* memSize)
     return CELL_OK;
 }
 
+s32 cellVpostQueryAttr(const CellVpostCfgParam* cfgParam, u32* memSize)
+{
+    return cellVpostQuery(cfgParam, memSize);
+}
+
 s32 cellVpostInit(const CellVpostCfgParam* cfgParam,
                     const CellVpostResource* resource,
                     CellVpostHandle* handle)
@@ -54,6 +59,13 @@ s32 cellVpostInit(const CellVpostCfgParam* cfgParam,
     return (s32)CELL_VPOST_ERROR_OUT_OF_MEMORY;
 }
 
+s32 cellVpostOpen(const CellVpostCfgParam* cfgParam,
+                    const CellVpostResource* resource,
+                    CellVpostHandle* handle)
+{
+    return cellVpostInit(cfgParam, resource, handle);
+}
+
 s32 cellVpostEnd(CellVpostHandle handle)
 {
     printf("[cellVpost] End(%u)\n", handle);
@@ -61,6 +73,11 @@ s32 cellVpostEnd(CellVpostHandle handle)
         return (s32)CELL_VPOST_ERROR_HANDLE_NOT_FOUND;
     s_handles[handle].in_use = 0;
     return CELL_OK;
+}
+
+s32 cellVpostClose(CellVpostHandle handle)
+{
+    return cellVpostEnd(handle);
 }
 
 s32 cellVpostExec(CellVpostHandle handle,
