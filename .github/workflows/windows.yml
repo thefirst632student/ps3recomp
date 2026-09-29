@@ -39,11 +39,37 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          choco install ninja ffmpeg-shared -y --no-progress
-          $ffmpeg = Get-ChildItem "C:\ProgramData\chocolatey\lib\ffmpeg-shared\tools" -Directory | Select-Object -First 1
-          if (-not $ffmpeg) { throw "ffmpeg-shared install prefix not found" }
-          "PS3RECOMP_FFMPEG_ROOT=$($ffmpeg.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          Write-Host "FFmpeg root: $($ffmpeg.FullName)"
+          # windows-latest already carries Ninja and vcpkg, but keep a small
+          # fallback for Ninja.  Do not use Chocolatey's ffmpeg-shared package:
+          # its package version is pinned while its gyan.dev download URL is
+          # mutable, so an upstream FFmpeg refresh makes Chocolatey's stored
+          # checksum fail before the build even reaches CMake.
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            choco install ninja -y --no-progress
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+          $vcpkg = (Get-Command vcpkg -ErrorAction Stop).Source
+          $installRoot = Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed"
+          & $vcpkg install "ffmpeg[avcodec,swscale]:x64-windows" "--x-install-root=$installRoot"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $ffmpegRoot = Join-Path $installRoot "x64-windows"
+          $required = @(
+            "include\libavcodec\avcodec.h",
+            "include\libavutil\avutil.h",
+            "include\libswscale\swscale.h",
+            "lib\avcodec.lib",
+            "lib\avutil.lib",
+            "lib\swscale.lib"
+          )
+          foreach ($rel in $required) {
+            $path = Join-Path $ffmpegRoot $rel
+            if (-not (Test-Path $path)) { throw "vcpkg FFmpeg install is incomplete: $path" }
+          }
+
+          "PS3RECOMP_FFMPEG_ROOT=$ffmpegRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "FFmpeg root: $ffmpegRoot"
 
       - name: Show toolchain
         run: |
