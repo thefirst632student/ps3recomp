@@ -1180,6 +1180,25 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
     if ((uint32_t)a == (VM_HLE_INJECT_BASE + 0x2008u)) { static int _rp=-1;
         if(_rp<0){ const char* e=getenv("GCM_REFPOLL"); _rp=(e&&*e=='0')?0:1; }
         if(_rp){ extern void cellGcm_ref_on_poll(void); cellGcm_ref_on_poll(); } }
+
+    /* Back-end label poll assist.  The normal RSX FIFO walker owns rendering,
+     * but a title may submit a final semaphore release after requesting a flip
+     * and immediately poll the corresponding label while the presentation
+     * thread is blocked in Present().  Let cellGcmSys retire ONLY a release
+     * pair already reached by the main walker.  This is the label analogue of
+     * GCM_REFPOLL above; it does not skip rendering commands or synthesize a
+     * value that was not present in the guest FIFO. */
+    { const uint32_t ea = (uint32_t)a;
+      const uint32_t lb = VM_HLE_INJECT_BASE;
+      if (ea >= lb && ea < lb + 0x1000u && ((ea - lb) & 0xFu) == 0) {
+          /* Only pay the helper cost while the label is non-zero.  Zero is the
+           * common completed state and needs no RSX progress. */
+          uint32_t raw; memcpy(&raw, vm_base + ea, 4);
+          if (__builtin_bswap32(raw) != 0) {
+              extern void cellGcm_label_on_poll(uint32_t);
+              cellGcm_label_on_poll(ea);
+          }
+      } }
     uint32_t v; memcpy(&v, vm_base + (uint32_t)a, 4);
     g_last_rd_addr = (uint32_t)a; g_last_rd_val = __builtin_bswap32(v);
 #ifdef _WIN32

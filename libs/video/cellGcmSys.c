@@ -1284,6 +1284,96 @@ void cellGcm_rsx_process_fifo(void)
     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
 }
 
+/* CPU-side poll assist for RSX back-end labels.
+ *
+ * A back-end semaphore release is often the last command a title submits after
+ * a flip.  Presentation is deliberately decoupled from guest execution, but the
+ * current host architecture can still be inside a blocking Present while the
+ * guest appends that release and immediately polls its label.  The normal FIFO
+ * walker therefore cannot retire the last 16 bytes until Present returns, while
+ * the guest cannot submit another frame until the label changes.
+ *
+ * Do NOT skip ahead through rendering commands here.  We only retire a complete
+ * NV4097 SET_SEMAPHORE_OFFSET + BACK_END_WRITE_SEMAPHORE_RELEASE pair when it is
+ * sitting exactly at the main walker's current get pointer.  At that point all
+ * commands before the fence have already been consumed by the normal walker;
+ * advancing these two synchronization methods is equivalent to the real RSX
+ * completing the tail of the submitted batch asynchronously.
+ *
+ * This mirrors cellGcm_ref_on_poll(): a CPU poll can help an already-reached GPU
+ * synchronization command make progress even if host presentation is starved.
+ */
+void cellGcm_label_on_poll(u32 label_ea)
+{
+    if (label_ea < GCM_LABEL_GUEST_BASE ||
+        label_ea >= GCM_LABEL_GUEST_BASE + CELL_GCM_MAX_LABEL_COUNT * GCM_LABEL_STRIDE)
+        return;
+
+    if (!TryAcquireSRWLockExclusive(&s_gcm_fifo_lock)) {
+        if (s_gcm_kick_ev) SetEvent(s_gcm_kick_ev);
+        return;
+    }
+
+    u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+    u32 get = s_fifo_getoff;
+    int progressed = 0;
+
+    /* The SDK emits the pair as four contiguous dwords:
+     *   [0] method 0x1D6C count=1, [1] label offset,
+     *   [2] method 0x1D70/0x1D74 count=1, [3] value.
+     * gcmReserve guarantees the pair does not straddle a ring wrap. */
+    if (get != put) {
+        u32 h0_ea = gcm_io2ea(get);
+        u32 a0_ea = gcm_io2ea(get + 4);
+        u32 h1_ea = gcm_io2ea(get + 8);
+        u32 a1_ea = gcm_io2ea(get + 12);
+        if (h0_ea && a0_ea && h1_ea && a1_ea) {
+            u32 h0 = vm_read32(h0_ea);
+            u32 h1 = vm_read32(h1_ea);
+            u32 c0 = (h0 >> 18) & 0x7FFu;
+            u32 c1 = (h1 >> 18) & 0x7FFu;
+            u32 m0 = h0 & 0x1FFCu;
+            u32 m1 = h1 & 0x1FFCu;
+            u32 s0 = (h0 >> 13) & 7u;
+            u32 s1 = (h1 >> 13) & 7u;
+            u32 t0 = h0 >> 29;
+            u32 t1 = h1 >> 29;
+
+            if ((t0 == 0 || t0 == 2) && (t1 == 0 || t1 == 2) &&
+                c0 == 1 && c1 == 1 && s0 == 0 && s1 == 0 &&
+                m0 == 0x1D6Cu && (m1 == 0x1D70u || m1 == 0x1D74u)) {
+                u32 sem_off = vm_read32(a0_ea) & 0x00FFFFFFu;
+                u32 raw = vm_read32(a1_ea);
+                u32 target = GCM_LABEL_GUEST_BASE + sem_off;
+
+                /* Only retire the pair for the label this CPU is actually
+                 * polling.  A different release remains ordered for the normal
+                 * walker instead of being speculatively completed. */
+                if (target == label_ea) {
+                    u32 val = raw;
+                    if (m1 == 0x1D70u)
+                        val = (raw & 0xff00ff00u) | ((raw >> 16) & 0xffu) | ((raw & 0xffu) << 16);
+                    vm_write32(target, val);
+                    s_fifo_getoff = get + 16;
+                    vm_write32(GCM_CONTROL_GUEST_ADDR + 4, s_fifo_getoff);
+                    g_gcm_fifo_drained_ea = gcm_io2ea(s_fifo_getoff);
+                    progressed = 1;
+
+                    static int n = 0;
+                    if (n++ < 16)
+                        fprintf(stderr,
+                                "[RSX] poll-retired label write @0x%08X = 0x%08X "
+                                "(get 0x%08X -> 0x%08X, put=0x%08X)%c",
+                                target, val, get, s_fifo_getoff, put, 10);
+                }
+            }
+        }
+    }
+
+    ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
+    if (!progressed && s_gcm_kick_ev) SetEvent(s_gcm_kick_ev);
+}
+
 static void gcm_rsx_process_fifo_unlocked(void)
 {
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
