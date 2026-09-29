@@ -39,6 +39,11 @@ extern ps3_guest_caller_fn g_ps3_guest_caller;
 
 #define MAX_VDEC 4
 #define VDEC_QUEUE_CAP 64
+/* cellVdec advertises cmdDepth=4 and RPCS3 limits decode AUs to four in flight.
+ * Our decoder is synchronous, so emulate that backpressure with the number of
+ * unconsumed pictures.  Letting FFmpeg run 64 frames ahead collapses WA2's
+ * PICOUT notifications into its single boolean wake flag and deadlocks VPOST. */
+#define VDEC_BACKPRESSURE_CAP 4
 #define PICITEM_SIZE 0x80u
 #define PICINFO_OFFSET 0x80u
 
@@ -180,7 +185,7 @@ static void clear_queue(VdecSlot* v)
 static int queue_synthetic(VdecSlot* v, const CellVdecAuInfo* au, u32 width, u32 height)
 {
     qlock(v);
-    while (v->qCount >= VDEC_QUEUE_CAP && v->seqStarted) qwait_10ms(v);
+    while (v->qCount >= VDEC_BACKPRESSURE_CAP && v->seqStarted) qwait_10ms(v);
     if (!v->seqStarted) { qunlock(v); return -1; }
     int pos = (v->qHead + v->qCount) % VDEC_QUEUE_CAP;
     VdecFrame* q = &v->queue[pos];
@@ -308,10 +313,11 @@ static int queue_frame(VdecSlot* v, AVFrame* f, const CellVdecAuInfo* au)
     const u64 step = frame_step_90k(v);
 
     qlock(v);
-    while (v->qCount >= VDEC_QUEUE_CAP && v->seqStarted) {
+    while (v->qCount >= VDEC_BACKPRESSURE_CAP && v->seqStarted) {
         static unsigned waitLog;
         if ((waitLog++ % 500u) == 0u)
-            printf("[cellVdec] output queue full (%d); waiting for picture consumer\n", v->qCount);
+            printf("[cellVdec] backpressure at %d pictures (cmdDepth=%d); waiting for consumer\n",
+                   v->qCount, VDEC_BACKPRESSURE_CAP);
         qwait_10ms(v);
     }
     if (!v->seqStarted) { qunlock(v); return AVERROR(EPIPE); }
