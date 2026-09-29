@@ -17,6 +17,12 @@
 #include <errno.h>
 #include <limits.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <pthread.h>
+#include <time.h>
+#endif
 #include "../guest_struct.h"
 #include "../../runtime/ppu/ppu_memory.h"
 
@@ -32,7 +38,7 @@ typedef void (*ps3_guest_caller_fn)(uint32_t, uint64_t, uint64_t, uint64_t, uint
 extern ps3_guest_caller_fn g_ps3_guest_caller;
 
 #define MAX_VDEC 4
-#define VDEC_QUEUE_CAP 16
+#define VDEC_QUEUE_CAP 64
 #define PICITEM_SIZE 0x80u
 #define PICINFO_OFFSET 0x80u
 
@@ -60,9 +66,21 @@ typedef struct {
     int seqStarted;
     u32 auCount;
     u32 frameRateCode;
+    u64 nextPts;
+    u64 nextDts;
+    int nextPtsValid;
+    int nextDtsValid;
     VdecFrame queue[VDEC_QUEUE_CAP];
     int qHead;
     int qCount;
+#ifdef _WIN32
+    CRITICAL_SECTION qMutex;
+    CONDITION_VARIABLE qCond;
+#else
+    pthread_mutex_t qMutex;
+    pthread_cond_t qCond;
+#endif
+    int qSyncInit;
 #ifdef PS3RECOMP_HAVE_FFMPEG
     const AVCodec* codec;
     AVCodecContext* ctx;
@@ -71,6 +89,71 @@ typedef struct {
 } VdecSlot;
 
 static VdecSlot s_vdec[MAX_VDEC];
+
+static void qsync_init(VdecSlot* v)
+{
+    if (v->qSyncInit) return;
+#ifdef _WIN32
+    InitializeCriticalSection(&v->qMutex);
+    InitializeConditionVariable(&v->qCond);
+#else
+    pthread_mutex_init(&v->qMutex, NULL);
+    pthread_cond_init(&v->qCond, NULL);
+#endif
+    v->qSyncInit = 1;
+}
+
+static void qsync_destroy(VdecSlot* v)
+{
+    if (!v->qSyncInit) return;
+#ifdef _WIN32
+    DeleteCriticalSection(&v->qMutex);
+#else
+    pthread_cond_destroy(&v->qCond);
+    pthread_mutex_destroy(&v->qMutex);
+#endif
+    v->qSyncInit = 0;
+}
+
+static void qlock(VdecSlot* v)
+{
+#ifdef _WIN32
+    EnterCriticalSection(&v->qMutex);
+#else
+    pthread_mutex_lock(&v->qMutex);
+#endif
+}
+
+static void qunlock(VdecSlot* v)
+{
+#ifdef _WIN32
+    LeaveCriticalSection(&v->qMutex);
+#else
+    pthread_mutex_unlock(&v->qMutex);
+#endif
+}
+
+static void qwake_all(VdecSlot* v)
+{
+#ifdef _WIN32
+    WakeAllConditionVariable(&v->qCond);
+#else
+    pthread_cond_broadcast(&v->qCond);
+#endif
+}
+
+static void qwait_10ms(VdecSlot* v)
+{
+#ifdef _WIN32
+    SleepConditionVariableCS(&v->qCond, &v->qMutex, 10);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_nsec += 10 * 1000 * 1000;
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    pthread_cond_timedwait(&v->qCond, &v->qMutex, &ts);
+#endif
+}
 
 static void callback(VdecSlot* v, u32 handle, u32 type, s32 status)
 {
@@ -82,6 +165,7 @@ static void callback(VdecSlot* v, u32 handle, u32 type, s32 status)
 
 static void clear_queue(VdecSlot* v)
 {
+    if (v->qSyncInit) qlock(v);
     for (int i = 0; i < VDEC_QUEUE_CAP; ++i) {
 #ifdef PS3RECOMP_HAVE_FFMPEG
         if (v->queue[i].frame) av_frame_free(&v->queue[i].frame);
@@ -90,11 +174,14 @@ static void clear_queue(VdecSlot* v)
     }
     v->qHead = 0;
     v->qCount = 0;
+    if (v->qSyncInit) { qwake_all(v); qunlock(v); }
 }
 
 static int queue_synthetic(VdecSlot* v, const CellVdecAuInfo* au, u32 width, u32 height)
 {
-    if (v->qCount >= VDEC_QUEUE_CAP) return -1;
+    qlock(v);
+    while (v->qCount >= VDEC_QUEUE_CAP && v->seqStarted) qwait_10ms(v);
+    if (!v->seqStarted) { qunlock(v); return -1; }
     int pos = (v->qHead + v->qCount) % VDEC_QUEUE_CAP;
     VdecFrame* q = &v->queue[pos];
     memset(q, 0, sizeof(*q));
@@ -106,6 +193,7 @@ static int queue_synthetic(VdecSlot* v, const CellVdecAuInfo* au, u32 width, u32
     q->auNum = v->auCount;
     q->synthetic = 1;
     v->qCount++;
+    qunlock(v);
     return 0;
 }
 
@@ -185,25 +273,99 @@ static u8* extract_video_es(const u8* src, size_t srcSize, size_t* outSize)
     return out;
 }
 
+static u64 frame_step_90k(const VdecSlot* v)
+{
+    switch (v->frameRateCode) {
+        case 0x80: return (1001ull * 90000ull) / 24000ull;
+        case 0x81: return 90000ull / 24ull;
+        case 0x82: return 90000ull / 25ull;
+        case 0x83: return (1001ull * 90000ull) / 30000ull;
+        case 0x84: return 90000ull / 30ull;
+        case 0x85: return 90000ull / 50ull;
+        case 0x86: return (1001ull * 90000ull) / 60000ull;
+        case 0x87: return 90000ull / 60ull;
+        default: break;
+    }
+
+    if (v->ctx && v->ctx->framerate.num > 0 && v->ctx->framerate.den > 0) {
+        u64 num = (u64)v->ctx->framerate.num;
+        u64 den = (u64)v->ctx->framerate.den;
+        u64 step = (90000ull * den + num / 2ull) / num;
+        if (step) return step;
+    }
+
+    /* Same safe fallback used by RPCS3 when the stream does not expose a
+     * usable frame rate.  Crucially, never propagate UINT64_MAX timestamps to
+     * the game's display scheduler. */
+    return 90000ull / 30ull;
+}
+
 static int queue_frame(VdecSlot* v, AVFrame* f, const CellVdecAuInfo* au)
 {
-    if (v->qCount >= VDEC_QUEUE_CAP) return -1;
+    const u64 invalid = UINT64_MAX;
+    const u64 fpts = f->pts != AV_NOPTS_VALUE ? (u64)f->pts : invalid;
+    const u64 fdts = f->pkt_dts != AV_NOPTS_VALUE ? (u64)f->pkt_dts : invalid;
+    const u64 step = frame_step_90k(v);
+
+    qlock(v);
+    while (v->qCount >= VDEC_QUEUE_CAP && v->seqStarted) {
+        static unsigned waitLog;
+        if ((waitLog++ % 500u) == 0u)
+            printf("[cellVdec] output queue full (%d); waiting for picture consumer\n", v->qCount);
+        qwait_10ms(v);
+    }
+    if (!v->seqStarted) { qunlock(v); return AVERROR(EPIPE); }
+
+    if (fpts != invalid) {
+        v->nextPts = fpts;
+        v->nextPtsValid = 1;
+    } else if (!v->nextPtsValid && au->pts != invalid) {
+        v->nextPts = au->pts;
+        v->nextPtsValid = 1;
+    }
+
+    if (fdts != invalid) {
+        v->nextDts = fdts;
+        v->nextDtsValid = 1;
+    } else if (!v->nextDtsValid && au->dts != invalid) {
+        v->nextDts = au->dts;
+        v->nextDtsValid = 1;
+    }
+
+    /* If only one timestamp domain is known, seed the other from it. */
+    if (!v->nextPtsValid && v->nextDtsValid) {
+        v->nextPts = v->nextDts;
+        v->nextPtsValid = 1;
+    }
+    if (!v->nextDtsValid && v->nextPtsValid) {
+        v->nextDts = v->nextPts;
+        v->nextDtsValid = 1;
+    }
+
     int pos = (v->qHead + v->qCount) % VDEC_QUEUE_CAP;
     VdecFrame* q = &v->queue[pos];
     memset(q, 0, sizeof(*q));
     q->frame = f;
     q->width = (u32)f->width;
     q->height = (u32)f->height;
-    q->pts = f->pts != AV_NOPTS_VALUE ? (u64)f->pts : au->pts;
-    q->dts = f->pkt_dts != AV_NOPTS_VALUE ? (u64)f->pkt_dts : au->dts;
+    q->pts = v->nextPtsValid ? v->nextPts : 0;
+    q->dts = v->nextDtsValid ? v->nextDts : q->pts;
     q->userData = au->userData;
     q->auNum = v->auCount;
     v->qCount++;
+
+    v->nextPts = q->pts + step;
+    v->nextDts = q->dts + step;
+    v->nextPtsValid = 1;
+    v->nextDtsValid = 1;
+    qunlock(v);
     return 0;
 }
 
-static int decode_packet(VdecSlot* v, const u8* data, size_t size, const CellVdecAuInfo* au)
+static int decode_packet(VdecSlot* v, const u8* data, size_t size,
+                         const CellVdecAuInfo* au, int* framesQueued)
 {
+    if (framesQueued) *framesQueued = 0;
     if (size > INT_MAX) return AVERROR(EINVAL);
 
     /* libavcodec bitstream readers are allowed to read
@@ -228,9 +390,12 @@ static int decode_packet(VdecSlot* v, const u8* data, size_t size, const CellVde
         ret = avcodec_receive_frame(v->ctx, f);
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) { av_frame_free(&f); return 0; }
         if (ret < 0) { av_frame_free(&f); return ret; }
-        if (queue_frame(v, f, au) < 0) { av_frame_free(&f); return AVERROR(ENOBUFS); }
+        ret = queue_frame(v, f, au);
+        if (ret < 0) { av_frame_free(&f); return ret; }
+        if (framesQueued) (*framesQueued)++;
     }
 }
+
 #endif
 
 s32 cellVdecQueryAttr(const CellVdecType* type, CellVdecAttr* attr)
@@ -254,11 +419,12 @@ s32 cellVdecOpen(const CellVdecType* type, const CellVdecResource* res,
     for (int i = 0; i < MAX_VDEC; ++i) if (!s_vdec[i].in_use) {
         VdecSlot* v = &s_vdec[i];
         memset(v, 0, sizeof(*v));
+        qsync_init(v);
         v->in_use = 1; v->codecType = codec;
         if (cb) { v->cbFunc = vm_read32(GUEST_EA(cb)); v->cbArg = vm_read32(GUEST_EA(cb) + 4); }
         if (res) { v->resMemAddr = vm_read32(GUEST_EA(res)); v->resMemSize = vm_read32(GUEST_EA(res) + 4); }
 #ifdef PS3RECOMP_HAVE_FFMPEG
-        if (ffmpeg_open(v) < 0) { memset(v, 0, sizeof(*v)); return (s32)CELL_VDEC_ERROR_FATAL; }
+        if (ffmpeg_open(v) < 0) { qsync_destroy(v); memset(v, 0, sizeof(*v)); return (s32)CELL_VDEC_ERROR_FATAL; }
 #else
         printf("[cellVdec] FFmpeg backend not built; real video decode unavailable\n");
 #endif
@@ -281,12 +447,18 @@ s32 cellVdecOpenEx(const CellVdecType* type, const CellVdecResource* res,
 s32 cellVdecClose(CellVdecHandle handle)
 {
     if (handle >= MAX_VDEC || !s_vdec[handle].in_use) return (s32)CELL_VDEC_ERROR_ARG;
+    VdecSlot* v = &s_vdec[handle];
+    qlock(v);
+    v->seqStarted = 0;
+    qwake_all(v);
+    qunlock(v);
 #ifdef PS3RECOMP_HAVE_FFMPEG
-    ffmpeg_close(&s_vdec[handle]);
+    ffmpeg_close(v);
 #else
-    clear_queue(&s_vdec[handle]);
+    clear_queue(v);
 #endif
-    memset(&s_vdec[handle], 0, sizeof(s_vdec[handle]));
+    qsync_destroy(v);
+    memset(v, 0, sizeof(*v));
     return CELL_OK;
 }
 
@@ -295,6 +467,8 @@ s32 cellVdecStartSeq(CellVdecHandle handle)
     if (handle >= MAX_VDEC || !s_vdec[handle].in_use) return (s32)CELL_VDEC_ERROR_ARG;
     VdecSlot* v = &s_vdec[handle];
     v->seqStarted = 1; v->auCount = 0;
+    v->nextPts = v->nextDts = 0;
+    v->nextPtsValid = v->nextDtsValid = 0;
     clear_queue(v);
 #ifdef PS3RECOMP_HAVE_FFMPEG
     avcodec_flush_buffers(v->ctx);
@@ -321,7 +495,10 @@ s32 cellVdecEndSeq(CellVdecHandle handle)
         }
     }
 #endif
+    qlock(v);
     v->seqStarted = 0;
+    qwake_all(v);
+    qunlock(v);
     callback(v, handle, CELL_VDEC_MSG_TYPE_SEQDONE, CELL_OK);
     return CELL_OK;
 }
@@ -349,17 +526,17 @@ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auIn
     u8* extracted = extract_video_es(src, au.size, &esSize);
     const u8* packet = extracted ? extracted : src;
     size_t packetSize = extracted ? esSize : au.size;
-    int before = v->qCount;
-    int ret = decode_packet(v, packet, packetSize, &au);
+    int framesQueued = 0;
+    int ret = decode_packet(v, packet, packetSize, &au, &framesQueued);
     if (extracted) av_free(extracted);
     callback(v, handle, CELL_VDEC_MSG_TYPE_AUDONE, ret < 0 ? CELL_VDEC_ERROR_AU : CELL_OK);
     if (ret < 0) {
         char err[128]; av_strerror(ret, err, sizeof(err));
-        printf("[cellVdec] decode failed: %s (%d), input=%s size=%zu\n", err, ret,
-               extracted ? "PAMF/PES" : "ES", packetSize);
+        printf("[cellVdec] decode failed: %s (%d), input=%s size=%zu qCount=%d\n", err, ret,
+               extracted ? "PAMF/PES" : "ES", packetSize, v->qCount);
         return (s32)CELL_VDEC_ERROR_AU;
     }
-    for (int i = before; i < v->qCount; ++i) callback(v, handle, CELL_VDEC_MSG_TYPE_PICOUT, CELL_OK);
+    for (int i = 0; i < framesQueued; ++i) callback(v, handle, CELL_VDEC_MSG_TYPE_PICOUT, CELL_OK);
 #else
     /* Keep cellVdec callback semantics alive even on builds where libavcodec
      * was not detected.  The old no-FFmpeg path emitted AUDONE only, so the
@@ -414,6 +591,7 @@ s32 cellVdecGetPicItem(CellVdecHandle handle, void* picItem)
 {
     if (handle >= MAX_VDEC || !s_vdec[handle].in_use || !picItem) return (s32)CELL_VDEC_ERROR_ARG;
     VdecSlot* v = &s_vdec[handle];
+    qlock(v);
     for (int n = 0; n < v->qCount; ++n) {
         int idx = (v->qHead + n) % VDEC_QUEUE_CAP;
         VdecFrame* q = &v->queue[idx];
@@ -422,11 +600,13 @@ s32 cellVdecGetPicItem(CellVdecHandle handle, void* picItem)
             write_pic_item(v, q, item);
             q->picItemReceived = 1;
             vm_write32(GUEST_EA(picItem), item);
-            printf("[cellVdec] GetPicItem -> item=0x%08X frame=%ux%u synthetic=%d qCount=%d\n",
-                   item, q->width, q->height, q->synthetic, v->qCount);
+            printf("[cellVdec] GetPicItem -> item=0x%08X frame=%ux%u pts=%llu synthetic=%d qCount=%d\n",
+                   item, q->width, q->height, (unsigned long long)q->pts, q->synthetic, v->qCount);
+            qunlock(v);
             return CELL_OK;
         }
     }
+    qunlock(v);
     return (s32)CELL_VDEC_ERROR_EMPTY;
 }
 
@@ -434,7 +614,8 @@ s32 cellVdecGetPicture(CellVdecHandle handle, const CellVdecPicFormat* format, v
 {
     if (handle >= MAX_VDEC || !s_vdec[handle].in_use || !format) return (s32)CELL_VDEC_ERROR_ARG;
     VdecSlot* v = &s_vdec[handle];
-    if (!v->qCount) return (s32)CELL_VDEC_ERROR_EMPTY;
+    qlock(v);
+    if (!v->qCount) { qunlock(v); return (s32)CELL_VDEC_ERROR_EMPTY; }
     VdecFrame* q = &v->queue[v->qHead];
     u32 width = q->width ? q->width : 1280;
     u32 height = q->height ? q->height : 720;
@@ -453,11 +634,11 @@ s32 cellVdecGetPicture(CellVdecHandle handle, const CellVdecPicFormat* format, v
                 case CELL_VDEC_PICFMT_RGBA32_ILV: dstFmt = AV_PIX_FMT_RGBA; stride = f->width * 4; break;
                 case CELL_VDEC_PICFMT_UYVY422_ILV: dstFmt = AV_PIX_FMT_UYVY422; stride = f->width * 2; break;
                 case CELL_VDEC_PICFMT_YUV420_PLANAR: dstFmt = AV_PIX_FMT_YUV420P; stride = f->width; break;
-                default: return (s32)CELL_VDEC_ERROR_ARG;
+                default: qunlock(v); return (s32)CELL_VDEC_ERROR_ARG;
             }
             v->sws = sws_getCachedContext(v->sws, f->width, f->height, (enum AVPixelFormat)f->format,
                                           f->width, f->height, dstFmt, SWS_POINT, NULL, NULL, NULL);
-            if (!v->sws) return (s32)CELL_VDEC_ERROR_FATAL;
+            if (!v->sws) { qunlock(v); return (s32)CELL_VDEC_ERROR_FATAL; }
             u8* dst[4] = { base, NULL, NULL, NULL };
             int lines[4] = { stride, 0, 0, 0 };
             if (dstFmt == AV_PIX_FMT_YUV420P) {
@@ -498,19 +679,22 @@ s32 cellVdecGetPicture(CellVdecHandle handle, const CellVdecPicFormat* format, v
                     break;
                 }
                 default:
+                    qunlock(v);
                     return (s32)CELL_VDEC_ERROR_ARG;
             }
         }
     }
 
-    printf("[cellVdec] GetPicture <- frame=%ux%u fmt=%u synthetic=%d qCount=%d\n",
-           width, height, fmt, q->synthetic, v->qCount);
+    printf("[cellVdec] GetPicture <- frame=%ux%u fmt=%u pts=%llu synthetic=%d qCount=%d\n",
+           width, height, fmt, (unsigned long long)q->pts, q->synthetic, v->qCount);
 #ifdef PS3RECOMP_HAVE_FFMPEG
     if (q->frame) av_frame_free(&q->frame);
 #endif
     memset(q, 0, sizeof(*q));
     v->qHead = (v->qHead + 1) % VDEC_QUEUE_CAP;
     v->qCount--;
+    qwake_all(v);
+    qunlock(v);
     return CELL_OK;
 }
 
@@ -518,6 +702,7 @@ s32 cellVdecSetFrameRate(CellVdecHandle handle, u32 frameRateCode)
 {
     if (handle >= MAX_VDEC || !s_vdec[handle].in_use) return (s32)CELL_VDEC_ERROR_ARG;
     s_vdec[handle].frameRateCode = frameRateCode;
+    printf("[cellVdec] SetFrameRate(handle=%u, code=0x%X)\n", handle, frameRateCode);
     return CELL_OK;
 }
 
