@@ -10,6 +10,12 @@
 #include <stdio.h>
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <pthread.h>
+#include <time.h>
+#endif
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
 #include "../../runtime/ppu/ppu_context.h" /* g_active_ctx -> the guest lr */
 #include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
@@ -33,11 +39,12 @@
 #define PCMITEM_AU_USERDATA  0x28u
 #define PCMITEM_BYTES        0x30u
 
-/* ponytail: one fixed-size silence buffer per handle, 1024 stereo float samples
- * -- the ATRAC3 frame this title (codecType 5) decodes. The ceiling is that it
- * is SILENCE and always this size; wire a real decoder in here when the audio
- * itself matters, without changing the guest-visible contract. */
-#define ADEC_PCM_SAMPLES  1024u
+/* ATRAC3plus outputs 2048 samples per access unit.  WA2 opens codecType 13
+ * (CELL_ADEC_TYPE_ATRACX_2CH), 48 kHz stereo float output, so one PCM block is
+ * 2048 * 2 * sizeof(float) == 0x4000 bytes.  The old 1024-sample stub advanced
+ * the movie audio clock at half speed and made VDISP hold all four VPOST
+ * buffers waiting for video PTS to become due. */
+#define ADEC_PCM_SAMPLES  2048u
 #define ADEC_PCM_BYTES    (ADEC_PCM_SAMPLES * 2u * 4u)
 
 /* Guest-visible scratch, in the HLE inject window rather than from the guest's
@@ -50,7 +57,7 @@
  * +0x2000, callback +0x2F00, the offset tables +0x3000/+0x5000, and sys_rsx's
  * device/driver-info/reports pages at +0x30000/+0x31000/+0x38000. */
 #define ADEC_SCRATCH_BASE   (VM_HLE_INJECT_BASE + 0x40000u)
-#define ADEC_SCRATCH_STRIDE 0x4000u
+#define ADEC_SCRATCH_STRIDE 0x8000u
 #define ADEC_ITEM_EA(h)     (ADEC_SCRATCH_BASE + (u32)(h) * ADEC_SCRATCH_STRIDE)
 #define ADEC_PCM_EA(h)      (ADEC_ITEM_EA(h) + 0x100u)
 
@@ -69,9 +76,91 @@ typedef struct {
     u32 pcmEa;          /* guest EA of the PCM buffer it points at    */
     int hasPcm;
     u32 auCount;        /* total AUs decoded */
+#ifdef _WIN32
+    CRITICAL_SECTION pcmMutex;
+    CONDITION_VARIABLE pcmCond;
+#else
+    pthread_mutex_t pcmMutex;
+    pthread_cond_t pcmCond;
+#endif
+    int pcmSyncInit;
 } AdecSlot;
 
 static AdecSlot s_adec[MAX_ADEC];
+
+/* The real ATRAC-X decoder has one output surface and waits until the consumer
+ * releases it before decoding the next AU (see RPCS3 cellAtracXdec.cpp,
+ * "Waiting for output to be consumed").  This matters to WA2 because its
+ * PCMOUT callback is edge/condition based, not an unbounded event counter.
+ * A single hasPcm flag without backpressure loses PCMOUT notifications and,
+ * worse, lets later AU metadata overwrite the PTS of the PCM still pending. */
+static void pcm_sync_init(AdecSlot* a)
+{
+    if (a->pcmSyncInit) return;
+#ifdef _WIN32
+    InitializeCriticalSection(&a->pcmMutex);
+    InitializeConditionVariable(&a->pcmCond);
+#else
+    pthread_mutex_init(&a->pcmMutex, NULL);
+    pthread_cond_init(&a->pcmCond, NULL);
+#endif
+    a->pcmSyncInit = 1;
+}
+
+static void pcm_sync_destroy(AdecSlot* a)
+{
+    if (!a->pcmSyncInit) return;
+#ifdef _WIN32
+    DeleteCriticalSection(&a->pcmMutex);
+#else
+    pthread_cond_destroy(&a->pcmCond);
+    pthread_mutex_destroy(&a->pcmMutex);
+#endif
+    a->pcmSyncInit = 0;
+}
+
+static void pcm_lock(AdecSlot* a)
+{
+#ifdef _WIN32
+    EnterCriticalSection(&a->pcmMutex);
+#else
+    pthread_mutex_lock(&a->pcmMutex);
+#endif
+}
+
+static void pcm_unlock(AdecSlot* a)
+{
+#ifdef _WIN32
+    LeaveCriticalSection(&a->pcmMutex);
+#else
+    pthread_mutex_unlock(&a->pcmMutex);
+#endif
+}
+
+static void pcm_wake_all(AdecSlot* a)
+{
+#ifdef _WIN32
+    WakeAllConditionVariable(&a->pcmCond);
+#else
+    pthread_cond_broadcast(&a->pcmCond);
+#endif
+}
+
+static void pcm_wait_10ms(AdecSlot* a)
+{
+#ifdef _WIN32
+    SleepConditionVariableCS(&a->pcmCond, &a->pcmMutex, 10);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_nsec += 10 * 1000 * 1000;
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_sec++;
+        ts.tv_nsec -= 1000000000L;
+    }
+    pthread_cond_timedwait(&a->pcmCond, &a->pcmMutex, &ts);
+#endif
+}
 
 /* Fire one guest callback.
  *
@@ -150,6 +239,7 @@ s32 cellAdecOpen(const CellAdecType* type, const CellAdecResource* res,
             memset(&s_adec[i], 0, sizeof(AdecSlot));
             s_adec[i].in_use    = 1;
             s_adec[i].codecType = codec_type;
+            pcm_sync_init(&s_adec[i]);
             if (cb_ea) {
                 s_adec[i].cbFunc = vm_read32(cb_ea + 0);
                 s_adec[i].cbArg  = vm_read32(cb_ea + 4);
@@ -175,7 +265,17 @@ s32 cellAdecClose(CellAdecHandle handle)
     if (handle >= MAX_ADEC || !s_adec[handle].in_use)
         return (s32)CELL_ADEC_ERROR_ARG;
 
-    s_adec[handle].in_use = 0;
+    AdecSlot* a = &s_adec[handle];
+    if (a->pcmSyncInit) {
+        pcm_lock(a);
+        a->in_use = 0;
+        a->hasPcm = 0;
+        pcm_wake_all(a);
+        pcm_unlock(a);
+        pcm_sync_destroy(a);
+    } else {
+        a->in_use = 0;
+    }
     return CELL_OK;
 }
 
@@ -187,7 +287,13 @@ s32 cellAdecStartSeq(CellAdecHandle handle, void* param)
     if (handle >= MAX_ADEC || !s_adec[handle].in_use)
         return (s32)CELL_ADEC_ERROR_ARG;
 
-    s_adec[handle].seqStarted = 1;
+    AdecSlot* a = &s_adec[handle];
+    pcm_lock(a);
+    a->seqStarted = 1;
+    a->hasPcm = 0;
+    a->auCount = 0;
+    pcm_wake_all(a);
+    pcm_unlock(a);
     return CELL_OK;
 }
 
@@ -213,7 +319,13 @@ s32 cellAdecEndSeq(CellAdecHandle handle)
     if (handle >= MAX_ADEC || !s_adec[handle].in_use)
         return (s32)CELL_ADEC_ERROR_ARG;
 
-    s_adec[handle].seqStarted = 0;
+    {
+        AdecSlot* a = &s_adec[handle];
+        pcm_lock(a);
+        a->seqStarted = 0;
+        pcm_wake_all(a);
+        pcm_unlock(a);
+    }
 
     adec_notify(handle, CELL_ADEC_MSG_TYPE_SEQDONE, CELL_OK);
 
@@ -229,9 +341,30 @@ s32 cellAdecDecodeAu(CellAdecHandle handle, const CellAdecAuInfo* auInfo)
 
     AdecSlot* a = &s_adec[handle];
 
-    printf("[cellAdec] DecodeAu(handle=%u, addr=0x%X, size=%u)\n",
+    /* One decoded PCM frame may be outstanding at a time.  Without this wait,
+     * DecodeAu overwrites itemEa (including its AU PTS) while apostThread is
+     * still consuming the previous frame. */
+    pcm_lock(a);
+    while (a->hasPcm && a->in_use && a->seqStarted) {
+        static int wait_logs = 0;
+        if (wait_logs++ < 12)
+            printf("[cellAdec] output busy; waiting for PCM consumer\n");
+        pcm_wait_10ms(a);
+    }
+    if (!a->in_use) {
+        pcm_unlock(a);
+        return (s32)CELL_ADEC_ERROR_ARG;
+    }
+    if (!a->seqStarted) {
+        pcm_unlock(a);
+        return (s32)CELL_ADEC_ERROR_SEQ;
+    }
+    pcm_unlock(a);
+
+    printf("[cellAdec] DecodeAu(handle=%u, addr=0x%X, size=%u, pts=%llu)\n",
            handle, vm_read32(GUEST_EA(auInfo) + (u32)offsetof(CellAdecAuInfo, startAddr)),
-           vm_read32(GUEST_EA(auInfo) + (u32)offsetof(CellAdecAuInfo, size)));
+           vm_read32(GUEST_EA(auInfo) + (u32)offsetof(CellAdecAuInfo, size)),
+           (unsigned long long)vm_read64(GUEST_EA(auInfo) + 0x08u));
 
     /* Step 1: report the AU consumed. msgData is the AU INFO ADDRESS, not a
      * status -- see RPCS3 Modules/cellAdec.cpp:1345. A decoder that tracks its
@@ -263,7 +396,9 @@ s32 cellAdecDecodeAu(CellAdecHandle handle, const CellAdecAuInfo* auInfo)
         vm_write32(it + PCMITEM_AU_USERDATA,     vm_read32(au + 0x10));
         vm_write32(it + PCMITEM_AU_USERDATA + 4, vm_read32(au + 0x14));
     }
+    pcm_lock(a);
     a->hasPcm = 1;
+    pcm_unlock(a);
 
     adec_notify(handle, CELL_ADEC_MSG_TYPE_PCMOUT, CELL_OK);
 
@@ -278,35 +413,49 @@ s32 cellAdecGetPcm(CellAdecHandle handle, void* outBuffer)
     if (handle >= MAX_ADEC || !s_adec[handle].in_use)
         return (s32)CELL_ADEC_ERROR_ARG;
 
-    if (!s_adec[handle].hasPcm)
+    AdecSlot* a = &s_adec[handle];
+    pcm_lock(a);
+    if (!a->hasPcm) {
+        pcm_unlock(a);
         return (s32)CELL_ADEC_ERROR_EMPTY;
+    }
 
-    /* outBuffer is the GUEST's buffer. Leaving it untouched hands the title
-     * whatever happened to be there, which it then plays. */
+    /* outBuffer is the GUEST's buffer. ATRAC3+ 2ch float output is 0x4000
+     * bytes per AU (2048 samples), matching the movie player's 0x4000-spaced
+     * apost buffers. */
     { const u32 out = GUEST_EA(outBuffer);
       if (out) for (u32 o = 0; o < ADEC_PCM_BYTES; o += 4) vm_write32(out + o, 0); }
 
-    s_adec[handle].hasPcm = 0;
+    a->hasPcm = 0;
+    pcm_wake_all(a);
+    pcm_unlock(a);
     return CELL_OK;
 }
 
 s32 cellAdecGetPcmItem(CellAdecHandle handle, const CellAdecPcmItem** pcmItem)
 {
-    { static int _n = 0; if (_n++ < 6)
-        printf("[cellAdec] GetPcmItem(handle=%u out=0x%08X hasPcm=%d)\n",
-               handle, GUEST_EA(pcmItem),
-               handle < MAX_ADEC ? s_adec[handle].hasPcm : -1); }
+    { static int _n = 0; if (_n++ < 12) {
+        const int hp = handle < MAX_ADEC ? s_adec[handle].hasPcm : -1;
+        const u64 pts = (handle < MAX_ADEC && hp) ? vm_read64(s_adec[handle].itemEa + PCMITEM_AU_PTS_HI) : 0;
+        printf("[cellAdec] GetPcmItem(handle=%u out=0x%08X hasPcm=%d pts=%llu pcmBytes=0x%X)\n",
+               handle, GUEST_EA(pcmItem), hp, (unsigned long long)pts, ADEC_PCM_BYTES);
+      } }
     if (handle >= MAX_ADEC || !s_adec[handle].in_use)
         return (s32)CELL_ADEC_ERROR_ARG;
 
-    if (!s_adec[handle].hasPcm)
+    AdecSlot* a = &s_adec[handle];
+    pcm_lock(a);
+    if (!a->hasPcm) {
+        pcm_unlock(a);
         return (s32)CELL_ADEC_ERROR_EMPTY;
+    }
 
     /* pcmItem is a GUEST CellAdecPcmItem**. Writing &host_struct here put a
      * HOST address into guest memory; the guest dereferenced it and died on a
      * wild address (rip 0x870D0E, fault 0xCFFDFFF0). Write the guest EA. */
     if (pcmItem)
-        vm_write32(GUEST_EA(pcmItem), s_adec[handle].itemEa);
+        vm_write32(GUEST_EA(pcmItem), a->itemEa);
 
+    pcm_unlock(a);
     return CELL_OK;
 }
