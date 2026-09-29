@@ -1,9 +1,10 @@
 /*
  * ps3recomp - cellVdec HLE implementation
  *
- * Real AVC/MPEG-2 decode backend when FFmpeg is available.  The PAMF demux
- * HLE is still intentionally lightweight, so DecodeAu also accepts a PAMF /
- * MPEG-PS chunk and extracts video PES payload before feeding libavcodec.
+ * Real AVC/MPEG-2 decode backend when FFmpeg is available.  cellDmux now
+ * supplies elementary-stream access units; DecodeAu also keeps a compatibility
+ * path that can extract video PES payload if an older caller sends PAMF /
+ * MPEG-PS data directly.
  *
  * Semantics follow cellVdec/RPCS3: GetPicItem publishes metadata without
  * consuming the picture; GetPicture consumes the oldest decoded picture and
@@ -14,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <limits.h>
 #include <string.h>
 #include "../guest_struct.h"
 #include "../../runtime/ppu/ppu_memory.h"
@@ -202,14 +204,22 @@ static int queue_frame(VdecSlot* v, AVFrame* f, const CellVdecAuInfo* au)
 
 static int decode_packet(VdecSlot* v, const u8* data, size_t size, const CellVdecAuInfo* au)
 {
-    AVPacket pkt;
-    memset(&pkt, 0, sizeof(pkt));
-    pkt.data = (u8*)data;
-    pkt.size = (int)size;
-    pkt.pts = au->pts == UINT64_MAX ? AV_NOPTS_VALUE : (int64_t)au->pts;
-    pkt.dts = au->dts == UINT64_MAX ? AV_NOPTS_VALUE : (int64_t)au->dts;
+    if (size > INT_MAX) return AVERROR(EINVAL);
 
-    int ret = avcodec_send_packet(v->ctx, &pkt);
+    /* libavcodec bitstream readers are allowed to read
+     * AV_INPUT_BUFFER_PADDING_SIZE bytes beyond pkt->size.  Guest AU memory has
+     * no such contract, so never point AVPacket directly into vm_base: copy it
+     * into an FFmpeg-owned packet whose padding is allocated/zeroed correctly. */
+    AVPacket* pkt = av_packet_alloc();
+    if (!pkt) return AVERROR(ENOMEM);
+    int ret = av_new_packet(pkt, (int)size);
+    if (ret < 0) { av_packet_free(&pkt); return ret; }
+    memcpy(pkt->data, data, size);
+    pkt->pts = au->pts == UINT64_MAX ? AV_NOPTS_VALUE : (int64_t)au->pts;
+    pkt->dts = au->dts == UINT64_MAX ? AV_NOPTS_VALUE : (int64_t)au->dts;
+
+    ret = avcodec_send_packet(v->ctx, pkt);
+    av_packet_free(&pkt);
     if (ret < 0) return ret;
 
     for (;;) {

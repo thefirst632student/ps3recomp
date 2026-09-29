@@ -238,6 +238,7 @@ endif()
 # FFmpeg video decode backend (cellVdec)
 # ---------------------------------------------------------------------------
 option(PS3RECOMP_ENABLE_FFMPEG "Enable real cellVdec decoding through FFmpeg" ON)
+option(PS3RECOMP_REQUIRE_FFMPEG "Fail configure if the real cellVdec FFmpeg backend is unavailable" OFF)
 set(PS3RECOMP_FFMPEG_ROOT "" CACHE PATH "Optional FFmpeg install prefix")
 if(PS3RECOMP_ENABLE_FFMPEG)
     set(PS3RECOMP_FFMPEG_OK OFF)
@@ -265,9 +266,18 @@ if(PS3RECOMP_ENABLE_FFMPEG)
         target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_HAVE_FFMPEG=1)
         message(STATUS "  FFmpeg:       cellVdec real AVC/MPEG-2 decode enabled")
     else()
+        if(PS3RECOMP_REQUIRE_FFMPEG)
+            message(FATAL_ERROR
+                "FFmpeg development libraries were not found, but PS3RECOMP_REQUIRE_FFMPEG=ON. "
+                "A movie-capable build needs libavcodec, libavutil and libswscale; "
+                "set PS3RECOMP_FFMPEG_ROOT to their install prefix.")
+        endif()
         message(WARNING "  FFmpeg: not found; cellVdec will use synthetic PICOUT fallback (movie pixels are not decoded)")
     endif()
 else()
+    if(PS3RECOMP_REQUIRE_FFMPEG)
+        message(FATAL_ERROR "PS3RECOMP_REQUIRE_FFMPEG=ON conflicts with PS3RECOMP_ENABLE_FFMPEG=OFF")
+    endif()
     message(STATUS "  FFmpeg:       disabled; cellVdec synthetic PICOUT fallback enabled")
 endif()
 
