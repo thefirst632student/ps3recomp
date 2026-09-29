@@ -79,12 +79,12 @@ extern "C" {
     s32 cellVdecSetFrameRate(u32 handle, u32 frameRateCode);
 
     s32 cellVpostQuery(const void* cfgParam, u32* memSize);
-    s32 cellVpostQueryAttr(const void* cfgParam, u32* memSize);
+    s32 cellVpostQueryAttr(const void* cfgParam, void* attr);
     s32 cellVpostInit(const void* cfgParam, const void* resource, void* handle);
     s32 cellVpostOpen(const void* cfgParam, const void* resource, void* handle);
     s32 cellVpostEnd(u32 handle);
     s32 cellVpostClose(u32 handle);
-    s32 cellVpostExec(u32 handle, const void* inPicBuf, const void* picInfo, void* outPicBuf, const void* ctrlParam);
+    s32 cellVpostExec(u32 handle, const void* inPicBuf, const void* ctrlParam, void* outPicBuf, void* picInfo);
 
     s32 cellAdecQueryAttr(const void* type, void* attr);
     s32 cellAdecOpen(const void* type, const void* res, const void* cb, void* handle);
