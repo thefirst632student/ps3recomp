@@ -4145,8 +4145,16 @@ static void render_frame(void)
         for (int _u = 0; _u < 4; _u++) {
             u32 wslot = DRAW_SRV_BASE + _d * 4 + (u32)_u;
             dr->tex_rt[_u] = -1;
-            /* Display-sized sampler source -> the rendered frame. */
+            /* A sampler that aliases an actual registered display surface may
+             * need the D3D backbuffer snapshot because the guest copy of that
+             * surface is not written by this backend.  Size alone is NOT an
+             * alias test: full-frame decoded video and post-process outputs can
+             * be ordinary textures with the same dimensions as the display.
+             * Replacing those with the previous framebuffer returns stale
+             * content instead of the guest texture. */
+            extern int cellGcmOffsetIsDisplay(u32 offset);
             if (dr->tex[_u].set && s_screen_copy &&
+                cellGcmOffsetIsDisplay(dr->tex[_u].raw) &&
                 dr->tex[_u].w == s_d3d.width && dr->tex[_u].h == s_d3d.height) {
                 static int en = -1;
                 if (en < 0) { const char* e = getenv("SCREEN_AS_TEX"); en = e ? atoi(e) : 1; }

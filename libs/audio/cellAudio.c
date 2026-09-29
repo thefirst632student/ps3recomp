@@ -512,6 +512,11 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
     (void)arg;
     printf("[cellAudio] Mixing thread started\n");
 
+    LARGE_INTEGER qpc_freq, next_qpc;
+    LONGLONG qpc_rem = 0;
+    QueryPerformanceFrequency(&qpc_freq);
+    QueryPerformanceCounter(&next_qpc);
+
     while (s_mix_thread_running) {
         /* Mix and submit one block */
         audio_mix_one_block();
@@ -528,13 +533,44 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
         /* Notify event queues */
         audio_notify_event_queues();
 
-        /* Wait approximately one audio period (~5.333ms).
-         * Adjust based on how much is queued to avoid buffer overrun. */
-        u32 queued = audio_backend_queued_samples();
-        if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
-            Sleep(5);
-        } else {
-            Sleep(2);
+        /* Advance the guest audio ring at the PS3 audio period, not at the
+         * host backend refill rate.  One guest block is 256 samples at 48 kHz
+         * (5.333... ms).  The old 2/5 ms adaptive sleep consumed a whole guest
+         * block on every host refill attempt; when WASAPI had little queued
+         * data that made read_index -- and therefore the title's audio master
+         * clock -- run as much as 2.67x real time.  Movie VDISP then classified
+         * almost every video frame as late and dropped it.
+         *
+         * Keep an absolute QPC deadline so mixing/backend work is included in
+         * the period instead of adding drift every iteration. */
+        {
+            LARGE_INTEGER now;
+
+            /* Exact rational step: freq * 256 / 48000, carrying the remainder
+             * so a long movie does not accumulate truncation error. */
+            LONGLONG numer = qpc_freq.QuadPart * (LONGLONG)CELL_AUDIO_BLOCK_SAMPLES + qpc_rem;
+            LONGLONG step  = numer / (LONGLONG)CELL_AUDIO_SAMPLE_RATE;
+            qpc_rem        = numer % (LONGLONG)CELL_AUDIO_SAMPLE_RATE;
+            next_qpc.QuadPart += step;
+
+            for (;;) {
+                QueryPerformanceCounter(&now);
+                LONGLONG remain = next_qpc.QuadPart - now.QuadPart;
+                if (remain <= 0) {
+                    /* Do not burst through many guest blocks after a debugger,
+                     * device stall or window move.  Real CELL_AUDIO time keeps
+                     * advancing; it does not replay missed callbacks in a tight
+                     * loop. */
+                    if (-remain > step * 2) {
+                        next_qpc = now;
+                        qpc_rem = 0;
+                    }
+                    break;
+                }
+
+                DWORD ms = (DWORD)((remain * 1000) / qpc_freq.QuadPart);
+                Sleep(ms > 1 ? ms - 1 : 1);
+            }
         }
     }
 
@@ -552,12 +588,9 @@ static void* audio_mix_thread_func(void* arg)
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
         audio_notify_event_queues();
 
-        u32 queued = audio_backend_queued_samples();
-        if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
-            usleep(5000);
-        } else {
-            usleep(2000);
-        }
+        /* CELL_AUDIO consumes exactly one 256-sample block per 48 kHz audio
+         * period.  Host queue depth must not change the guest read-index rate. */
+        usleep(CELL_AUDIO_PERIOD_US);
     }
 
     printf("[cellAudio] Mixing thread stopped\n");
