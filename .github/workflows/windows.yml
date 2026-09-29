@@ -37,8 +37,13 @@ jobs:
         with:
           arch: x64
 
-      - name: Install Ninja
-        run: choco install ninja -y --no-progress
+      - name: Install build dependencies
+        run: |
+          choco install ninja ffmpeg-shared -y --no-progress
+          $ffmpeg = Get-ChildItem "C:\ProgramData\chocolatey\lib\ffmpeg-shared\tools" -Directory | Select-Object -First 1
+          if (-not $ffmpeg) { throw "ffmpeg-shared install prefix not found" }
+          "PS3RECOMP_FFMPEG_ROOT=$($ffmpeg.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "FFmpeg root: $($ffmpeg.FullName)"
 
       - name: Show toolchain
         run: |
@@ -52,6 +57,8 @@ jobs:
           -DCMAKE_C_COMPILER=clang-cl
           -DCMAKE_CXX_COMPILER=clang-cl
           -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DPS3RECOMP_REQUIRE_FFMPEG=ON
+          -DPS3RECOMP_FFMPEG_ROOT="$env:PS3RECOMP_FFMPEG_ROOT"
 
       - name: Build
         run: cmake --build build
@@ -137,11 +144,21 @@ jobs:
 
       - name: Build eboot_port (Game Port)
         run: |
-          cmake -S eboot_port -B eboot_port/build -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          cmake -S eboot_port -B eboot_port/build -G Ninja `
+            -DCMAKE_C_COMPILER=clang-cl `
+            -DCMAKE_CXX_COMPILER=clang-cl `
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} `
+            -DPS3RECOMP_REQUIRE_FFMPEG=ON `
+            -DPS3RECOMP_FFMPEG_ROOT="$env:PS3RECOMP_FFMPEG_ROOT"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
           cmake --build eboot_port/build
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Copy-Item "$env:PS3RECOMP_FFMPEG_ROOT\bin\*.dll" "eboot_port\build\" -Force
 
       - name: Upload eboot_port Artifact
         uses: actions/upload-artifact@v4
         with:
           name: MyGameRecomp-Windows-${{ matrix.build_type }}
-          path: eboot_port/build/MyGameRecomp.exe
+          path: |
+            eboot_port/build/MyGameRecomp.exe
+            eboot_port/build/*.dll
