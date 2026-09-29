@@ -95,6 +95,7 @@ void     cellGcmTickVBlank(void);
 void     cellGcmTickFlip(void);
 int      cellGcm_take_flip_pending(void);
 void     cellGcm_rsx_process_fifo(void);      /* drain get -> put */
+void     cellGcm_fifo_kick_wait(unsigned ms); /* wakeable RSX idle wait */
 unsigned cellGcm_flip_request_count(void);
 }
 
@@ -186,26 +187,33 @@ static DWORD WINAPI frame_clock(LPVOID)
     ULONGLONG next_tick = GetTickCount64();
 
     for (;;) {
-        Sleep(4);
+        /* The RSX put register is producer-driven.  Use the same wakeable idle
+         * wait as the runtime harness rather than a blind Sleep: fence-heavy
+         * paths can wake the FIFO thread as soon as more work is visible. */
+        cellGcm_fifo_kick_wait(4);
         ULONGLONG now = GetTickCount64();
 
         int fired = 0;
         while ((long long)(now - next_tick) >= 0 && fired < 240) {
             cellGcmTickVBlank();
             cellGcmTickFlip();
-            /* Present a pending flip BEFORE draining any further. The flip
-             * fires at a get==put frame boundary on the guest thread, so the
-             * batch held right now is exactly the completed frame; presenting
-             * after the drain races the guest's next-frame writes and shows a
-             * mixed one. */
+            /* Retire guest FIFO work BEFORE entering Present().  A title may
+             * request a flip and then append a BACK_END_WRITE_SEMAPHORE_RELEASE
+             * which it immediately polls (WA2's movie vdisp does exactly this).
+             * Present() may block on the host compositor/GPU; doing it first
+             * leaves that release command stranded behind ctrl->put and creates
+             * a circular wait: guest waits for label, RSX drain waits for Present.
+             *
+             * The FIFO walker already stops at in-FIFO flip boundaries, so
+             * draining first does not consume the following frame for titles
+             * using FIFO flips. HLE/RESC flip users conventionally WaitFlip
+             * before submitting the next frame, so their post-flip fence is
+             * safe -- and required -- to retire before the host present. */
+            if (rsx_ok) cellGcm_rsx_process_fifo();
             if (rsx_ok && cellGcm_take_flip_pending()) {
                 present_guest_frame();
                 last_flip = cellGcm_flip_request_count();
             }
-            /* Drain the FIFO every tick. This is what writes the RSX sync-fence
-             * labels the game's per-frame logic blocks on, so it has to keep
-             * advancing at 60 Hz even while present() throttles. */
-            if (rsx_ok) cellGcm_rsx_process_fifo();
             next_tick += 16;             /* ~60 Hz */
             fired++;
         }
@@ -216,11 +224,14 @@ static DWORD WINAPI frame_clock(LPVOID)
          * those at 16 ms apiece paces the guest into single-figure frame rates.
          * The real RSX writes them in microseconds. */
         if (rsx_ok) {
+            /* Same ordering at the high-frequency cadence: retire labels and
+             * other synchronization writes before a potentially blocking host
+             * present. */
+            cellGcm_rsx_process_fifo();
             if (cellGcm_take_flip_pending()) {
                 present_guest_frame();
                 last_flip = cellGcm_flip_request_count();
             }
-            cellGcm_rsx_process_fifo();
 
             if (rsx_backend_pump() != 0) {
                 rsx_ok = 0;              /* window closed */
