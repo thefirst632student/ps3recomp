@@ -149,9 +149,15 @@ typedef struct {
     u64 pendingDts;
     u64 pendingUserData;
 
-    /* ATRAC3+ rolling state. */
+    /* ATRAC3+ rolling state.  A PAMF PES may begin in the middle of an
+     * access unit.  In that case the PES timestamp belongs to the first AU
+     * that STARTS in the new PES, not to the carried AU that finishes there. */
     u64 audioNextPts;
+    u64 audioNextDts;
     int audioPtsValid;
+    u64 audioPendingPts;
+    u64 audioPendingDts;
+    int audioPendingTs;
 
     /* PRIVATE_STREAM_2 can mark the next video AU as random access. */
     int nextRap;
@@ -198,6 +204,10 @@ static void reset_builder(DmuxEsSlot* es)
     es->pendingUserData = 0;
     es->audioPtsValid = 0;
     es->audioNextPts = DMUX_INVALID_TS;
+    es->audioNextDts = DMUX_INVALID_TS;
+    es->audioPendingPts = DMUX_INVALID_TS;
+    es->audioPendingDts = DMUX_INVALID_TS;
+    es->audioPendingTs = 0;
     es->nextRap = 0;
 }
 
@@ -383,10 +393,29 @@ static s32 feed_atrac(u32 esHandle, const u8* data, size_t size,
                       u64 pts, u64 dts, int hasTs, u64 userData)
 {
     DmuxEsSlot* es = &s_es[esHandle];
+
+    /* feed_atrac() drains every complete frame before returning, so any bytes
+     * left in build are the prefix of exactly one AU carried across a PES
+     * boundary.  PAMF timestamps describe the first AU STARTING in a PES.
+     * Do not overwrite the carried AU's timestamp when the next PES arrives;
+     * defer that PES timestamp until after the carried AU has been published.
+     *
+     * mv00.pam demonstrates the required case directly:
+     *   PES #0 PTS 85470: AU 85470, AU 89310, first 621 bytes of AU 93150
+     *   PES #1 PTS 96990: remaining 75 bytes of AU 93150, then AU 96990 ...
+     */
+    const int hasCarriedAu = es->buildSize != 0u;
     if (hasTs) {
-        es->audioNextPts = pts;
-        es->audioPtsValid = 1;
-        es->pendingDts = dts;
+        if (hasCarriedAu) {
+            es->audioPendingPts = pts;
+            es->audioPendingDts = dts;
+            es->audioPendingTs = 1;
+        } else {
+            es->audioNextPts = pts;
+            es->audioNextDts = dts;
+            es->audioPtsValid = 1;
+            es->audioPendingTs = 0;
+        }
     }
 
     if (!ensure_build_capacity(es, es->buildSize + size))
@@ -419,13 +448,26 @@ static s32 feed_atrac(u32 esHandle, const u8* data, size_t size,
         if (frameSize > DMUX_ATRAC_MAX || es->buildSize < frameSize) break;
 
         u64 outPts = es->audioPtsValid ? es->audioNextPts : DMUX_INVALID_TS;
-        u64 outDts = es->audioPtsValid ? es->pendingDts : DMUX_INVALID_TS;
+        u64 outDts = es->audioPtsValid ? es->audioNextDts : DMUX_INVALID_TS;
         s32 rc = queue_au(esHandle, es->build, frameSize, outPts, outDts, userData, 0);
         if (rc != CELL_OK) return rc;
+
         if (es->audioPtsValid) {
             es->audioNextPts += DMUX_AUDIO_TICKS_48K;
-            es->pendingDts = es->audioNextPts;
+            es->audioNextDts += DMUX_AUDIO_TICKS_48K;
         }
+
+        /* If this AU was carried across a PES boundary, the timestamp from the
+         * new PES belongs to the NEXT AU.  Install it only after publishing the
+         * carried AU.  There can be at most one carried AU because complete
+         * frames are drained eagerly. */
+        if (es->audioPendingTs) {
+            es->audioNextPts = es->audioPendingPts;
+            es->audioNextDts = es->audioPendingDts;
+            es->audioPtsValid = 1;
+            es->audioPendingTs = 0;
+        }
+
         memmove(es->build, es->build + frameSize, es->buildSize - frameSize);
         es->buildSize -= frameSize;
     }
