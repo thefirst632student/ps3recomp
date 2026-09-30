@@ -2448,30 +2448,28 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      *   right [757,992): original guest Sample path.
      * All branches return alpha=1 or the texture's opaque alpha, so normal
      * SRC_ALPHA blending cannot hide the diagnostic color. */
-    if ((fp_addr & ~1u) == 0x01BF9100u && s_logo_probe_ready) {
+    if ((fp_addr & ~1u) == 0x01BF9100u) {
         const char* old_tail =
             "    float4 _o = r[0];\n"
             "    return (_o == _o) ? _o : (float4)0;\n}\n";
-        char abc_tail[1024];
+        char abc_tail[1280];
+        /* Compile-time diagnostic: do not depend on texture-upload timing.
+         * The known static WA2 logo has an opaque white texel at (130,150),
+         * verified independently by both CPU decode and GPU readback probes. */
         snprintf(abc_tail, sizeof abc_tail,
             "    float4 _o = r[0];\n"
             "    if (input.position.x >= 288.0 && input.position.x < 992.0 && "
             "input.position.y >= 64.0 && input.position.y < 576.0) {\n"
-            "        if (input.position.x < 522.0) "
-            "return float4(saturate(input.tc0.x), saturate(input.tc0.y), 0.0, 1.0);\n"
-            "        if (input.position.x < 757.0) "
-            "return rsx_tex[0].Load(int3(%u, %u, 0));\n"
+            "        if (input.position.x < 464.0) return float4(1.0, 0.0, 0.0, 1.0);\n"
+            "        if (input.position.x < 640.0) return float4(saturate(input.tc0.x), saturate(input.tc0.y), 0.0, 1.0);\n"
+            "        if (input.position.x < 816.0) return rsx_tex[0].Load(int3(130, 150, 0));\n"
             "    }\n"
-            "    return (_o == _o) ? _o : (float4)0;\n}\n",
-            s_logo_probe_x, s_logo_probe_y);
+            "    return (_o == _o) ? _o : (float4)0;\n}\n");
         if (strstr(hlsl, old_tail)) {
             hlsl_replace_all(hlsl, sizeof(hlsl), old_tail, abc_tail);
             fprintf(stderr,
-                "[LOGO_STAGE_CFG] thirds=288..522(tc0),522..757(load),757..992(sample) "
-                "load=(%u,%u) expected=(%u,%u,%u,%u)%c",
-                s_logo_probe_x, s_logo_probe_y,
-                s_logo_probe_rgba[0], s_logo_probe_rgba[1],
-                s_logo_probe_rgba[2], s_logo_probe_rgba[3], 10);
+                "[LOGO_STAGE_CFG] quarters=288..464(solid-red),464..640(tc0),"
+                "640..816(load-white@130,150),816..992(sample)%c", 10);
         } else {
             fprintf(stderr, "[LOGO_STAGE_CFG] tail replacement FAILED%c", 10);
         }
@@ -5610,7 +5608,7 @@ skip_dump_consider: ;
         D3D12_RANGE _rr = {0, (SIZE_T)s_d3d.readback_pitch * s_d3d.height};
         if (SUCCEEDED(s_d3d.readback_buf->lpVtbl->Map(s_d3d.readback_buf, 0, &_rr, &_mp)) && _mp) {
             u32 nz = 0, rgb_nz = 0, alpha_nz = 0, bbox_rgb = 0, bbox_n = 0;
-            u32 abc_rgb[3] = {0,0,0}, abc_n[3] = {0,0,0};
+            u32 abc_rgb[4] = {0,0,0,0}, abc_n[4] = {0,0,0,0};
             u8 rmax=0,gmax=0,bmax=0,amax=0;
             for (u32 y=0; y<s_d3d.height; y++) {
                 const u8* row=(const u8*)_mp + (u64)y*s_d3d.readback_pitch;
@@ -5621,7 +5619,7 @@ skip_dump_consider: ;
                     if (q[3]) alpha_nz++;
                     if (q[0]>rmax)rmax=q[0]; if(q[1]>gmax)gmax=q[1]; if(q[2]>bmax)bmax=q[2]; if(q[3]>amax)amax=q[3];
                     if (x>=288 && x<992 && y>=64 && y<576) {
-                        int ai = (x < 522) ? 0 : ((x < 757) ? 1 : 2);
+                        int ai = (x < 464) ? 0 : ((x < 640) ? 1 : ((x < 816) ? 2 : 3));
                         bbox_n++; abc_n[ai]++;
                         if(q[0]||q[1]||q[2]) { bbox_rgb++; abc_rgb[ai]++; }
                     }
@@ -5635,8 +5633,9 @@ skip_dump_consider: ;
                 alpha_nz, s_d3d.width*s_d3d.height, nz, bbox_rgb, bbox_n,
                 rmax,gmax,bmax,amax,qc[0],qc[1],qc[2],qc[3],10);
             fprintf(stderr,
-                "[LOGO_STAGE] tc0_rgb=%u/%u load_rgb=%u/%u sample_rgb=%u/%u%c",
-                abc_rgb[0], abc_n[0], abc_rgb[1], abc_n[1], abc_rgb[2], abc_n[2], 10);
+                "[LOGO_STAGE] solid_rgb=%u/%u tc0_rgb=%u/%u load_rgb=%u/%u sample_rgb=%u/%u%c",
+                abc_rgb[0], abc_n[0], abc_rgb[1], abc_n[1],
+                abc_rgb[2], abc_n[2], abc_rgb[3], abc_n[3], 10);
             D3D12_RANGE _wr = {0,0};
             s_d3d.readback_buf->lpVtbl->Unmap(s_d3d.readback_buf,0,&_wr);
         } else {
