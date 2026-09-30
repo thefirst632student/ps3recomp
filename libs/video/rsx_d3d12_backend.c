@@ -2516,6 +2516,71 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             }
             logo_fp_dumped = 1;
         }
+
+        /* Raw instruction telemetry for the same FP.  RPCS3 models bit 31 of
+         * SRC2 as the instruction-wide perspective-correction flag; the HLSL
+         * decompiler in this tree currently ignores it.  Log it here before
+         * changing any semantics so the next run tells us whether that missing
+         * state is relevant to this exact shader. */
+        {
+            const u8* uc = vm_base + off;
+            u32 poff = 0;
+            for (int pi = 0; pi < n && pi < 2 && poff + 16 <= 4096; pi++) {
+                u32 pw0 = rsx_fp_read_word(uc + poff + 0);
+                u32 pw1 = rsx_fp_read_word(uc + poff + 4);
+                u32 pw2 = rsx_fp_read_word(uc + poff + 8);
+                u32 pw3 = rsx_fp_read_word(uc + poff + 12);
+                fprintf(stderr,
+                    "[LOGO_FPRAW] i=%d op=0x%02X input=%u tex=%u persp=%u "
+                    "w0=%08X w1=%08X w2=%08X w3=%08X%c",
+                    pi, (pw0 >> 24) & 0x3Fu, (pw0 >> 13) & 0xFu,
+                    (pw0 >> 17) & 0xFu, (pw3 >> 31) & 1u,
+                    pw0, pw1, pw2, pw3, 10);
+                poff += 16;
+                /* Inline constants occupy an additional instruction-sized slot. */
+                u32 t0 = pw1 & 3u, t1 = pw2 & 3u, t2 = pw3 & 3u;
+                if (t0 == 2u || t1 == 2u || t2 == 2u) poff += 16;
+            }
+        }
+    }
+
+    /* WA2 sample-semantics probe.  Previous probes established that the exact
+     * GPU texture and SRV are populated and that Texture.Load of texel 130,150
+     * is white, while Texture.Sample(tc0) is black.  Distinguish the two
+     * remaining mechanisms without assuming the WIP sample project is correct:
+     *   Q0 fixed normalized Sample at that known-white texel -> sampler path
+     *   Q1 SampleLevel(tc0, 0)                         -> no implicit derivatives
+     *   Q2 original guest Sample(tc0)                  -> baseline
+     *   Q3 tc0 status: green=in [0,1], red=out, blue=NaN, magenta=huge/Inf.
+     * This modifies only the known boot-logo FP and is diagnostic, not a game
+     * workaround. */
+    if ((fp_addr & ~1u) == 0x01BF9100u) {
+        const char* old_tail =
+            "    float4 _o = r[0];\n"
+            "    return (_o == _o) ? _o : (float4)0;\n}\n";
+        char probe_tail[2048];
+        snprintf(probe_tail, sizeof probe_tail,
+            "    float4 _o = r[0];\n"
+            "    if (input.position.x >= 288.0 && input.position.x < 992.0 && "
+            "input.position.y >= 64.0 && input.position.y < 576.0) {\n"
+            "        if (input.position.x < 464.0) return rsx_tex[0].Sample(rsx_samp[0], float2(0.1853693182, 0.2939453125));\n"
+            "        if (input.position.x < 640.0) return rsx_tex[0].SampleLevel(rsx_samp[0], input.tc0.xy, 0.0);\n"
+            "        if (input.position.x < 816.0) return (_o == _o) ? _o : (float4)0;\n"
+            "        float2 _uv = input.tc0.xy;\n"
+            "        if (!all(_uv == _uv)) return float4(0.0,0.0,1.0,1.0);\n"
+            "        if (any(abs(_uv) > float2(1.0e10,1.0e10))) return float4(1.0,0.0,1.0,1.0);\n"
+            "        bool _inside = all(_uv >= float2(-0.001,-0.001)) && all(_uv <= float2(1.001,1.001));\n"
+            "        return _inside ? float4(0.0,1.0,0.0,1.0) : float4(1.0,0.0,0.0,1.0);\n"
+            "    }\n"
+            "    return (_o == _o) ? _o : (float4)0;\n}\n");
+        if (strstr(hlsl, old_tail)) {
+            hlsl_replace_all(hlsl, sizeof(hlsl), old_tail, probe_tail);
+            fprintf(stderr,
+                "[LOGO_SAMPLE_CFG] q0=fixed-sample-white q1=samplelevel(tc0,0) "
+                "q2=implicit-sample(tc0) q3=uv-status%c", 10);
+        } else {
+            fprintf(stderr, "[LOGO_SAMPLE_CFG] tail replacement FAILED%c", 10);
+        }
     }
     /* FP_LIST=1: every program the title actually compiles, with its size. A
      * fragment program that hangs the GPU shows up here as an implausible
@@ -5822,6 +5887,9 @@ skip_dump_consider: ;
         D3D12_RANGE _rr = {0, (SIZE_T)s_d3d.readback_pitch * s_d3d.height};
         if (SUCCEEDED(s_d3d.readback_buf->lpVtbl->Map(s_d3d.readback_buf, 0, &_rr, &_mp)) && _mp) {
             u32 nz = 0, rgb_nz = 0, alpha_nz = 0, bbox_rgb = 0, bbox_n = 0;
+            u32 q_n[4] = {0,0,0,0}, q_rgb[4] = {0,0,0,0};
+            u64 q_sum[4][3] = {{0}};
+            u32 q_status_green=0, q_status_red=0, q_status_blue=0, q_status_magenta=0;
             u8 rmax=0,gmax=0,bmax=0,amax=0;
             for (u32 y=0; y<s_d3d.height; y++) {
                 const u8* row=(const u8*)_mp + (u64)y*s_d3d.readback_pitch;
@@ -5832,8 +5900,16 @@ skip_dump_consider: ;
                     if (q[3]) alpha_nz++;
                     if (q[0]>rmax)rmax=q[0]; if(q[1]>gmax)gmax=q[1]; if(q[2]>bmax)bmax=q[2]; if(q[3]>amax)amax=q[3];
                     if (x>=288 && x<992 && y>=64 && y<576) {
-                        bbox_n++;
-                        if(q[0]||q[1]||q[2]) bbox_rgb++;
+                        int qi = (x < 464) ? 0 : ((x < 640) ? 1 : ((x < 816) ? 2 : 3));
+                        bbox_n++; q_n[qi]++;
+                        q_sum[qi][0] += q[0]; q_sum[qi][1] += q[1]; q_sum[qi][2] += q[2];
+                        if(q[0]||q[1]||q[2]) { bbox_rgb++; q_rgb[qi]++; }
+                        if (qi == 3) {
+                            if (q[1] > 200 && q[0] < 40 && q[2] < 40) q_status_green++;
+                            else if (q[0] > 200 && q[1] < 40 && q[2] < 40) q_status_red++;
+                            else if (q[2] > 200 && q[0] < 40 && q[1] < 40) q_status_blue++;
+                            else if (q[0] > 200 && q[2] > 200 && q[1] < 40) q_status_magenta++;
+                        }
                     }
                 }
             }
@@ -5844,6 +5920,26 @@ skip_dump_consider: ;
                 s_d3d.frame_count, rgb_nz, s_d3d.width*s_d3d.height,
                 alpha_nz, s_d3d.width*s_d3d.height, nz, bbox_rgb, bbox_n,
                 rmax,gmax,bmax,amax,qc[0],qc[1],qc[2],qc[3],10);
+            fprintf(stderr,
+                "[LOGO_SAMPLE] fixed=%u/%u avg=(%u,%u,%u) "
+                "level0=%u/%u avg=(%u,%u,%u) implicit=%u/%u avg=(%u,%u,%u) "
+                "uvstat G/R/B/M=%u/%u/%u/%u avg=(%u,%u,%u)%c",
+                q_rgb[0],q_n[0],
+                q_n[0] ? (u32)(q_sum[0][0]/q_n[0]) : 0u,
+                q_n[0] ? (u32)(q_sum[0][1]/q_n[0]) : 0u,
+                q_n[0] ? (u32)(q_sum[0][2]/q_n[0]) : 0u,
+                q_rgb[1],q_n[1],
+                q_n[1] ? (u32)(q_sum[1][0]/q_n[1]) : 0u,
+                q_n[1] ? (u32)(q_sum[1][1]/q_n[1]) : 0u,
+                q_n[1] ? (u32)(q_sum[1][2]/q_n[1]) : 0u,
+                q_rgb[2],q_n[2],
+                q_n[2] ? (u32)(q_sum[2][0]/q_n[2]) : 0u,
+                q_n[2] ? (u32)(q_sum[2][1]/q_n[2]) : 0u,
+                q_n[2] ? (u32)(q_sum[2][2]/q_n[2]) : 0u,
+                q_status_green,q_status_red,q_status_blue,q_status_magenta,
+                q_n[3] ? (u32)(q_sum[3][0]/q_n[3]) : 0u,
+                q_n[3] ? (u32)(q_sum[3][1]/q_n[3]) : 0u,
+                q_n[3] ? (u32)(q_sum[3][2]/q_n[3]) : 0u,10);
             D3D12_RANGE _wr = {0,0};
             s_d3d.readback_buf->lpVtbl->Unmap(s_d3d.readback_buf,0,&_wr);
         } else {
