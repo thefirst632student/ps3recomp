@@ -3040,6 +3040,41 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, u32 guest_pitch, i
     rsx_texture_decode(mapped, pitch, vm_base + off, w, h, &tl,
                        rsx_texture_argb_is_rgba());
 
+    /* WA2 root-cause probe: inspect the host-visible RGBA image AFTER the RSX
+     * format/layout conversion, not just the guest source bytes. If this says
+     * RGB and alpha are populated, texture decode/component order is exonerated. */
+    if (_f == 0 && key_off == 0x01CA8480u &&
+        tl.fmt == RSX_TEXFMT_R8G8B8A8) {
+        static int _logo_dec_done = 0;
+        if (!_logo_dec_done) {
+            _logo_dec_done = 1;
+            u64 sr = 0, sg = 0, sb = 0, sa = 0;
+            u32 rgb_nz = 0, a_nz = 0, a_partial = 0, samples = 0;
+            u8 rmax = 0, gmax = 0, bmax = 0, amin = 255, amax = 0;
+            for (u32 y = 0; y < h; y++) {
+                const u8* row = (const u8*)mapped + (u64)y * pitch;
+                for (u32 x = 0; x < w; x++) {
+                    const u8* q = row + (u64)x * 4u;
+                    u8 r=q[0], g=q[1], b=q[2], a=q[3];
+                    sr += r; sg += g; sb += b; sa += a; samples++;
+                    if (r || g || b) rgb_nz++;
+                    if (a) a_nz++;
+                    if (a && a != 255) a_partial++;
+                    if (r > rmax) rmax=r; if (g > gmax) gmax=g; if (b > bmax) bmax=b;
+                    if (a < amin) amin=a; if (a > amax) amax=a;
+                }
+            }
+            const u8* ctr = (const u8*)mapped + (u64)(h/2) * pitch + (u64)(w/2) * 4u;
+            fprintf(stderr,
+                "[LOGO_DEC] raw=0x%08X %ux%u rgb_nz=%u/%u a_nz=%u/%u a_partial=%u "
+                "avg=(%u,%u,%u,%u) maxRGB=(%u,%u,%u) alpha=[%u..%u] center=(%u,%u,%u,%u)%c",
+                key_off, w, h, rgb_nz, samples, a_nz, samples, a_partial,
+                samples ? (u32)(sr/samples) : 0, samples ? (u32)(sg/samples) : 0,
+                samples ? (u32)(sb/samples) : 0, samples ? (u32)(sa/samples) : 0,
+                rmax, gmax, bmax, amin, amax, ctr[0], ctr[1], ctr[2], ctr[3], 10);
+        }
+    }
+
     /* The diagnostics below only apply to the linear 8-bit case (Bink video
      * planes); they used to sit inside that branch of the conversion. */
     if (!tl.compressed && tl.bytes_per_texel == 1 && !tl.swizzled) {
@@ -4136,6 +4171,19 @@ static void render_frame(void)
     double _rf0 = perf_on() ? perf_now() : 0.0;
     u32 fi = s_d3d.frame_index;
 
+    /* WA2 logo stage probe: detect the exact guest batches that bind either
+     * boot-logo texture. This is diagnostic only; it does not alter draw state.
+     * Keep the flag alive until after command submission so we can read back the
+     * final swapchain image and answer whether pixels survived rasterization. */
+    int logo_probe_batch = 0;
+    for (u32 _lp = 0; _lp < s_d3d.draw_count && _lp < MAX_DRAWS; _lp++) {
+        const D3D12DrawRecord* _dr = &s_d3d.draws[_lp];
+        if (_dr->tex[0].raw == 0x01CA8480u || _dr->tex[0].raw == 0x01CA3E80u) {
+            logo_probe_batch = 1;
+            break;
+        }
+    }
+
     /* Drain the GPU before touching shared upload resources (vp_vb vertices,
      * vp_cb constants, per-frame texture staging): the previous frame's draws
      * may still be reading them, and overwriting mid-flight tears geometry
@@ -4159,8 +4207,9 @@ static void render_frame(void)
         compile_vp();
     /* Per-draw VP constants are snapshotted at record time (vp_record_cb). */
 
-    /* Lazily create the readback buffer the first time a dump is requested. */
-    if (s_d3d.dump_frames_left > 0 && !s_d3d.readback_buf) {
+    /* Lazily create the readback buffer the first time a dump is requested, or
+     * for the one-shot logo stage probe. */
+    if ((s_d3d.dump_frames_left > 0 || logo_probe_batch) && !s_d3d.readback_buf) {
         s_d3d.readback_pitch = (s_d3d.width * 4 + 255) & ~255u;
         D3D12_HEAP_PROPERTIES hp = {0};
         hp.Type = D3D12_HEAP_TYPE_READBACK;
@@ -5228,6 +5277,8 @@ static void render_frame(void)
 skip_dump_consider: ;
     guest_fb_present(fi);
     composite_present(fi);
+    static int s_logo_fb_done = 0;
+    int logo_fb_probe = logo_probe_batch && !s_logo_fb_done && s_d3d.readback_buf;
     int dumping = (s_d3d.dump_frames_left > 0 && s_d3d.readback_buf
                    && s_d3d.dump_skip_left == 0);
     { static int mind2 = -1;
@@ -5243,7 +5294,7 @@ skip_dump_consider: ;
                            s_every = e ? atoi(e) : 0; }
         if (s_every > 1) s_d3d.dump_skip_left = s_every - 1;
     }
-    if (dumping) {
+    if (dumping || logo_fb_probe) {
         /* RT -> COPY_SOURCE, copy into the readback buffer, then -> PRESENT. */
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
@@ -5311,6 +5362,43 @@ skip_dump_consider: ;
             fflush(stderr);
         }
       } }
+
+    if (logo_fb_probe) {
+        /* The copy above is ordered on the graphics queue; wait once, map, and
+         * characterize both the full frame and the known large-logo rectangle.
+         * No screenshot is needed to answer whether rasterization produced any
+         * visible color. */
+        wait_for_gpu();
+        void* _mp = NULL;
+        D3D12_RANGE _rr = {0, (SIZE_T)s_d3d.readback_pitch * s_d3d.height};
+        if (SUCCEEDED(s_d3d.readback_buf->lpVtbl->Map(s_d3d.readback_buf, 0, &_rr, &_mp)) && _mp) {
+            u32 nz = 0, rgb_nz = 0, alpha_nz = 0, bbox_rgb = 0, bbox_n = 0;
+            u8 rmax=0,gmax=0,bmax=0,amax=0;
+            for (u32 y=0; y<s_d3d.height; y++) {
+                const u8* row=(const u8*)_mp + (u64)y*s_d3d.readback_pitch;
+                for (u32 x=0; x<s_d3d.width; x++) {
+                    const u8* q=row+(u64)x*4u;
+                    if (q[0]||q[1]||q[2]||q[3]) nz++;
+                    if (q[0]||q[1]||q[2]) rgb_nz++;
+                    if (q[3]) alpha_nz++;
+                    if (q[0]>rmax)rmax=q[0]; if(q[1]>gmax)gmax=q[1]; if(q[2]>bmax)bmax=q[2]; if(q[3]>amax)amax=q[3];
+                    if (x>=288 && x<992 && y>=64 && y<576) { bbox_n++; if(q[0]||q[1]||q[2]) bbox_rgb++; }
+                }
+            }
+            const u8* qc=(const u8*)_mp + (u64)360*s_d3d.readback_pitch + (u64)640*4u;
+            fprintf(stderr,
+                "[LOGO_FB] frame=%u rgb_nz=%u/%u alpha_nz=%u/%u any_nz=%u "
+                "bbox_rgb=%u/%u max=(%u,%u,%u,%u) center=(%u,%u,%u,%u)%c",
+                s_d3d.frame_count, rgb_nz, s_d3d.width*s_d3d.height,
+                alpha_nz, s_d3d.width*s_d3d.height, nz, bbox_rgb, bbox_n,
+                rmax,gmax,bmax,amax,qc[0],qc[1],qc[2],qc[3],10);
+            D3D12_RANGE _wr = {0,0};
+            s_d3d.readback_buf->lpVtbl->Unmap(s_d3d.readback_buf,0,&_wr);
+        } else {
+            fprintf(stderr, "[LOGO_FB] readback map FAILED%c", 10);
+        }
+        s_logo_fb_done = 1;
+    }
 
     if (s_sc_dump_pending) {
         s_sc_dump_pending = 0;
