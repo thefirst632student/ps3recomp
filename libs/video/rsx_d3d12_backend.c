@@ -2291,6 +2291,38 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     (void)exp32;
     int n = rsx_fp_decompile(vm_base + off, 4096, RSX_FP_CTRL_AUTO, hlsl, sizeof(hlsl));
     if (n <= 0) { static int _e=0; if(_e++<16) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr); return NULL; }
+
+    /* WA2 logo root-cause probe: do not alter shader behavior.  The two boot
+     * logo draws use this fragment program.  Report which sampler units and
+     * interpolants the translated program actually consumes so a black result
+     * can be separated from an empty texture or a bad vertex stream. */
+    if ((fp_addr & ~1u) == 0x01BF9100u) {
+        static int logo_fp_dumped = 0;
+        if (!logo_fp_dumped) {
+            u32 units = 0;
+            for (int u = 0; u < 4; u++) {
+                char pat[48];
+                snprintf(pat, sizeof pat, "rsx_tex%d.Sample", u);
+                if (strstr(hlsl, pat)) units |= 1u << u;
+            }
+            fprintf(stderr, "[LOGO_FP] fp=0x%08X instrs=%d sampled_units=0x%X%c",
+                    fp_addr, n, units, 10);
+            const char* q = hlsl;
+            int shown = 0;
+            while (shown < 8 && (q = strstr(q, ".Sample(")) != NULL) {
+                const char* b = q;
+                const char* eol = q;
+                while (b > hlsl && b[-1] != '\n') b--;
+                while (*eol && *eol != '\n') eol++;
+                int len = (int)(eol - b);
+                if (len > 240) len = 240;
+                fprintf(stderr, "[LOGO_FP] sample: %.*s%c", len, b, 10);
+                q = eol;
+                shown++;
+            }
+            logo_fp_dumped = 1;
+        }
+    }
     /* FP_LIST=1: every program the title actually compiles, with its size. A
      * fragment program that hangs the GPU shows up here as an implausible
      * instruction count long before it shows up as a TDR. */
@@ -6256,6 +6288,39 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
     }
     s_total++;
 
+    /* WA2 logo root-cause probe: inspect the actual post-fetch attributes for
+     * the two characteristic boot-logo draws.  In particular attrib3 is the
+     * normalized ubyte4 vertex colour/alpha used by SRC_ALPHA blending, while
+     * attrib8 is the texture coordinate.  No rendering state is changed. */
+    if (s_d3d.current_rsx_state &&
+        ((s_d3d.current_rsx_state->shader_program & ~1u) == 0x01BF9100u) &&
+        ((primitive == RSX_PRIMITIVE_TRIANGLE_STRIP && first == 10u && count == 4u) ||
+         (primitive == RSX_PRIMITIVE_QUADS && first == 0u && count == 24u))) {
+        static u32 logo_draw_seen = 0;
+        u32 bit = (primitive == RSX_PRIMITIVE_QUADS) ? 2u : 1u;
+        if (!(logo_draw_seen & bit)) {
+            logo_draw_seen |= bit;
+            const rsx_state* st = s_d3d.current_rsx_state;
+            fprintf(stderr,
+                    "[LOGO_VTX] prim=%u first=%u count=%u blend=%d sf=0x%X df=0x%X alphaTest=%d func=0x%X ref=%u viewport=%u,%u %ux%u scissor=%u,%u %ux%u%c",
+                    primitive, first, count, st->blend_enable, st->blend_sfactor,
+                    st->blend_dfactor, st->alpha_test_enable, st->alpha_func,
+                    st->alpha_ref, st->viewport_x, st->viewport_y, st->viewport_w,
+                    st->viewport_h, st->scissor_x, st->scissor_y, st->scissor_w,
+                    st->scissor_h, 10);
+            u32 nv = count < 4u ? count : 4u;
+            for (u32 k = 0; k < nv; k++) {
+                VPSlot vv[16];
+                read_vp_vertex(st, first + k, vv);
+                fprintf(stderr,
+                        "[LOGO_VTX] v%u pos=(%.4g %.4g %.4g %.4g) color=(%.4g %.4g %.4g %.4g) uv=(%.4g %.4g %.4g %.4g)%c",
+                        k, vv[0].v[0], vv[0].v[1], vv[0].v[2], vv[0].v[3],
+                        vv[3].v[0], vv[3].v[1], vv[3].v[2], vv[3].v[3],
+                        vv[8].v[0], vv[8].v[1], vv[8].v[2], vv[8].v[3], 10);
+            }
+        }
+    }
+
     if (!s_d3d.pipeline_ready || !s_d3d.vb_mapped) return;
     if (count == 0 || count > MAX_VERTICES) return;
 
@@ -6734,6 +6799,48 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
                     }
                 }
             } }
+          /* WA2 logo root-cause probe.  This is observational only: compare
+           * the selected address with LOCAL and MAIN resolutions and inspect
+           * the exact level-0 byte span implied by RSX format/pitch. */
+          if ((width == 704u && height == 512u) ||
+              (width == 224u && height == 80u)) {
+              static u32 logo_seen[8]; static int logo_seen_n = 0;
+              int known = 0;
+              for (int k = 0; k < logo_seen_n; k++) if (logo_seen[k] == offset) known = 1;
+              if (!known && logo_seen_n < 8) {
+                  logo_seen[logo_seen_n++] = offset;
+                  rsx_tex_layout lp;
+                  rsx_texture_layout_pitched(format, width, height,
+                                             tex->control3 & 0xFFFFu, &lp);
+                  u32 bytes = lp.row_bytes * lp.rows;
+                  u32 ea_l = cellGcmResolveLocated(1, offset);
+                  u32 ea_m = cellGcmResolveLocated(0, offset);
+                  u32 eas[3] = {_r, ea_l, ea_m};
+                  const char* names[3] = {"chosen", "local", "main"};
+                  fprintf(stderr,
+                          "[LOGO_TEX] raw=0x%08X fmt=0x%02X %ux%u pitch=%u ctrl1=0x%08X bytes=%u chosen=0x%08X local=0x%08X main=0x%08X%c",
+                          offset, format, width, height, tex->control3 & 0xFFFFu,
+                          tex->control1, bytes, _r, ea_l, ea_m, 10);
+                  for (int a = 0; a < 3; a++) {
+                      u32 ea = eas[a];
+                      if (!ea || ea >= 0xE0000000u || bytes == 0 || ea + bytes < ea ||
+                          ea + bytes >= 0xE0000000u) {
+                          fprintf(stderr, "[LOGO_TEX] %s invalid ea=0x%08X%c", names[a], ea, 10);
+                          continue;
+                      }
+                      u32 nz = 0, probes = 0;
+                      u32 step = bytes > 16384u ? bytes / 2048u : 7u;
+                      if (!step) step = 1;
+                      for (u32 i = 0; i < bytes; i += step) { probes++; if (vm_base[ea+i]) nz++; }
+                      u32 cs = tex_csum(vm_base + ea, bytes);
+                      fprintf(stderr, "[LOGO_TEX] %s ea=0x%08X nz=%u/%u csum=%08X head=",
+                              names[a], ea, nz, probes, cs);
+                      u32 head = bytes < 16u ? bytes : 16u;
+                      for (u32 i = 0; i < head; i++) fprintf(stderr, "%02X", vm_base[ea+i]);
+                      fputc(10, stderr);
+                  }
+              }
+          }
           s_d3d.cur_texs[unit].off = _r; }
         s_d3d.cur_texs[unit].raw = offset;
         s_d3d.cur_texs[unit].w = width; s_d3d.cur_texs[unit].h = height;
