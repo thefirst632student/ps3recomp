@@ -190,6 +190,14 @@ typedef struct {
     u32 hash;               /* FNV-1a of the ucode */
     ID3DBlob* vs;
     int uses_c03;
+    /* Root-cause telemetry retained with the compiled VS.  A draw can hit the
+     * cache long after the HLSL text that created it is gone; keeping the
+     * constant references and HPOS-writing lines lets us inspect the exact VP
+     * that a later logo draw actually uses without changing rendering. */
+    int instrs;
+    u32 const_refs[16];
+    int const_ref_count;
+    char hpos_summary[768];
 } VPVSEntry;
 #define VP_VS_CACHE 16  /* wave uses 5+ distinct VPs; at 4 the cache
                          * thrashed every frame and eviction shifted slots
@@ -1920,6 +1928,60 @@ static u32 vp_hash_ucode(const u8* p, u32 n)
     return h ? h : 1u;
 }
 
+static void vp_diag_summarize_hlsl(VPVSEntry* e, const char* hlsl, int instrs)
+{
+    if (!e || !hlsl) return;
+    e->instrs = instrs;
+    e->const_ref_count = 0;
+    e->hpos_summary[0] = 0;
+
+    /* Collect direct vp_c[N] references. Indexed references are deliberately
+     * skipped because their runtime address depends on a0/a1. */
+    const char* q = hlsl;
+    while ((q = strstr(q, "vp_c[")) != NULL) {
+        q += 5;
+        if (*q >= '0' && *q <= '9') {
+            char* endp = NULL;
+            unsigned long v = strtoul(q, &endp, 10);
+            if (endp != q && v < RSX_MAX_VERTEX_CONSTANTS) {
+                int seen = 0;
+                for (int i = 0; i < e->const_ref_count; i++)
+                    if (e->const_refs[i] == (u32)v) { seen = 1; break; }
+                if (!seen && e->const_ref_count < 16)
+                    e->const_refs[e->const_ref_count++] = (u32)v;
+                q = endp;
+                continue;
+            }
+        }
+    }
+
+    /* Retain only the lines that write HPOS plus the final SV_Position map. */
+    const char* line = hlsl;
+    size_t used = 0;
+    while (*line && used + 2 < sizeof(e->hpos_summary)) {
+        const char* nl = strchr(line, '\n');
+        size_t len = nl ? (size_t)(nl - line) : strlen(line);
+        int keep = 0;
+        if (len) {
+            char tmp[512];
+            size_t n = len < sizeof(tmp) - 1 ? len : sizeof(tmp) - 1;
+            memcpy(tmp, line, n); tmp[n] = 0;
+            keep = strstr(tmp, "o[0]") != NULL || strstr(tmp, "Out.pos") != NULL;
+            if (keep) {
+                if (used && used + 3 < sizeof(e->hpos_summary)) {
+                    e->hpos_summary[used++] = ' '; e->hpos_summary[used++] = '|'; e->hpos_summary[used++] = ' ';
+                }
+                size_t room = sizeof(e->hpos_summary) - 1 - used;
+                if (n > room) n = room;
+                memcpy(e->hpos_summary + used, tmp, n); used += n;
+                e->hpos_summary[used] = 0;
+            }
+        }
+        if (!nl) break;
+        line = nl + 1;
+    }
+}
+
 static int vp_get_vs(const rsx_state* st)
 {
     extern int rsx_vp_decompile(const uint8_t*, u32, char*, u32);
@@ -2016,6 +2078,7 @@ static int vp_get_vs(const rsx_state* st)
     s_d3d.vp_vs[slot].uses_c03 =
         (strstr(hlsl, "vp_c[0]") || strstr(hlsl, "vp_c[1]") ||
          strstr(hlsl, "vp_c[2]") || strstr(hlsl, "vp_c[3]")) ? 1 : 0;
+    vp_diag_summarize_hlsl(&s_d3d.vp_vs[slot], hlsl, ni);
     { static int _n=0; if (_n++<6) printf("[VP] per-draw VS cached (hash=0x%08X, %d instrs, slot %d)\n", hash, ni, slot); }
     /* Build the base VP pipeline here if it does not exist yet. render_frame's
      * trigger reads s_d3d.current_rsx_state, which by frame end no longer has
@@ -2302,7 +2365,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             u32 units = 0;
             for (int u = 0; u < 4; u++) {
                 char pat[48];
-                snprintf(pat, sizeof pat, "rsx_tex%d.Sample", u);
+                snprintf(pat, sizeof pat, "rsx_tex[%d].Sample", u);
                 if (strstr(hlsl, pat)) units |= 1u << u;
             }
             fprintf(stderr, "[LOGO_FP] fp=0x%08X instrs=%d sampled_units=0x%X%c",
@@ -3390,6 +3453,36 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
     char* dst = (char*)s_d3d.vp_cb_mapped
         + ((u64)s_d3d.vp_parity * MAX_DRAWS + slot) * VP_CB_STRIDE;
     memcpy(dst, st->vertex_constants, RSX_MAX_VERTEX_CONSTANTS * 16);
+    /* Automatic WA2 logo VP probe. This is observation only: no constants,
+     * shaders, draw order or GPU state are modified.  The first texture probe
+     * established that texture bytes and pre-VP vertices are valid, so the next
+     * split is whether the guest VP maps those vertices into a valid clip volume. */
+    if (dr && (dr->tex[0].raw == 0x01CA8480u || dr->tex[0].raw == 0x01CA3E80u)) {
+        static u32 logged_raw[2] = {0, 0};
+        int li = (dr->tex[0].raw == 0x01CA8480u) ? 0 : 1;
+        if (logged_raw[li] != dr->tex[0].raw) {
+            logged_raw[li] = dr->tex[0].raw;
+            const float* c = (const float*)dst;
+            fprintf(stderr,
+                    "[LOGO_VP] tex=0x%08X vs=%d cb=%u instrs=%d cmask=0x%X cull=0x%X depth=0x%X rt=0x%08X verts=%u start=%u\n",
+                    dr->tex[0].raw, vs_idx, slot,
+                    (vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n) ? s_d3d.vp_vs[vs_idx].instrs : -1,
+                    dr->cmask, dr->cull, dr->depth, dr->rt_off,
+                    dr->vertex_count, dr->vb_byte_offset / 256u);
+            if (vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n) {
+                VPVSEntry* ve = &s_d3d.vp_vs[vs_idx];
+                fprintf(stderr, "[LOGO_VP] hpos: %s\n",
+                        ve->hpos_summary[0] ? ve->hpos_summary : "<no o[0]/Out.pos lines captured>");
+                fprintf(stderr, "[LOGO_VP] refs(%d):", ve->const_ref_count);
+                for (int ri = 0; ri < ve->const_ref_count; ri++) {
+                    u32 ci = ve->const_refs[ri];
+                    fprintf(stderr, " c%u=(%.7g %.7g %.7g %.7g)", ci,
+                            c[ci*4+0], c[ci*4+1], c[ci*4+2], c[ci*4+3]);
+                }
+                fputc('\n', stderr);
+            }
+        }
+    }
     /* VP_MVP=<N>: the constant bank as the shader will see it, for the first N
      * draws. A snapshot taken from a stale rsx_state looks exactly like a broken
      * vertex program from the outside -- both give zero fragments. */
