@@ -157,13 +157,16 @@ typedef struct {
 } OffRT;
 #define MAX_OFF_RTS  16  /* demosaic double-buffers its 6-surface pass chain */
 #define RT_SRV_BASE  5   /* SRV heap slots 5..20 hold offscreen-RT SRVs */
-/* Per-draw SRV windows: each VP draw gets 4 consecutive descriptors (t0-t3)
- * so multi-unit fragment programs see all their textures (demosaic's
- * interpolation passes sample 3 units). */
+/* Match the fragment decompiler ABI exactly: it declares rsx_tex[16] and
+ * rsx_samp[16].  Yakuza's proven live-draw renderer therefore exposes a full
+ * 16-wide SRV/sampler table per draw.  A short 4-wide table is not ABI
+ * compatible with those declarations even when a particular shader only
+ * references unit 0. */
+#define DRAW_DESC_WIDTH 16
 #define DRAW_SRV_BASE 32
-#define SRV_HEAP_SIZE (DRAW_SRV_BASE + MAX_DRAWS * 4)
-#define VP_SMP_TABLE_WIDTH 4
-#define VP_SMP_TABLES 512 /* 512*4 = 2048, D3D12 shader-visible sampler-heap limit */
+#define SRV_HEAP_SIZE (DRAW_SRV_BASE + MAX_DRAWS * DRAW_DESC_WIDTH)
+#define VP_SMP_TABLE_WIDTH 16
+#define VP_SMP_TABLES 128 /* 128*16 = 2048, D3D12 shader-visible sampler-heap limit */
 #define VP_SMP_HEAP_SIZE (VP_SMP_TABLE_WIDTH * VP_SMP_TABLES)
 
 /* Per-frame VP texture slot: a guest texture uploaded for this frame's VP
@@ -379,13 +382,14 @@ typedef struct {
 
 static D3D12State s_d3d;
 
-/* Dynamic RSX fragment-sampler tables.  Guest FPs reference s0-s3; sampler
- * state is independent of the PSO and changes per draw, so a static sampler in
- * the root signature is semantically wrong.  Tables are immutable once created
- * (safe while earlier frames are in flight) and cached by the four guest states. */
+/* Dynamic RSX fragment-sampler tables.  The FP decompiler declares s0-s15;
+ * expose all 16 descriptors exactly like the Yakuza live-draw renderer.
+ * Guest state is currently tracked for units 0..3 in this backend; unused
+ * entries 4..15 receive a valid default sampler.  Tables are immutable once
+ * created so descriptors referenced by in-flight frames are never overwritten. */
 typedef struct {
     u64 hash;
-    u32 state[4][4]; /* address, control0, filter, border */
+    u32 state[VP_SMP_TABLE_WIDTH][4]; /* address, control0, filter, border */
     int valid;
 } VPSamplerTable;
 static VPSamplerTable s_vp_sampler_tables[VP_SMP_TABLES];
@@ -1221,18 +1225,18 @@ static int init_d3d12(u32 width, u32 height)
      * game uploads its VP microcode (render_frame).
      * ---------------------------------------------------------------*/
     {
-        /* 4-descriptor SRV table (t0-t3) so decompiled fragment programs can
-         * sample up to 4 texture units; the hardcoded atlas/colour PSs use only
-         * t0 and are unaffected. Matching 4 static samplers s0-s3. */
+        /* The fragment decompiler declares 16 texture and sampler registers.
+         * Keep the root-signature ranges ABI-compatible with those declarations,
+         * as done by the Yakuza live-draw renderer. */
         D3D12_DESCRIPTOR_RANGE srv_range = {0};
         srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        srv_range.NumDescriptors = 4;
+        srv_range.NumDescriptors = DRAW_DESC_WIDTH;
         srv_range.BaseShaderRegister = 0;
         srv_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
         D3D12_DESCRIPTOR_RANGE smp_range = {0};
         smp_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
-        smp_range.NumDescriptors = 4;
+        smp_range.NumDescriptors = VP_SMP_TABLE_WIDTH;
         smp_range.BaseShaderRegister = 0;
         smp_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
@@ -2916,12 +2920,28 @@ static D3D12_SAMPLER_DESC vp_decode_sampler(u32 address, u32 control0, u32 filte
     return sd;
 }
 
+static void vp_sampler_state_for_unit(const D3D12DrawRecord* dr, int u, u32 out[4])
+{
+    if (u >= 0 && u < 4 && dr->tex[u].set) {
+        out[0] = dr->tex[u].address;
+        out[1] = dr->tex[u].control0;
+        out[2] = dr->tex[u].filter;
+        out[3] = dr->tex[u].border;
+    } else {
+        /* Yakuza's SMP_DEFAULT: linear clamp, no mip restriction needed for
+         * an unreferenced slot.  Keep it deterministic for table caching. */
+        out[0] = 0x00030303u; /* clamp S/T/R */
+        out[1] = 0x80000000u; /* enabled, LOD 0 */
+        out[2] = 0x02022000u; /* min/mag linear, mip point */
+        out[3] = 0u;
+    }
+}
+
 static u64 vp_sampler_hash(const D3D12DrawRecord* dr)
 {
     u64 h = 1469598103934665603ull;
-    for (int u = 0; u < 4; u++) {
-        const u32 v[4] = { dr->tex[u].address, dr->tex[u].control0,
-                           dr->tex[u].filter, dr->tex[u].border };
+    for (int u = 0; u < VP_SMP_TABLE_WIDTH; u++) {
+        u32 v[4]; vp_sampler_state_for_unit(dr, u, v);
         for (int j = 0; j < 4; j++) {
             h ^= (u64)v[j]; h *= 1099511628211ull;
         }
@@ -2937,11 +2957,10 @@ static int vp_sampler_table_for_draw(const D3D12DrawRecord* dr)
         VPSamplerTable* t = &s_vp_sampler_tables[i];
         if (!t->valid || t->hash != hash) continue;
         int same = 1;
-        for (int u = 0; u < 4 && same; u++) {
-            if (t->state[u][0] != dr->tex[u].address ||
-                t->state[u][1] != dr->tex[u].control0 ||
-                t->state[u][2] != dr->tex[u].filter ||
-                t->state[u][3] != dr->tex[u].border) same = 0;
+        for (int u = 0; u < VP_SMP_TABLE_WIDTH && same; u++) {
+            u32 v[4]; vp_sampler_state_for_unit(dr, u, v);
+            if (t->state[u][0] != v[0] || t->state[u][1] != v[1] ||
+                t->state[u][2] != v[2] || t->state[u][3] != v[3]) same = 0;
         }
         if (same) return (int)i;
     }
@@ -2956,15 +2975,11 @@ static int vp_sampler_table_for_draw(const D3D12DrawRecord* dr)
     D3D12_CPU_DESCRIPTOR_HANDLE ch;
     s_d3d.vp_sampler_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.vp_sampler_heap, &ch);
     ch.ptr += (u64)idx * VP_SMP_TABLE_WIDTH * s_d3d.vp_sampler_inc;
-    for (int u = 0; u < 4; u++) {
-        t->state[u][0] = dr->tex[u].address;
-        t->state[u][1] = dr->tex[u].control0;
-        t->state[u][2] = dr->tex[u].filter;
-        t->state[u][3] = dr->tex[u].border;
-        D3D12_SAMPLER_DESC sd = vp_decode_sampler(dr->tex[u].address,
-                                                  dr->tex[u].control0,
-                                                  dr->tex[u].filter,
-                                                  dr->tex[u].border);
+    for (int u = 0; u < VP_SMP_TABLE_WIDTH; u++) {
+        u32 v[4]; vp_sampler_state_for_unit(dr, u, v);
+        t->state[u][0] = v[0]; t->state[u][1] = v[1];
+        t->state[u][2] = v[2]; t->state[u][3] = v[3];
+        D3D12_SAMPLER_DESC sd = vp_decode_sampler(v[0], v[1], v[2], v[3]);
         s_d3d.device->lpVtbl->CreateSampler(s_d3d.device, &sd, ch);
         ch.ptr += s_d3d.vp_sampler_inc;
     }
@@ -2975,9 +2990,9 @@ static int vp_sampler_table_for_draw(const D3D12DrawRecord* dr)
                                                   dr->tex[0].filter,
                                                   dr->tex[0].border);
         fprintf(stderr,
-                "[RSX-SAMPLER] logo table=%u addr=0x%08X ctrl0=0x%08X filter=0x%08X "
+                "[RSX-SAMPLER] logo table=%u width=%u addr=0x%08X ctrl0=0x%08X filter=0x%08X "
                 "U/V/W=%u/%u/%u minLOD=%.3f maxLOD=%.3f d3dfilter=0x%X\n",
-                idx, dr->tex[0].address, dr->tex[0].control0, dr->tex[0].filter,
+                idx, (u32)VP_SMP_TABLE_WIDTH, dr->tex[0].address, dr->tex[0].control0, dr->tex[0].filter,
                 (u32)sd.AddressU, (u32)sd.AddressV, (u32)sd.AddressW,
                 (double)sd.MinLOD, (double)sd.MaxLOD, (u32)sd.Filter);
     }
@@ -4847,12 +4862,12 @@ static void render_frame(void)
                               dr->tex[_u].fmt, dr->fp_addr, dr->vertex_count,
                               dr->vp_x, dr->vp_y, dr->vp_w, dr->vp_h, 10); }
               } }
-        /* Fill this draw's t0-t3 SRV window (DRAW_SRV_BASE + d*4): each unit
+        /* Fill this draw's 16-wide SRV window. Units 0..3 are currently tracked; each unit
          * resolves to an offscreen RT (sampled directly), an uploaded guest
          * texture, or a null SRV. */
         double _sv0 = perf_on() ? perf_now() : 0.0;
         for (int _u = 0; _u < 4; _u++) {
-            u32 wslot = DRAW_SRV_BASE + _d * 4 + (u32)_u;
+            u32 wslot = DRAW_SRV_BASE + _d * DRAW_DESC_WIDTH + (u32)_u;
             dr->tex_rt[_u] = -1;
             /* Display-sized sampler source -> the rendered frame. */
             if (dr->tex[_u].set && s_screen_copy &&
@@ -5316,7 +5331,7 @@ static void render_frame(void)
                         off_rt_transition(rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                 }
                 D3D12_GPU_DESCRIPTOR_HANDLE gh = gh_base;
-                gh.ptr += (u64)(DRAW_SRV_BASE + d * 4) * s_d3d.srv_inc;
+                gh.ptr += (u64)(DRAW_SRV_BASE + d * DRAW_DESC_WIDTH) * s_d3d.srv_inc;
                 s_d3d.cmd_list->lpVtbl->SetGraphicsRootDescriptorTable(s_d3d.cmd_list, 1, gh);
                 if (s_d3d.vp_sampler_heap) {
                     int sti = vp_sampler_table_for_draw(dr);
