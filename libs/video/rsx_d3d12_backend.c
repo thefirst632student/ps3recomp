@@ -349,6 +349,33 @@ typedef struct {
 } D3D12State;
 
 static D3D12State s_d3d;
+
+/* Host movie bridge for eboot_port.  This is the renderer instance that owns
+ * the window/swap chain created by eboot_port/main.cpp.  cellVpost workers run
+ * on guest PPU host threads, so they only stage CPU pixels here; every D3D12
+ * command is recorded/submitted later by the frame-clock thread. */
+static volatile LONG s_movie_mode = 0;
+static volatile LONG s_movie_has_frame = 0;
+static SRWLOCK s_movie_lock = SRWLOCK_INIT;
+static u8* s_movie_cpu_rgba = NULL;
+static ID3D12Resource* s_movie_upload = NULL;
+static u8* s_movie_upload_mapped = NULL;
+static u32 s_movie_upload_pitch = 0;
+static unsigned long long s_movie_submit_seq = 0;
+static unsigned long long s_movie_present_seq = 0;
+
+static int movie_mode_active(void)
+{
+    return InterlockedCompareExchange(&s_movie_mode, 0, 0) != 0;
+}
+
+static void movie_discard_guest_batch(void)
+{
+    s_d3d.draw_count = 0;
+    s_d3d.vb_offset = 0;
+    s_d3d.vp_vb_offset = 0;
+    s_d3d.merge_prev_draw = 0;
+}
 char g_rsx_title_base[128] = "ps3recomp";
 static u32 s_dbg_last_draws = 0;
 static u64 s_req_verts = 0, s_req_draws = 0, s_drop_draws = 0;
@@ -1272,6 +1299,167 @@ static void move_to_next_frame(void)
     }
 
     s_d3d.fence_values[s_d3d.frame_index] = current_fence + 1;
+}
+
+
+static int movie_resources_init(u32 width, u32 height)
+{
+    s_movie_upload_pitch = (width * 4u + 255u) & ~255u;
+    const size_t cpu_size = (size_t)width * height * 4u;
+    s_movie_cpu_rgba = (u8*)calloc(1, cpu_size);
+    if (!s_movie_cpu_rgba)
+        return -1;
+
+    D3D12_HEAP_PROPERTIES hp = {0};
+    hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC bd = {0};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = (u64)s_movie_upload_pitch * height;
+    bd.Height = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    HRESULT hr = s_d3d.device->lpVtbl->CreateCommittedResource(
+        s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &bd,
+        D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+        &IID_ID3D12Resource, (void**)&s_movie_upload);
+    if (FAILED(hr) || !s_movie_upload) {
+        fprintf(stderr, "[movie-d3d12] upload allocation failed hr=0x%08lX\n",
+                (unsigned long)hr);
+        free(s_movie_cpu_rgba);
+        s_movie_cpu_rgba = NULL;
+        return -1;
+    }
+
+    D3D12_RANGE no_read = {0, 0};
+    hr = s_movie_upload->lpVtbl->Map(
+        s_movie_upload, 0, &no_read, (void**)&s_movie_upload_mapped);
+    if (FAILED(hr) || !s_movie_upload_mapped) {
+        fprintf(stderr, "[movie-d3d12] upload map failed hr=0x%08lX\n",
+                (unsigned long)hr);
+        s_movie_upload->lpVtbl->Release(s_movie_upload);
+        s_movie_upload = NULL;
+        free(s_movie_cpu_rgba);
+        s_movie_cpu_rgba = NULL;
+        return -1;
+    }
+
+    fprintf(stderr, "[movie-d3d12] staging ready %ux%u pitch=%u bytes=%llu\n",
+            width, height, s_movie_upload_pitch,
+            (unsigned long long)((u64)s_movie_upload_pitch * height));
+    return 0;
+}
+
+static void movie_resources_shutdown(void)
+{
+    if (s_movie_upload) {
+        if (s_movie_upload_mapped)
+            s_movie_upload->lpVtbl->Unmap(s_movie_upload, 0, NULL);
+        s_movie_upload_mapped = NULL;
+        s_movie_upload->lpVtbl->Release(s_movie_upload);
+        s_movie_upload = NULL;
+    }
+    free(s_movie_cpu_rgba);
+    s_movie_cpu_rgba = NULL;
+    s_movie_upload_pitch = 0;
+    InterlockedExchange(&s_movie_has_frame, 0);
+    InterlockedExchange(&s_movie_mode, 0);
+}
+
+static void movie_present_latest(void)
+{
+    if (!s_d3d.initialized || !movie_mode_active() ||
+        !s_movie_cpu_rgba || !s_movie_upload || !s_movie_upload_mapped ||
+        InterlockedCompareExchange(&s_movie_has_frame, 0, 0) == 0) {
+        movie_discard_guest_batch();
+        return;
+    }
+
+    /* The upload heap is reused every movie present.  Serialise with the GPU
+     * before overwriting it; this is the same conservative policy render_frame
+     * uses for its shared upload resources. */
+    wait_for_gpu();
+
+    u32 sparse_nonblack = 0;
+    u8 center[4] = {0, 0, 0, 0};
+    unsigned long long submit_seq;
+    AcquireSRWLockExclusive(&s_movie_lock);
+    for (u32 y = 0; y < s_d3d.height; ++y) {
+        memcpy(s_movie_upload_mapped + (size_t)y * s_movie_upload_pitch,
+               s_movie_cpu_rgba + (size_t)y * s_d3d.width * 4u,
+               (size_t)s_d3d.width * 4u);
+    }
+    {
+        const size_t cp = ((size_t)(s_d3d.height / 2u) * s_d3d.width +
+                           s_d3d.width / 2u) * 4u;
+        memcpy(center, s_movie_cpu_rgba + cp, 4);
+        const size_t pixels = (size_t)s_d3d.width * s_d3d.height;
+        const size_t step = pixels / 1024u ? pixels / 1024u : 1u;
+        for (size_t i = 0; i < pixels; i += step) {
+            const u8* p = s_movie_cpu_rgba + i * 4u;
+            if (p[0] || p[1] || p[2]) sparse_nonblack++;
+        }
+        submit_seq = s_movie_submit_seq;
+    }
+    ReleaseSRWLockExclusive(&s_movie_lock);
+
+    const u32 fi = s_d3d.frame_index;
+    s_d3d.cmd_allocators[fi]->lpVtbl->Reset(s_d3d.cmd_allocators[fi]);
+    s_d3d.cmd_list->lpVtbl->Reset(
+        s_d3d.cmd_list, s_d3d.cmd_allocators[fi], NULL);
+
+    D3D12_RESOURCE_BARRIER b = {0};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = s_d3d.render_targets[fi];
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
+
+    D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
+    dst.pResource = s_d3d.render_targets[fi];
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.SubresourceIndex = 0;
+    src.pResource = s_movie_upload;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint.Offset = 0;
+    src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    src.PlacedFootprint.Footprint.Width = s_d3d.width;
+    src.PlacedFootprint.Footprint.Height = s_d3d.height;
+    src.PlacedFootprint.Footprint.Depth = 1;
+    src.PlacedFootprint.Footprint.RowPitch = s_movie_upload_pitch;
+    s_d3d.cmd_list->lpVtbl->CopyTextureRegion(
+        s_d3d.cmd_list, &dst, 0, 0, 0, &src, NULL);
+
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
+
+    s_d3d.cmd_list->lpVtbl->Close(s_d3d.cmd_list);
+    ID3D12CommandList* lists[] = {(ID3D12CommandList*)s_d3d.cmd_list};
+    s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, lists);
+
+    HRESULT hr = s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 1, 0);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[movie-d3d12] Present failed hr=0x%08lX\n",
+                (unsigned long)hr);
+    } else {
+        const unsigned long long n = ++s_movie_present_seq;
+        if (n <= 8ull || (n % 120ull) == 0ull) {
+            fprintf(stderr,
+                    "[movie-d3d12] present #%llu submit=%llu bb=%u "
+                    "center=%02X%02X%02X%02X sparse_nonblack=%u/1024\n",
+                    n, submit_seq, fi, center[0], center[1], center[2], center[3],
+                    sparse_nonblack);
+        }
+    }
+
+    move_to_next_frame();
+    s_d3d.frame_count++;
+    s_dbg_last_draws = 0;
+    movie_discard_guest_batch();
 }
 
 /* ---------------------------------------------------------------------------
@@ -4145,16 +4333,8 @@ static void render_frame(void)
         for (int _u = 0; _u < 4; _u++) {
             u32 wslot = DRAW_SRV_BASE + _d * 4 + (u32)_u;
             dr->tex_rt[_u] = -1;
-            /* A sampler that aliases an actual registered display surface may
-             * need the D3D backbuffer snapshot because the guest copy of that
-             * surface is not written by this backend.  Size alone is NOT an
-             * alias test: full-frame decoded video and post-process outputs can
-             * be ordinary textures with the same dimensions as the display.
-             * Replacing those with the previous framebuffer returns stale
-             * content instead of the guest texture. */
-            extern int cellGcmOffsetIsDisplay(u32 offset);
+            /* Display-sized sampler source -> the rendered frame. */
             if (dr->tex[_u].set && s_screen_copy &&
-                cellGcmOffsetIsDisplay(dr->tex[_u].raw) &&
                 dr->tex[_u].w == s_d3d.width && dr->tex[_u].h == s_d3d.height) {
                 static int en = -1;
                 if (en < 0) { const char* e = getenv("SCREEN_AS_TEX"); en = e ? atoi(e) : 1; }
@@ -5155,6 +5335,11 @@ static void d3d12_present(void* ud, u32 buffer_id)
     (void)ud;
     (void)buffer_id;
 
+    if (movie_mode_active()) {
+        movie_discard_guest_batch();
+        return;
+    }
+
     if (blink_dbg())
         printf("[PRESENT] draws=%u clears_since_last=%u\n",
                s_d3d.draw_count, s_dbg_clears_since_present);
@@ -5187,6 +5372,10 @@ static void d3d12_present(void* ud, u32 buffer_id)
 static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
 {
     (void)ud;
+    if (movie_mode_active()) {
+        movie_discard_guest_batch();
+        return;
+    }
     (void)flags;
     (void)depth;
     (void)stencil;
@@ -6000,6 +6189,7 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
 
 static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
 {
+    if (movie_mode_active()) return;
     /* RSX_LIVE_FEED_DBG=1: pair with the [feed] method counts so "the FIFO
      * carries no draw batches" can be checked against "the backend is told
      * to draw" in the same run. */
@@ -6249,6 +6439,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
 
 static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
 {
+    if (movie_mode_active()) return;
     /* RSX_LIVE_FEED_DBG=1: pair with the [feed] method counts so "the FIFO
      * carries no draw batches" can be checked against "the backend is told
      * to draw" in the same run. */
@@ -6645,6 +6836,13 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
         return -1;
     }
 
+    InterlockedExchange(&s_movie_mode, 0);
+    InterlockedExchange(&s_movie_has_frame, 0);
+    s_movie_submit_seq = 0;
+    s_movie_present_seq = 0;
+    if (movie_resources_init(width, height) != 0)
+        fprintf(stderr, "[movie-d3d12] staging unavailable; movie frames cannot be presented\n");
+
     /* Set up backend callbacks */
     s_d3d12_backend.userdata          = &s_d3d;
     s_d3d12_backend.init              = d3d12_init;
@@ -6677,6 +6875,7 @@ void rsx_d3d12_backend_shutdown(void)
     if (!s_d3d.initialized) return;
 
     wait_for_gpu();
+    movie_resources_shutdown();
 
     /* Release D3D12 resources */
     if (s_d3d.vertex_buffer) {
@@ -6720,8 +6919,61 @@ int rsx_d3d12_backend_pump_messages(void)
     return s_d3d.window_closed ? -1 : 0;
 }
 
+void rsx_d3d12_backend_set_movie_mode(int on)
+{
+    if (on) {
+        if (InterlockedExchange(&s_movie_mode, 1) == 0) {
+            fprintf(stderr, "[movie-d3d12] mode ON (active eboot_port backend)\n");
+        }
+    } else {
+        if (InterlockedExchange(&s_movie_mode, 0) != 0)
+            fprintf(stderr, "[movie-d3d12] mode OFF; guest RSX presentation restored\n");
+        InterlockedExchange(&s_movie_has_frame, 0);
+        /* Do not touch draw-list state here: this function can be called from
+         * a guest PPU host thread.  Guest batches are owned exclusively by the
+         * frame-clock/FIFO thread and are discarded there while movie mode is
+         * active. */
+    }
+}
+
+int rsx_d3d12_backend_movie_mode(void)
+{
+    return movie_mode_active();
+}
+
+void rsx_d3d12_backend_submit_movie_rgba(const u8* rgba, u32 width, u32 height)
+{
+    if (!rgba || !width || !height || !s_d3d.initialized || !s_movie_cpu_rgba)
+        return;
+
+    AcquireSRWLockExclusive(&s_movie_lock);
+    if (width == s_d3d.width && height == s_d3d.height) {
+        memcpy(s_movie_cpu_rgba, rgba, (size_t)width * height * 4u);
+    } else {
+        /* Keep the presentation path general: scale any decoded frame into the
+         * fixed swap-chain size before handing it to D3D12. */
+        for (u32 y = 0; y < s_d3d.height; ++y) {
+            const u32 sy = (u32)(((u64)y * height) / s_d3d.height);
+            u8* dst = s_movie_cpu_rgba + (size_t)y * s_d3d.width * 4u;
+            const u8* src = rgba + (size_t)sy * width * 4u;
+            for (u32 x = 0; x < s_d3d.width; ++x) {
+                const u32 sx = (u32)(((u64)x * width) / s_d3d.width);
+                memcpy(dst + (size_t)x * 4u, src + (size_t)sx * 4u, 4u);
+            }
+        }
+    }
+    ++s_movie_submit_seq;
+    InterlockedExchange(&s_movie_has_frame, 1);
+    ReleaseSRWLockExclusive(&s_movie_lock);
+}
+
 void rsx_d3d12_backend_present(void)
 {
+    if (movie_mode_active()) {
+        movie_present_latest();
+        return;
+    }
+
     extern unsigned cellGcm_flip_request_count(void);
     static int s_seen_content = 0;
     unsigned fc = cellGcm_flip_request_count();
@@ -6849,5 +7101,9 @@ int rsx_d3d12_backend_init(u32 w, u32 h, const char* t)
 void rsx_d3d12_backend_shutdown(void) {}
 int rsx_d3d12_backend_pump_messages(void) { return 0; }
 void rsx_d3d12_backend_present(void) {}
+void rsx_d3d12_backend_set_movie_mode(int on) { (void)on; }
+void rsx_d3d12_backend_submit_movie_rgba(const u8* rgba, u32 w, u32 h)
+{ (void)rgba; (void)w; (void)h; }
+int rsx_d3d12_backend_movie_mode(void) { return 0; }
 
 #endif /* _WIN32 */

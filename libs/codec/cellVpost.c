@@ -10,7 +10,7 @@
  */
 #include "cellVpost.h"
 #include "../guest_struct.h"
-#include "../video/rsx_live_draw.h"
+#include "../video/rsx_d3d12_backend.h"
 #include "../../runtime/memory/vm.h"
 #include "../../runtime/ppu/ppu_memory.h"
 
@@ -190,7 +190,7 @@ s32 cellVpostClose(CellVpostHandle handle)
     if (s_handles[handle].movie_mode) {
         s_handles[handle].movie_mode = 0;
         if (s_movie_users > 0) --s_movie_users;
-        if (s_movie_users == 0) rsx_live_draw_set_movie_mode(0);
+        if (s_movie_users == 0) rsx_d3d12_backend_set_movie_mode(0);
     }
     fprintf(stderr, "[cellVpost] Close(handle=%u frames=%llu)\n", handle,
             (unsigned long long)s_handles[handle].exec_count);
@@ -248,16 +248,25 @@ s32 cellVpostExec(CellVpostHandle handle,
     yuv_to_rgba(yp, up, vp, out, iw, ih, ow, oh, quant, matrix, alpha);
     store_pic_info(info_ea, iw, ih, ow, oh, chroma, quant, matrix, user);
 
+    /* Stage into the renderer that actually owns eboot_port's window.
+     * rsx_live_draw is not initialized by this runner, so sending frames there
+     * only logged a call and then returned at g.ready == 0.  The active D3D12
+     * backend consumes this staging buffer on its frame-clock thread. */
+    rsx_d3d12_backend_submit_movie_rgba(out, ow, oh);
+    /* Reassert this on every submitted frame.  WA2 does not reliably call
+     * cellVpostClose between movie lifecycles, while the runtime deliberately
+     * drops movie mode when vdispStart drains.  Making this idempotent avoids
+     * a stale per-handle flag suppressing the next movie. */
+    rsx_d3d12_backend_set_movie_mode(1);
     if (!s_handles[handle].movie_mode) {
         s_handles[handle].movie_mode = 1;
-        if (s_movie_users++ == 0) rsx_live_draw_set_movie_mode(1);
+        ++s_movie_users;
     }
-    rsx_live_draw_present_rgba(out, ow, oh);
 
     const u64 n = ++s_handles[handle].exec_count;
     if (n <= 8 || (n % 120u) == 0) {
         fprintf(stderr,
-                "[cellVpost] Exec #%llu %ux%u YUV420 -> %ux%u RGBA alpha=%u user=0x%llX direct-present\n",
+                "[cellVpost] Exec #%llu %ux%u YUV420 -> %ux%u RGBA alpha=%u user=0x%llX backend-submit\n",
                 (unsigned long long)n, iw, ih, ow, oh, alpha,
                 (unsigned long long)user);
     }

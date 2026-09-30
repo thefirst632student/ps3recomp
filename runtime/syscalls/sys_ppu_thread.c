@@ -20,7 +20,7 @@ static PPU_TLS int     s_exit_armed = 0;
 #include <stddef.h>
 #include "sys_ppu_thread.h"
 #include "sys_cond.h"
-#include "../../libs/video/rsx_live_draw.h"
+#include "../../libs/video/rsx_d3d12_backend.h"
 #include "../platform/win32_compat.h"   /* GetCurrentThreadId on POSIX */
 #include <string.h>
 #include <stdio.h>
@@ -581,6 +581,19 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
         const uint32_t vdisp = (uint32_t)t->entry_arg;
         if (vdisp && vm_is_valid_addr(vdisp + 0x39)) {
             uint8_t* obj = (uint8_t*)vm_to_host(vdisp);
+            /* vdispStart (EBOOT code 0x000866B4) tests +0x10 after waking.
+             * 0x88000005 keeps the worker in its normal consume loop; zero
+             * takes the clean drain/return path at 0x00087098.  The previous
+             * workaround only toggled +0x38/+0x39, so the condition woke but
+             * the worker immediately re-entered the loop and join still hung. */
+            const uint32_t old_state = ((uint32_t)obj[0x10] << 24) |
+                                       ((uint32_t)obj[0x11] << 16) |
+                                       ((uint32_t)obj[0x12] << 8)  |
+                                       (uint32_t)obj[0x13];
+            obj[0x10] = 0;
+            obj[0x11] = 0;
+            obj[0x12] = 0;
+            obj[0x13] = 0;
             obj[0x38] = 1;
             obj[0x39] = 0;
             const uint8_t* cond_p = (const uint8_t*)vm_to_host(vdisp + 0x18);
@@ -590,8 +603,8 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
                                      (uint32_t)cond_p[3];
             const int32_t wake_rc = sys_cond_signal_all_id(cond_id);
             fprintf(stderr,
-                    "[HLE] WA2 vdisp EOS wake: vdisp=0x%08X cond=%u rc=0x%08X (vpost joined)\n",
-                    vdisp, cond_id, (uint32_t)wake_rc);
+                    "[HLE] WA2 vdisp EOS wake: vdisp=0x%08X state=0x%08X->0 cond=%u rc=0x%08X (vpost joined)\n",
+                    vdisp, old_state, cond_id, (uint32_t)wake_rc);
         }
     }
 
@@ -613,7 +626,7 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
         /* The title does not reliably call cellVpostClose/End after this movie.
          * Restore the normal guest RSX stream at the lifecycle boundary we do
          * know is final: the display worker has actually exited and joined. */
-        rsx_live_draw_set_movie_mode(0);
+        rsx_d3d12_backend_set_movie_mode(0);
         s_wa2_movie_vpost_joined = 0;
         fprintf(stderr, "[HLE] WA2 movie display drained: vdispStart joined; guest RSX restored\n");
     }

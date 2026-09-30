@@ -49,6 +49,14 @@ int rsx_d3d12_backend_pump_messages(void);
 /* Force a present (useful for debugging). */
 void rsx_d3d12_backend_present(void);
 
+/* Host movie bridge.  Decoded RGBA frames are staged from guest worker
+ * threads, then copied/presented by the backend's own frame-clock thread.
+ * This is intentionally separate from rsx_live_draw: eboot_port/main.cpp
+ * owns this D3D12 backend and never initializes the live-draw renderer. */
+void rsx_d3d12_backend_set_movie_mode(int on);
+void rsx_d3d12_backend_submit_movie_rgba(const u8* rgba, u32 width, u32 height);
+int  rsx_d3d12_backend_movie_mode(void);
+
 #ifdef __cplusplus
 }
 #endif
