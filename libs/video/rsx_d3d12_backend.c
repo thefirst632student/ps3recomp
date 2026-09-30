@@ -86,6 +86,10 @@ typedef struct {
                          * faces on most solid geometry; rendering everything
                          * double-sided lets a shell's interior faces show
                          * through and shade unlit (black). */
+    u32 depth;          /* packed guest depth state: bit0 test enable, bit1 write,
+                         * raw NV4097/GL compare function in bits 8..23. D3D12
+                         * PSOs are immutable, so depth state is part of the PSO
+                         * key just like blend/cull/colour-mask. */
     u32 cmask;          /* D3D write mask from SET_COLOR_MASK at draw time
                          * (wave's sim passes write single lanes of the height
                          * maps; ignoring the mask stomped persistent state) */
@@ -208,6 +212,7 @@ typedef struct {
                              * stale compile forever. */
     u32 cmask;              /* colour write mask (PSO key) */
     u32 cull;               /* packed face culling (PSO key) */
+    u32 depth;              /* packed guest depth state (PSO key) */
     u32 cube_mask;          /* which units are cube textures (PSO key): the HLSL
                              * declares those samplers as TextureCube, so a cube
                              * and a 2D variant of the same program are different
@@ -2077,6 +2082,36 @@ static u32 rsx_cull_key(const rsx_state* st)
     return k;
 }
 
+static u32 rsx_depth_key(const rsx_state* st)
+{
+    u32 k = (!st || !st->depth_test_enable)
+        ? 0u : (1u | (st->depth_mask ? 2u : 0u) | ((st->depth_func & 0xFFFFu) << 8));
+    { static u32 seen[16]; static int ns = 0; int found = 0;
+      for (int i = 0; i < ns; i++) if (seen[i] == k) found = 1;
+      if (!found && ns < 16) { seen[ns++] = k;
+          fprintf(stderr, "[D3D12] guest depth state: test=%d write=%d func=0x%X key=0x%X%c",
+                  st ? st->depth_test_enable : 0, st ? st->depth_mask : 0,
+                  st ? st->depth_func : 0, k, 10); } }
+    return k;
+}
+
+static D3D12_COMPARISON_FUNC rsx_depth_func_d3d(u32 f)
+{
+    /* NV4097 comparison functions use the GL enum range. Match the Metal/live
+     * backends: an unset/unknown register value compares ALWAYS. */
+    switch (f) {
+    case 0x0200u: return D3D12_COMPARISON_FUNC_NEVER;
+    case 0x0201u: return D3D12_COMPARISON_FUNC_LESS;
+    case 0x0202u: return D3D12_COMPARISON_FUNC_EQUAL;
+    case 0x0203u: return D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    case 0x0204u: return D3D12_COMPARISON_FUNC_GREATER;
+    case 0x0205u: return D3D12_COMPARISON_FUNC_NOT_EQUAL;
+    case 0x0206u: return D3D12_COMPARISON_FUNC_GREATER_EQUAL;
+    case 0x0207u: return D3D12_COMPARISON_FUNC_ALWAYS;
+    default:      return D3D12_COMPARISON_FUNC_ALWAYS;
+    }
+}
+
 static u32 rsx_blend_key(const rsx_state* st, int enable)
 {
     { static int _bd = -1; if (_bd < 0) _bd = getenv("BLENDDBG") ? 1 : 0;
@@ -2149,7 +2184,7 @@ static u32 dr_cube_mask(const D3D12DrawRecord* dr)
 
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
                                           DXGI_FORMAT rtfmt, int exp32, u32 cmask, u32 cull,
-                                          u32 cube_mask)
+                                          u32 depth, u32 cube_mask)
 {
     if (nrt < 1) nrt = 1; if (nrt > 4) nrt = 4;
     if (rtfmt == 0) rtfmt = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -2198,7 +2233,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             s_d3d.vp_fp[i].blend == blend && s_d3d.vp_fp[i].nrt == nrt &&
             s_d3d.vp_fp[i].rtfmt == (u32)rtfmt && s_d3d.vp_fp[i].exp32 == exp32 &&
             s_d3d.vp_fp[i].ucode_hash == uhash && s_d3d.vp_fp[i].cmask == cmask &&
-            s_d3d.vp_fp[i].cull == cull &&
+            s_d3d.vp_fp[i].cull == cull && s_d3d.vp_fp[i].depth == depth &&
             s_d3d.vp_fp[i].cube_mask == cube_mask)
             return s_d3d.vp_fp[i].pso;
     s_perf_pso_miss++;      /* falls through to a full decompile + D3DCompile */
@@ -2520,10 +2555,19 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     for (int _r = 0; _r < nrt; _r++)
         pd.BlendState.RenderTarget[_r].RenderTargetWriteMask = (UINT8)(cmask & 0xF);
     pd.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
-    pd.DepthStencilState.DepthEnable = TRUE;
-    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
-    pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    /* Mirror NV4097 depth state exactly. The old backend forced depth test+write
+     * with LESS_EQUAL for every guest FP draw. That is not a harmless default:
+     * WA2 explicitly disables depth for its 2D logo/UI passes, so an earlier
+     * fullscreen/background quad could populate Z and reject every later logo
+     * pixel even though RSX intended painter's-order compositing. */
+    pd.DepthStencilState.DepthEnable = (depth & 1u) ? TRUE : FALSE;
+    pd.DepthStencilState.DepthWriteMask = ((depth & 3u) == 3u)
+        ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+    pd.DepthStencilState.DepthFunc = (depth & 1u)
+        ? rsx_depth_func_d3d((depth >> 8) & 0xFFFFu)
+        : D3D12_COMPARISON_FUNC_ALWAYS;
     pd.DepthStencilState.StencilEnable = FALSE;
+    /* DEPTH_OFF=1: diagnostic override for guest-FP draws. */
     /* DEPTH_OFF=1: drop the depth test for guest-FP draws, so submission order
      * alone decides what is on top. Paired with DRAW_LAST_TEX this puts one
      * object in front of everything and answers "is it merely occluded?" --
@@ -2562,6 +2606,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     s_d3d.vp_fp[s_d3d.vp_fp_n].ucode_hash = uhash;
     s_d3d.vp_fp[s_d3d.vp_fp_n].cmask   = cmask;
     s_d3d.vp_fp[s_d3d.vp_fp_n].cull    = cull;
+    s_d3d.vp_fp[s_d3d.vp_fp_n].depth   = depth;
     s_d3d.vp_fp[s_d3d.vp_fp_n].cube_mask = cube_mask;
     s_d3d.vp_fp[s_d3d.vp_fp_n].pso     = pso;
     s_d3d.vp_fp_n++;
@@ -4427,7 +4472,8 @@ static void render_frame(void)
                                        dr_num_rts(dr),
                                        dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                   : DXGI_FORMAT_R8G8B8A8_UNORM,
-                                       dr->fp_exp32, dr->cmask, dr->cull, dr_cube_mask(dr));
+                                       dr->fp_exp32, dr->cmask, dr->cull, dr->depth,
+                                       dr_cube_mask(dr));
         if (perf_on()) s_perf_pso += perf_now() - _ps0;
     }
 
@@ -4752,7 +4798,7 @@ static void render_frame(void)
                                                 dr_num_rts(dr),
                                                 dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                            : DXGI_FORMAT_R8G8B8A8_UNORM,
-                                                dr->fp_exp32, dr->cmask, dr->cull,
+                                                dr->fp_exp32, dr->cmask, dr->cull, dr->depth,
                                                 dr_cube_mask(dr)) : NULL;
                 s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list,
                                                          dpso ? dpso : vpso);
@@ -6235,6 +6281,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->fp_exp32 = s_d3d.current_rsx_state ?
                     ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
                 dr->cull = rsx_cull_key(s_d3d.current_rsx_state);
+                dr->depth = rsx_depth_key(s_d3d.current_rsx_state);
         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
             dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
                 dr->cmask = 0xF;
@@ -6357,6 +6404,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             dr->fp_exp32 = s_d3d.current_rsx_state ?
                 ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
             dr->cull = rsx_cull_key(s_d3d.current_rsx_state);
+            dr->depth = rsx_depth_key(s_d3d.current_rsx_state);
         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
             dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
             dr->cmask = 0xF;
@@ -6502,6 +6550,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         dr->fp_exp32 = s_d3d.current_rsx_state ?
             ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
         dr->cull = rsx_cull_key(s_d3d.current_rsx_state);
+        dr->depth = rsx_depth_key(s_d3d.current_rsx_state);
         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
         dr->cmask = 0xF;
         if (s_d3d.current_rsx_state) {
