@@ -365,6 +365,13 @@ typedef struct {
 
 static D3D12State s_d3d;
 
+/* WA2 logo root-cause probe: two non-invasive occlusion queries, one for the
+ * large A8R8G8B8 logo draw and one for the DXT5 sub-logo draw.  An occlusion
+ * count answers whether the draw actually generated raster samples without
+ * changing shaders, blend state, textures, or framebuffer contents. */
+static ID3D12QueryHeap* s_logo_occ_heap = NULL;
+static ID3D12Resource*  s_logo_occ_readback = NULL;
+
 /* Host movie bridge for eboot_port.  This is the renderer instance that owns
  * the window/swap chain created by eboot_port/main.cpp.  cellVpost workers run
  * on guest PPU host threads, so they only stage CPU pixels here; every D3D12
@@ -3043,7 +3050,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, u32 guest_pitch, i
     /* WA2 root-cause probe: inspect the host-visible RGBA image AFTER the RSX
      * format/layout conversion, not just the guest source bytes. If this says
      * RGB and alpha are populated, texture decode/component order is exonerated. */
-    if (_f == 0 && key_off == 0x01CA8480u &&
+    if (_f == 0 && (key_off & 0x0FFFFFFFu) == 0x01CA8480u &&
         tl.fmt == RSX_TEXFMT_R8G8B8A8) {
         static int _logo_dec_done = 0;
         if (!_logo_dec_done) {
@@ -4183,6 +4190,32 @@ static void render_frame(void)
             break;
         }
     }
+    int logo_occ_issued[2] = {0, 0};
+    if (logo_probe_batch && s_d3d.device && (!s_logo_occ_heap || !s_logo_occ_readback)) {
+        if (!s_logo_occ_heap) {
+            D3D12_QUERY_HEAP_DESC qd = {0};
+            qd.Type = D3D12_QUERY_HEAP_TYPE_OCCLUSION;
+            qd.Count = 2;
+            if (FAILED(s_d3d.device->lpVtbl->CreateQueryHeap(
+                    s_d3d.device, &qd, &IID_ID3D12QueryHeap, (void**)&s_logo_occ_heap)))
+                s_logo_occ_heap = NULL;
+        }
+        if (!s_logo_occ_readback) {
+            D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC bd = {0};
+            bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            bd.Width = 2u * sizeof(UINT64); bd.Height = 1; bd.DepthOrArraySize = 1;
+            bd.MipLevels = 1; bd.SampleDesc.Count = 1;
+            bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
+                    s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &bd,
+                    D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+                    &IID_ID3D12Resource, (void**)&s_logo_occ_readback)))
+                s_logo_occ_readback = NULL;
+        }
+        if (!s_logo_occ_heap || !s_logo_occ_readback)
+            fprintf(stderr, "[LOGO_OCC] query resource allocation failed%c", 10);
+    }
 
     /* Drain the GPU before touching shared upload resources (vp_vb vertices,
      * vp_cb constants, per-frame texture staging): the previous frame's draws
@@ -5056,8 +5089,25 @@ static void render_frame(void)
                       s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(
                           s_d3d.cmd_list, bn, brh, FALSE, &dsv_handle);
                   } }
+                int _logo_q = -1;
+                if (logo_probe_batch && s_logo_occ_heap && s_logo_occ_readback) {
+                    if (dr->tex[0].raw == 0x01CA8480u && !logo_occ_issued[0]) _logo_q = 0;
+                    else if (dr->tex[0].raw == 0x01CA3E80u && !logo_occ_issued[1]) _logo_q = 1;
+                    if (_logo_q >= 0)
+                        s_d3d.cmd_list->lpVtbl->BeginQuery(
+                            s_d3d.cmd_list, s_logo_occ_heap, D3D12_QUERY_TYPE_OCCLUSION, (UINT)_logo_q);
+                }
                 s_d3d.cmd_list->lpVtbl->DrawInstanced(s_d3d.cmd_list,
                     dr->vertex_count, 1, dr->vb_byte_offset / 256, 0);
+                if (_logo_q >= 0) {
+                    s_d3d.cmd_list->lpVtbl->EndQuery(
+                        s_d3d.cmd_list, s_logo_occ_heap, D3D12_QUERY_TYPE_OCCLUSION, (UINT)_logo_q);
+                    s_d3d.cmd_list->lpVtbl->ResolveQueryData(
+                        s_d3d.cmd_list, s_logo_occ_heap, D3D12_QUERY_TYPE_OCCLUSION,
+                        (UINT)_logo_q, 1, s_logo_occ_readback,
+                        (UINT64)_logo_q * sizeof(UINT64));
+                    logo_occ_issued[_logo_q] = 1;
+                }
                 /* VP_SUBMIT=<N>: prove the VP pass actually reaches the GPU.
                  * "records exist" and "draws were submitted" are different
                  * claims, and every blank-output investigation conflates them. */
@@ -5369,6 +5419,23 @@ skip_dump_consider: ;
          * No screenshot is needed to answer whether rasterization produced any
          * visible color. */
         wait_for_gpu();
+        if (s_logo_occ_readback && (logo_occ_issued[0] || logo_occ_issued[1])) {
+            void* _qp = NULL;
+            D3D12_RANGE _qr = {0, 2u * sizeof(UINT64)};
+            if (SUCCEEDED(s_logo_occ_readback->lpVtbl->Map(
+                    s_logo_occ_readback, 0, &_qr, &_qp)) && _qp) {
+                const UINT64* _qv = (const UINT64*)_qp;
+                fprintf(stderr,
+                    "[LOGO_OCC] big_samples=%llu small_samples=%llu issued=%d/%d%c",
+                    (unsigned long long)(logo_occ_issued[0] ? _qv[0] : 0),
+                    (unsigned long long)(logo_occ_issued[1] ? _qv[1] : 0),
+                    logo_occ_issued[0], logo_occ_issued[1], 10);
+                D3D12_RANGE _qw = {0,0};
+                s_logo_occ_readback->lpVtbl->Unmap(s_logo_occ_readback, 0, &_qw);
+            } else {
+                fprintf(stderr, "[LOGO_OCC] readback map FAILED%c", 10);
+            }
+        }
         void* _mp = NULL;
         D3D12_RANGE _rr = {0, (SIZE_T)s_d3d.readback_pitch * s_d3d.height};
         if (SUCCEEDED(s_d3d.readback_buf->lpVtbl->Map(s_d3d.readback_buf, 0, &_rr, &_mp)) && _mp) {
@@ -7232,6 +7299,8 @@ void rsx_d3d12_backend_shutdown(void)
     if (s_d3d.depth_buffer) s_d3d.depth_buffer->lpVtbl->Release(s_d3d.depth_buffer);
     if (s_d3d.dsv_heap)     s_d3d.dsv_heap->lpVtbl->Release(s_d3d.dsv_heap);
     if (s_d3d.root_signature) s_d3d.root_signature->lpVtbl->Release(s_d3d.root_signature);
+    if (s_logo_occ_readback) { s_logo_occ_readback->lpVtbl->Release(s_logo_occ_readback); s_logo_occ_readback = NULL; }
+    if (s_logo_occ_heap) { s_logo_occ_heap->lpVtbl->Release(s_logo_occ_heap); s_logo_occ_heap = NULL; }
     if (s_d3d.fence) s_d3d.fence->lpVtbl->Release(s_d3d.fence);
     if (s_d3d.fence_event) CloseHandle(s_d3d.fence_event);
     if (s_d3d.cmd_list) s_d3d.cmd_list->lpVtbl->Release(s_d3d.cmd_list);
