@@ -2355,11 +2355,16 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             fprintf(stderr, "[CUBEKEY] fp=0x%X cube_mask=0x%X (distinct pairs=%d)%c",
                     fp_addr, cube_mask, ns, 10); } } }
     static char hlsl[32768];
-    /* Signature changed when the newer decompiler was adopted: the third
-     * parameter is now SET_SHADER_CONTROL, not an exports-32 flag. This
-     * backend does not track that register, so let the decompiler infer it. */
-    (void)exp32;
-    int n = rsx_fp_decompile(vm_base + off, 4096, RSX_FP_CTRL_AUTO, hlsl, sizeof(hlsl));
+    /* Fragment color export selection is hardware state, not a property that
+     * can be inferred reliably from which temporary register happened to be
+     * written.  SET_SHADER_CONTROL bit 0x40 selects fp32 exports (r0); when
+     * clear the color export is fp16 (h0).  The draw record already snapshots
+     * this bit in fp_exp32 and the PSO cache key already includes it, so feed
+     * the same state to the decompiler.  Using RSX_FP_CTRL_AUTO here can select
+     * the wrong register file and produce a perfectly rasterized all-black
+     * draw -- exactly what the WA2 logo probes observed. */
+    const u32 fp_ctrl = exp32 ? 0x40u : 0u;
+    int n = rsx_fp_decompile(vm_base + off, 4096, fp_ctrl, hlsl, sizeof(hlsl));
     if (n <= 0) { static int _e=0; if(_e++<16) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr); return NULL; }
 
     /* WA2 logo root-cause probe: do not alter shader behavior.  The two boot
@@ -2375,8 +2380,8 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
                 snprintf(pat, sizeof pat, "rsx_tex[%d].Sample", u);
                 if (strstr(hlsl, pat)) units |= 1u << u;
             }
-            fprintf(stderr, "[LOGO_FP] fp=0x%08X instrs=%d sampled_units=0x%X%c",
-                    fp_addr, n, units, 10);
+            fprintf(stderr, "[LOGO_FP] fp=0x%08X instrs=%d sampled_units=0x%X export=%s ctrl=0x%02X%c",
+                    fp_addr, n, units, exp32 ? "r0/fp32" : "h0/fp16", fp_ctrl, 10);
             const char* q = hlsl;
             int shown = 0;
             while (shown < 8 && (q = strstr(q, ".Sample(")) != NULL) {
