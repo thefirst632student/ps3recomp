@@ -378,6 +378,13 @@ static ID3D12Resource*  s_logo_occ_readback = NULL;
 static ID3D12Resource*  s_logo_tex_readback = NULL;
 static int               s_logo_tex_copy_issued = 0;
 static u32               s_logo_tex_readback_pitch = 0;
+/* Fragment-stage A/B/C probe: choose a guaranteed bright texel from the
+ * decoded big-logo image. The PS diagnostic uses Texture.Load at this exact
+ * coordinate so sampler behavior is separable from SRV/resource visibility. */
+static u32               s_logo_probe_x = 0;
+static u32               s_logo_probe_y = 0;
+static u8                s_logo_probe_rgba[4] = {0,0,0,0};
+static int               s_logo_probe_ready = 0;
 
 /* Host movie bridge for eboot_port.  This is the renderer instance that owns
  * the window/swap chain created by eboot_port/main.cpp.  cellVpost workers run
@@ -2432,6 +2439,44 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             logo_fp_dumped = 1;
         }
     }
+    /* WA2 fragment-stage A/B/C root-cause probe. This is deliberately limited
+     * to the known large-logo screen rectangle and its 2-instruction FP. It
+     * does NOT pretend to fix rendering; it makes three independent signals in
+     * one draw so the next log identifies the failing contract:
+     *   left  [288,522): output interpolated tc0 as RG color (no texture read)
+     *   middle[522,757): Texture.Load a known-bright texel (no sampler/tc0)
+     *   right [757,992): original guest Sample path.
+     * All branches return alpha=1 or the texture's opaque alpha, so normal
+     * SRC_ALPHA blending cannot hide the diagnostic color. */
+    if ((fp_addr & ~1u) == 0x01BF9100u && s_logo_probe_ready) {
+        const char* old_tail =
+            "    float4 _o = r[0];\n"
+            "    return (_o == _o) ? _o : (float4)0;\n}\n";
+        char abc_tail[1024];
+        snprintf(abc_tail, sizeof abc_tail,
+            "    float4 _o = r[0];\n"
+            "    if (input.position.x >= 288.0 && input.position.x < 992.0 && "
+            "input.position.y >= 64.0 && input.position.y < 576.0) {\n"
+            "        if (input.position.x < 522.0) "
+            "return float4(saturate(input.tc0.x), saturate(input.tc0.y), 0.0, 1.0);\n"
+            "        if (input.position.x < 757.0) "
+            "return rsx_tex[0].Load(int3(%u, %u, 0));\n"
+            "    }\n"
+            "    return (_o == _o) ? _o : (float4)0;\n}\n",
+            s_logo_probe_x, s_logo_probe_y);
+        if (strstr(hlsl, old_tail)) {
+            hlsl_replace_all(hlsl, sizeof(hlsl), old_tail, abc_tail);
+            fprintf(stderr,
+                "[LOGO_STAGE_CFG] thirds=288..522(tc0),522..757(load),757..992(sample) "
+                "load=(%u,%u) expected=(%u,%u,%u,%u)%c",
+                s_logo_probe_x, s_logo_probe_y,
+                s_logo_probe_rgba[0], s_logo_probe_rgba[1],
+                s_logo_probe_rgba[2], s_logo_probe_rgba[3], 10);
+        } else {
+            fprintf(stderr, "[LOGO_STAGE_CFG] tail replacement FAILED%c", 10);
+        }
+    }
+
     /* FP_LIST=1: every program the title actually compiles, with its size. A
      * fragment program that hangs the GPU shows up here as an implausible
      * instruction count long before it shows up as a TDR. */
@@ -3096,6 +3141,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, u32 guest_pitch, i
             _logo_dec_done = 1;
             u64 sr = 0, sg = 0, sb = 0, sa = 0;
             u32 rgb_nz = 0, a_nz = 0, a_partial = 0, samples = 0;
+            u32 probe_best = 0;
             u8 rmax = 0, gmax = 0, bmax = 0, amin = 255, amax = 0;
             for (u32 y = 0; y < h; y++) {
                 const u8* row = (const u8*)mapped + (u64)y * pitch;
@@ -3106,18 +3152,28 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, u32 guest_pitch, i
                     if (r || g || b) rgb_nz++;
                     if (a) a_nz++;
                     if (a && a != 255) a_partial++;
+                    { u32 bright = (u32)r + (u32)g + (u32)b;
+                      if (bright > probe_best) {
+                          probe_best = bright; s_logo_probe_x = x; s_logo_probe_y = y;
+                          s_logo_probe_rgba[0]=r; s_logo_probe_rgba[1]=g;
+                          s_logo_probe_rgba[2]=b; s_logo_probe_rgba[3]=a;
+                      } }
                     if (r > rmax) rmax=r; if (g > gmax) gmax=g; if (b > bmax) bmax=b;
                     if (a < amin) amin=a; if (a > amax) amax=a;
                 }
             }
             const u8* ctr = (const u8*)mapped + (u64)(h/2) * pitch + (u64)(w/2) * 4u;
+            s_logo_probe_ready = probe_best != 0;
             fprintf(stderr,
                 "[LOGO_DEC] raw=0x%08X %ux%u rgb_nz=%u/%u a_nz=%u/%u a_partial=%u "
-                "avg=(%u,%u,%u,%u) maxRGB=(%u,%u,%u) alpha=[%u..%u] center=(%u,%u,%u,%u)%c",
+                "avg=(%u,%u,%u,%u) maxRGB=(%u,%u,%u) alpha=[%u..%u] center=(%u,%u,%u,%u) "
+                "probe=(%u,%u:%u,%u,%u,%u)%c",
                 key_off, w, h, rgb_nz, samples, a_nz, samples, a_partial,
                 samples ? (u32)(sr/samples) : 0, samples ? (u32)(sg/samples) : 0,
                 samples ? (u32)(sb/samples) : 0, samples ? (u32)(sa/samples) : 0,
-                rmax, gmax, bmax, amin, amax, ctr[0], ctr[1], ctr[2], ctr[3], 10);
+                rmax, gmax, bmax, amin, amax, ctr[0], ctr[1], ctr[2], ctr[3],
+                s_logo_probe_x, s_logo_probe_y, s_logo_probe_rgba[0], s_logo_probe_rgba[1],
+                s_logo_probe_rgba[2], s_logo_probe_rgba[3], 10);
         }
     }
 
@@ -5554,6 +5610,7 @@ skip_dump_consider: ;
         D3D12_RANGE _rr = {0, (SIZE_T)s_d3d.readback_pitch * s_d3d.height};
         if (SUCCEEDED(s_d3d.readback_buf->lpVtbl->Map(s_d3d.readback_buf, 0, &_rr, &_mp)) && _mp) {
             u32 nz = 0, rgb_nz = 0, alpha_nz = 0, bbox_rgb = 0, bbox_n = 0;
+            u32 abc_rgb[3] = {0,0,0}, abc_n[3] = {0,0,0};
             u8 rmax=0,gmax=0,bmax=0,amax=0;
             for (u32 y=0; y<s_d3d.height; y++) {
                 const u8* row=(const u8*)_mp + (u64)y*s_d3d.readback_pitch;
@@ -5563,7 +5620,11 @@ skip_dump_consider: ;
                     if (q[0]||q[1]||q[2]) rgb_nz++;
                     if (q[3]) alpha_nz++;
                     if (q[0]>rmax)rmax=q[0]; if(q[1]>gmax)gmax=q[1]; if(q[2]>bmax)bmax=q[2]; if(q[3]>amax)amax=q[3];
-                    if (x>=288 && x<992 && y>=64 && y<576) { bbox_n++; if(q[0]||q[1]||q[2]) bbox_rgb++; }
+                    if (x>=288 && x<992 && y>=64 && y<576) {
+                        int ai = (x < 522) ? 0 : ((x < 757) ? 1 : 2);
+                        bbox_n++; abc_n[ai]++;
+                        if(q[0]||q[1]||q[2]) { bbox_rgb++; abc_rgb[ai]++; }
+                    }
                 }
             }
             const u8* qc=(const u8*)_mp + (u64)360*s_d3d.readback_pitch + (u64)640*4u;
@@ -5573,6 +5634,9 @@ skip_dump_consider: ;
                 s_d3d.frame_count, rgb_nz, s_d3d.width*s_d3d.height,
                 alpha_nz, s_d3d.width*s_d3d.height, nz, bbox_rgb, bbox_n,
                 rmax,gmax,bmax,amax,qc[0],qc[1],qc[2],qc[3],10);
+            fprintf(stderr,
+                "[LOGO_STAGE] tc0_rgb=%u/%u load_rgb=%u/%u sample_rgb=%u/%u%c",
+                abc_rgb[0], abc_n[0], abc_rgb[1], abc_n[1], abc_rgb[2], abc_n[2], 10);
             D3D12_RANGE _wr = {0,0};
             s_d3d.readback_buf->lpVtbl->Unmap(s_d3d.readback_buf,0,&_wr);
         } else {
