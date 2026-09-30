@@ -1254,6 +1254,18 @@ void cellGcm_fifo_kick_wait(unsigned ms)
  * order). TryAcquire: a contended poll just reads the current ref. */
 static SRWLOCK s_ref_pub_lock = SRWLOCK_INIT;
 
+/* Guest-side label waits are serviced by FIFO semaphore RELEASE methods.
+ * vm_read32() calls this hook while a title spin-polls the injected label
+ * window.  Do not run the FIFO walker from that guest thread: the D3D12
+ * backend and walker are owned by the present thread.  Merely wake that
+ * thread so it can drain queued commands and publish the label naturally.
+ * This mirrors the dry-ref kick path below without fabricating label values. */
+void cellGcm_label_on_poll(void)
+{
+    if (s_gcm_kick_ev)
+        SetEvent(s_gcm_kick_ev);
+}
+
 void cellGcm_ref_on_poll(void)
 {
     /* Pace: leave each published value observable for >= ~200us of spins
