@@ -168,6 +168,8 @@ typedef struct {
 #define VP_SMP_TABLE_WIDTH 16
 #define VP_SMP_TABLES 128 /* 128*16 = 2048, D3D12 shader-visible sampler-heap limit */
 #define VP_SMP_HEAP_SIZE (VP_SMP_TABLE_WIDTH * VP_SMP_TABLES)
+#define VP_SMP_CACHE_SLOTS 128 /* CPU-only immutable sampler cache, Yakuza model */
+#define VP_SMP_CPU_HEAP_SIZE (VP_SMP_CACHE_SLOTS + 1) /* slot 0 = default */
 
 /* Per-frame VP texture slot: a guest texture uploaded for this frame's VP
  * draws (re-uploaded every frame -- gcm/cube's plasma animates in guest
@@ -337,7 +339,8 @@ typedef struct {
     VPFPEntry             vp_fp[VP_FP_CACHE];   /* guest-FP PSO cache            */
     int                   vp_fp_n;
     u32                   srv_inc;              /* CBV_SRV_UAV descriptor size   */
-    ID3D12DescriptorHeap* vp_sampler_heap;       /* shader-visible s0-s3 tables   */
+    ID3D12DescriptorHeap* vp_sampler_cpu_heap;   /* CPU-only cached sampler descs */
+    ID3D12DescriptorHeap* vp_sampler_heap;       /* shader-visible 16-wide tables */
     u32                   vp_sampler_inc;        /* SAMPLER descriptor size       */
     /* VP path: latest texture + sampler state bound per unit (t0-t3). */
     struct {
@@ -388,10 +391,15 @@ static D3D12State s_d3d;
  * entries 4..15 receive a valid default sampler.  Tables are immutable once
  * created so descriptors referenced by in-flight frames are never overwritten. */
 typedef struct {
-    u64 hash;
-    u32 state[VP_SMP_TABLE_WIDTH][4]; /* address, control0, filter, border */
+    u32 state[4]; /* address, control0, filter, border */
+    int valid;
+} VPSamplerCacheEntry;
+typedef struct {
+    u32 slots[VP_SMP_TABLE_WIDTH]; /* CPU-cache sampler slot per shader unit */
     int valid;
 } VPSamplerTable;
+static VPSamplerCacheEntry s_vp_sampler_cache[VP_SMP_CACHE_SLOTS];
+static u32 s_vp_sampler_cache_count = 0;
 static VPSamplerTable s_vp_sampler_tables[VP_SMP_TABLES];
 static u32 s_vp_sampler_table_count = 0;
 
@@ -1153,24 +1161,47 @@ static int init_d3d12(u32 width, u32 height)
             }
         }
 
-        /* Shader-visible dynamic sampler heap for guest fragment samplers.
-         * D3D12 allows at most 2048 sampler descriptors in one visible heap.
-         * We cache 512 immutable four-sampler tables, enough for all measured
-         * guest states without rewriting descriptors still used by the GPU. */
+        /* Yakuza descriptor model: CreateSampler only into a CPU-only cache,
+         * then copy complete 16-wide tables into the shader-visible ring.
+         * This avoids modifying/creating sampler descriptors in a heap that may
+         * already be referenced by an in-flight command list. */
         {
             D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
             hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+            hd.NumDescriptors = VP_SMP_CPU_HEAP_SIZE;
+            hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+            hr = s_d3d.device->lpVtbl->CreateDescriptorHeap(
+                s_d3d.device, &hd, &IID_ID3D12DescriptorHeap, (void**)&s_d3d.vp_sampler_cpu_heap);
+            if (FAILED(hr))
+                printf("[D3D12] sampler CPU heap creation failed (0x%08lX)\n", hr);
+
             hd.NumDescriptors = VP_SMP_HEAP_SIZE;
             hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
             hr = s_d3d.device->lpVtbl->CreateDescriptorHeap(
                 s_d3d.device, &hd, &IID_ID3D12DescriptorHeap, (void**)&s_d3d.vp_sampler_heap);
             if (FAILED(hr)) {
-                printf("[D3D12] sampler heap creation failed (0x%08lX)\n", hr);
-            } else {
+                printf("[D3D12] sampler visible heap creation failed (0x%08lX)\n", hr);
+            } else if (s_d3d.vp_sampler_cpu_heap) {
                 s_d3d.vp_sampler_inc = s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
                     s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+                s_vp_sampler_cache_count = 0;
                 s_vp_sampler_table_count = 0;
+                memset(s_vp_sampler_cache, 0, sizeof(s_vp_sampler_cache));
                 memset(s_vp_sampler_tables, 0, sizeof(s_vp_sampler_tables));
+
+                /* CPU cache slot 0 is the valid default sampler used for all
+                 * unreferenced s-registers, matching Yakuza's SMP_DEFAULT. */
+                D3D12_SAMPLER_DESC def = {0};
+                def.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+                def.AddressU = def.AddressV = def.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+                def.MinLOD = 0.0f;
+                def.MaxLOD = D3D12_FLOAT32_MAX;
+                def.MaxAnisotropy = 1;
+                def.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+                D3D12_CPU_DESCRIPTOR_HANDLE h;
+                s_d3d.vp_sampler_cpu_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(
+                    s_d3d.vp_sampler_cpu_heap, &h);
+                s_d3d.device->lpVtbl->CreateSampler(s_d3d.device, &def, h);
             }
         }
 
@@ -2937,62 +2968,92 @@ static void vp_sampler_state_for_unit(const D3D12DrawRecord* dr, int u, u32 out[
     }
 }
 
-static u64 vp_sampler_hash(const D3D12DrawRecord* dr)
+static D3D12_CPU_DESCRIPTOR_HANDLE vp_sampler_cpu_handle(u32 slot)
 {
-    u64 h = 1469598103934665603ull;
-    for (int u = 0; u < VP_SMP_TABLE_WIDTH; u++) {
-        u32 v[4]; vp_sampler_state_for_unit(dr, u, v);
-        for (int j = 0; j < 4; j++) {
-            h ^= (u64)v[j]; h *= 1099511628211ull;
-        }
-    }
+    D3D12_CPU_DESCRIPTOR_HANDLE h = {0};
+    if (!s_d3d.vp_sampler_cpu_heap || !s_d3d.vp_sampler_inc) return h;
+    s_d3d.vp_sampler_cpu_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(
+        s_d3d.vp_sampler_cpu_heap, &h);
+    h.ptr += (u64)slot * s_d3d.vp_sampler_inc;
     return h;
+}
+
+static u32 vp_sampler_slot_for_state(const u32 v[4])
+{
+    for (u32 i = 0; i < s_vp_sampler_cache_count; i++) {
+        VPSamplerCacheEntry* e = &s_vp_sampler_cache[i];
+        if (e->valid && e->state[0] == v[0] && e->state[1] == v[1] &&
+            e->state[2] == v[2] && e->state[3] == v[3])
+            return 1u + i;
+    }
+    if (!s_d3d.vp_sampler_cpu_heap || s_vp_sampler_cache_count >= VP_SMP_CACHE_SLOTS) {
+        static int warned = 0;
+        if (!warned++) fprintf(stderr, "[D3D12] sampler CPU cache exhausted; using default sampler\n");
+        return 0;
+    }
+    const u32 i = s_vp_sampler_cache_count++;
+    VPSamplerCacheEntry* e = &s_vp_sampler_cache[i];
+    e->valid = 1;
+    e->state[0] = v[0]; e->state[1] = v[1]; e->state[2] = v[2]; e->state[3] = v[3];
+    D3D12_SAMPLER_DESC sd = vp_decode_sampler(v[0], v[1], v[2], v[3]);
+    s_d3d.device->lpVtbl->CreateSampler(s_d3d.device, &sd, vp_sampler_cpu_handle(1u + i));
+    return 1u + i;
 }
 
 static int vp_sampler_table_for_draw(const D3D12DrawRecord* dr)
 {
-    if (!s_d3d.vp_sampler_heap || !s_d3d.vp_sampler_inc) return -1;
-    const u64 hash = vp_sampler_hash(dr);
+    if (!s_d3d.vp_sampler_heap || !s_d3d.vp_sampler_cpu_heap || !s_d3d.vp_sampler_inc)
+        return -1;
+
+    u32 slots[VP_SMP_TABLE_WIDTH];
+    for (int u = 0; u < VP_SMP_TABLE_WIDTH; u++) {
+        if (u >= 4 || !dr->tex[u].set) {
+            slots[u] = 0; /* Yakuza SMP_DEFAULT */
+        } else {
+            u32 v[4]; vp_sampler_state_for_unit(dr, u, v);
+            slots[u] = vp_sampler_slot_for_state(v);
+        }
+    }
+
     for (u32 i = 0; i < s_vp_sampler_table_count; i++) {
         VPSamplerTable* t = &s_vp_sampler_tables[i];
-        if (!t->valid || t->hash != hash) continue;
-        int same = 1;
-        for (int u = 0; u < VP_SMP_TABLE_WIDTH && same; u++) {
-            u32 v[4]; vp_sampler_state_for_unit(dr, u, v);
-            if (t->state[u][0] != v[0] || t->state[u][1] != v[1] ||
-                t->state[u][2] != v[2] || t->state[u][3] != v[3]) same = 0;
-        }
-        if (same) return (int)i;
+        if (t->valid && memcmp(t->slots, slots, sizeof(slots)) == 0)
+            return (int)i;
     }
     if (s_vp_sampler_table_count >= VP_SMP_TABLES) {
         static int warned = 0;
-        if (!warned++) fprintf(stderr, "[D3D12] sampler table cache exhausted; reusing table 0\n");
+        if (!warned++) fprintf(stderr, "[D3D12] sampler visible table ring exhausted; reusing table 0\n");
         return 0;
     }
+
     const u32 idx = s_vp_sampler_table_count++;
     VPSamplerTable* t = &s_vp_sampler_tables[idx];
-    t->valid = 1; t->hash = hash;
-    D3D12_CPU_DESCRIPTOR_HANDLE ch;
-    s_d3d.vp_sampler_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.vp_sampler_heap, &ch);
-    ch.ptr += (u64)idx * VP_SMP_TABLE_WIDTH * s_d3d.vp_sampler_inc;
-    for (int u = 0; u < VP_SMP_TABLE_WIDTH; u++) {
-        u32 v[4]; vp_sampler_state_for_unit(dr, u, v);
-        t->state[u][0] = v[0]; t->state[u][1] = v[1];
-        t->state[u][2] = v[2]; t->state[u][3] = v[3];
-        D3D12_SAMPLER_DESC sd = vp_decode_sampler(v[0], v[1], v[2], v[3]);
-        s_d3d.device->lpVtbl->CreateSampler(s_d3d.device, &sd, ch);
-        ch.ptr += s_d3d.vp_sampler_inc;
-    }
-    /* Keep one concise root-cause marker for the first logo sampler. */
+    t->valid = 1;
+    memcpy(t->slots, slots, sizeof(slots));
+
+    D3D12_CPU_DESCRIPTOR_HANDLE dst;
+    D3D12_CPU_DESCRIPTOR_HANDLE src[VP_SMP_TABLE_WIDTH];
+    const UINT dst_size = VP_SMP_TABLE_WIDTH;
+    s_d3d.vp_sampler_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(
+        s_d3d.vp_sampler_heap, &dst);
+    dst.ptr += (u64)idx * VP_SMP_TABLE_WIDTH * s_d3d.vp_sampler_inc;
+    for (int u = 0; u < VP_SMP_TABLE_WIDTH; u++)
+        src[u] = vp_sampler_cpu_handle(slots[u]);
+    s_d3d.device->lpVtbl->CopyDescriptors(
+        s_d3d.device, 1, &dst, &dst_size,
+        VP_SMP_TABLE_WIDTH, src, NULL, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+
     if (dr->tex[0].raw == 0x01CA8480u) {
         D3D12_SAMPLER_DESC sd = vp_decode_sampler(dr->tex[0].address,
                                                   dr->tex[0].control0,
                                                   dr->tex[0].filter,
                                                   dr->tex[0].border);
         fprintf(stderr,
-                "[RSX-SAMPLER] logo table=%u width=%u addr=0x%08X ctrl0=0x%08X filter=0x%08X "
-                "U/V/W=%u/%u/%u minLOD=%.3f maxLOD=%.3f d3dfilter=0x%X\n",
-                idx, (u32)VP_SMP_TABLE_WIDTH, dr->tex[0].address, dr->tex[0].control0, dr->tex[0].filter,
+                "[RSX-SAMPLER] logo table=%u width=%u cpuSlot=%u copy=CPU->VISIBLE "
+                "addr=0x%08X ctrl0=0x%08X filter=0x%08X U/V/W=%u/%u/%u "
+                "minLOD=%.3f maxLOD=%.3f d3dfilter=0x%X\n",
+                idx, (u32)VP_SMP_TABLE_WIDTH, slots[0],
+                dr->tex[0].address, dr->tex[0].control0, dr->tex[0].filter,
                 (u32)sd.AddressU, (u32)sd.AddressV, (u32)sd.AddressW,
                 (double)sd.MinLOD, (double)sd.MaxLOD, (u32)sd.Filter);
     }
@@ -7651,6 +7712,8 @@ void rsx_d3d12_backend_shutdown(void)
         if (s_d3d.render_targets[i]) s_d3d.render_targets[i]->lpVtbl->Release(s_d3d.render_targets[i]);
     }
     if (s_d3d.vp_sampler_heap) { s_d3d.vp_sampler_heap->lpVtbl->Release(s_d3d.vp_sampler_heap); s_d3d.vp_sampler_heap = NULL; }
+    if (s_d3d.vp_sampler_cpu_heap) { s_d3d.vp_sampler_cpu_heap->lpVtbl->Release(s_d3d.vp_sampler_cpu_heap); s_d3d.vp_sampler_cpu_heap = NULL; }
+    s_vp_sampler_cache_count = 0;
     s_vp_sampler_table_count = 0;
     if (s_d3d.rtv_heap) s_d3d.rtv_heap->lpVtbl->Release(s_d3d.rtv_heap);
     if (s_d3d.swap_chain) s_d3d.swap_chain->lpVtbl->Release(s_d3d.swap_chain);
