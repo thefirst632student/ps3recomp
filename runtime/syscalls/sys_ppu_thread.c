@@ -19,6 +19,8 @@ static PPU_TLS int     s_exit_armed = 0;
 
 #include <stddef.h>
 #include "sys_ppu_thread.h"
+#include "sys_cond.h"
+#include "../../libs/video/rsx_live_draw.h"
 #include "../platform/win32_compat.h"   /* GetCurrentThreadId on POSIX */
 #include <string.h>
 #include <stdio.h>
@@ -43,6 +45,12 @@ static PPU_TLS int     s_exit_armed = 0;
  * -----------------------------------------------------------------------*/
 ppu_thread_info       g_ppu_threads[PPU_THREAD_MAX];
 vm_stack_alloc        g_vm_stack_alloc;
+
+/* WA2 movie worker lifecycle bridge.  The title joins vpostStart before
+ * vdispStart.  That ordering is a reliable EOS signal even when cellVdec's
+ * HLE sequence bit remains set because the guest never reaches/observes an
+ * EndSeq transition. */
+static volatile int s_wa2_movie_vpost_joined = 0;
 ppu_thread_entry_fn   g_ppu_thread_entry_trampoline = NULL;
 
 /* Simple mutex for thread table access */
@@ -369,6 +377,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
     t->stack_addr = stack_addr;
     t->stack_size = stack_size;
     t->entry_addr = entry;
+    t->entry_arg  = arg;
 
     /* Copy thread name if provided */
     if (name_addr != 0) {
@@ -376,6 +385,8 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
         strncpy(t->name, name, sizeof(t->name) - 1);
         t->name[sizeof(t->name) - 1] = '\0';
     }
+    if (strcmp(t->name, "vpostStart") == 0)
+        s_wa2_movie_vpost_joined = 0;
 
     /* Create synchronization for join */
 #ifdef _WIN32
@@ -560,6 +571,30 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
     }
     table_unlock();
 
+    /* WA2: vpostStart being fully joined is the producer-side EOS.  vdispStart
+     * can otherwise sleep forever on its empty-queue condition because older
+     * HLE code gated the wakeup on cellVdec_is_seq_active(), whose bit can stay
+     * true after the decode worker has already exited.  Arm the vdisp event byte
+     * and broadcast its own condition before blocking in join.  The byte makes
+     * the wake retained even if the worker has not parked yet. */
+    if (s_wa2_movie_vpost_joined && strcmp(t->name, "vdispStart") == 0) {
+        const uint32_t vdisp = (uint32_t)t->entry_arg;
+        if (vdisp && vm_is_valid_addr(vdisp + 0x39)) {
+            uint8_t* obj = (uint8_t*)vm_to_host(vdisp);
+            obj[0x38] = 1;
+            obj[0x39] = 0;
+            const uint8_t* cond_p = (const uint8_t*)vm_to_host(vdisp + 0x18);
+            const uint32_t cond_id = ((uint32_t)cond_p[0] << 24) |
+                                     ((uint32_t)cond_p[1] << 16) |
+                                     ((uint32_t)cond_p[2] << 8)  |
+                                     (uint32_t)cond_p[3];
+            const int32_t wake_rc = sys_cond_signal_all_id(cond_id);
+            fprintf(stderr,
+                    "[HLE] WA2 vdisp EOS wake: vdisp=0x%08X cond=%u rc=0x%08X (vpost joined)\n",
+                    vdisp, cond_id, (uint32_t)wake_rc);
+        }
+    }
+
     /* Wait for completion */
 #ifdef _WIN32
     WaitForSingleObject(t->finish_event, INFINITE);
@@ -570,6 +605,18 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
     }
     pthread_mutex_unlock(&t->finish_mutex);
 #endif
+
+    if (strcmp(t->name, "vpostStart") == 0) {
+        s_wa2_movie_vpost_joined = 1;
+        fprintf(stderr, "[HLE] WA2 movie producer drained: vpostStart joined\n");
+    } else if (strcmp(t->name, "vdispStart") == 0) {
+        /* The title does not reliably call cellVpostClose/End after this movie.
+         * Restore the normal guest RSX stream at the lifecycle boundary we do
+         * know is final: the display worker has actually exited and joined. */
+        rsx_live_draw_set_movie_mode(0);
+        s_wa2_movie_vpost_joined = 0;
+        fprintf(stderr, "[HLE] WA2 movie display drained: vdispStart joined; guest RSX restored\n");
+    }
 
     /* Write exit status */
     if (status_addr != 0) {

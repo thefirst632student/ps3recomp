@@ -53,6 +53,8 @@ int64_t sys_cond_wait(ppu_context* ctx);
 int64_t sys_cond_signal(ppu_context* ctx);
 int64_t sys_cond_signal_all(ppu_context* ctx);
 int64_t sys_cond_signal_to(ppu_context* ctx);
+/* Host-side retained-signal helper for runtime lifecycle bridges. */
+int32_t sys_cond_signal_all_id(uint32_t id);
 
 /* Registration */
 void sys_cond_init(lv2_syscall_table* tbl);

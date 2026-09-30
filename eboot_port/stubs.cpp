@@ -58,13 +58,13 @@ extern "C" {
     s32 cellDmuxEnableEs(u32 handle, const void* filterId, const void* res, const void* esCb, const void* esSpecificInfo, void* esHandle);
     s32 cellDmuxDisableEs(u32 esHandle);
     s32 cellDmuxReleaseAu(u32 esHandle);
-    s32 cellDmuxSetStream(u32 handle, u32 streamAddr, u32 streamSize, u8 discontinuity, u64 userData);
+    s32 cellDmuxSetStream(u32 handle, const void* streamAddr, u32 streamSize, u64 userData);
     s32 cellDmuxResetStream(u32 handle);
-    s32 cellDmuxGetAu(u32 esHandle, void* auInfo, void* auSpecificInfo);
-    s32 cellDmuxGetAuEx(u32 esHandle, void* auInfoEx, void* auSpecificInfo);
-    s32 cellDmuxPeekAu(u32 esHandle, void* auInfo, void* auSpecificInfo);
-    s32 cellDmuxPeekAuEx(u32 esHandle, void* auInfoEx, void* auSpecificInfo);
-    s32 cellDmuxFlushEs(u32 esHandle);
+    s32 cellDmuxGetAu(u32 handle, u32 esHandle, void* auInfo);
+    s32 cellDmuxGetAuEx(u32 handle, u32 esHandle, void* auInfoEx);
+    s32 cellDmuxPeekAu(u32 handle, u32 esHandle, void* auInfo);
+    s32 cellDmuxPeekAuEx(u32 handle, u32 esHandle, void* auInfoEx);
+    s32 cellDmuxFlushEs(u32 handle, u32 esHandle);
 
     s32 cellVdecQueryAttr(const void* type, void* attr);
     s32 cellVdecQueryAttrEx(const void* type, void* attr);
@@ -74,11 +74,11 @@ extern "C" {
     s32 cellVdecStartSeq(u32 handle);
     s32 cellVdecEndSeq(u32 handle);
     s32 cellVdecDecodeAu(u32 handle, s32 mode, const void* auInfo);
-    s32 cellVdecGetPicture(u32 handle, const void* format, void* outBuff);
+    s32 cellVdecGetPicture(u32 handle, void* picItem);
     s32 cellVdecGetPicItem(u32 handle, void* picItem);
     s32 cellVdecSetFrameRate(u32 handle, u32 frameRateCode);
 
-    s32 cellVpostQuery(const void* cfgParam, u32* memSize);
+    s32 cellVpostQuery(const void* cfgParam, void* attr);
     s32 cellVpostQueryAttr(const void* cfgParam, void* attr);
     s32 cellVpostInit(const void* cfgParam, const void* resource, void* handle);
     s32 cellVpostOpen(const void* cfgParam, const void* resource, void* handle);
