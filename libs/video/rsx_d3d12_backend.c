@@ -198,6 +198,7 @@ typedef struct {
     u32 const_refs[16];
     int const_ref_count;
     char hpos_summary[768];
+    char tex0_summary[768];
 } VPVSEntry;
 #define VP_VS_CACHE 16  /* wave uses 5+ distinct VPs; at 4 the cache
                          * thrashed every frame and eviction shifted slots
@@ -371,6 +372,12 @@ static D3D12State s_d3d;
  * changing shaders, blend state, textures, or framebuffer contents. */
 static ID3D12QueryHeap* s_logo_occ_heap = NULL;
 static ID3D12Resource*  s_logo_occ_readback = NULL;
+/* GPU-side texture verification for the large WA2 logo.  LOGO_DEC proves the
+ * CPU decode buffer is populated; this readback proves the DEFAULT-heap texture
+ * actually consumed by the SRV received the same pixels after CopyTextureRegion. */
+static ID3D12Resource*  s_logo_tex_readback = NULL;
+static int               s_logo_tex_copy_issued = 0;
+static u32               s_logo_tex_readback_pitch = 0;
 
 /* Host movie bridge for eboot_port.  This is the renderer instance that owns
  * the window/swap chain created by eboot_port/main.cpp.  cellVpost workers run
@@ -1941,6 +1948,7 @@ static void vp_diag_summarize_hlsl(VPVSEntry* e, const char* hlsl, int instrs)
     e->instrs = instrs;
     e->const_ref_count = 0;
     e->hpos_summary[0] = 0;
+    e->tex0_summary[0] = 0;
 
     /* Collect direct vp_c[N] references. Indexed references are deliberately
      * skipped because their runtime address depends on a0/a1. */
@@ -1982,6 +1990,32 @@ static void vp_diag_summarize_hlsl(VPVSEntry* e, const char* hlsl, int instrs)
                 if (n > room) n = room;
                 memcpy(e->hpos_summary + used, tmp, n); used += n;
                 e->hpos_summary[used] = 0;
+            }
+        }
+        if (!nl) break;
+        line = nl + 1;
+    }
+
+    /* Keep the exact TEXCOORD0-producing lines too.  With full occlusion but
+     * a black sampled logo, the remaining split is whether o[7]/TEXCOORD0 is
+     * actually written by the guest VP or the GPU texture/SRV is black. */
+    line = hlsl;
+    used = 0;
+    while (*line && used + 2 < sizeof(e->tex0_summary)) {
+        const char* nl = strchr(line, '\n');
+        size_t len = nl ? (size_t)(nl - line) : strlen(line);
+        if (len) {
+            char tmp[512];
+            size_t n = len < sizeof(tmp) - 1 ? len : sizeof(tmp) - 1;
+            memcpy(tmp, line, n); tmp[n] = 0;
+            if (strstr(tmp, "o[7]") != NULL || strstr(tmp, "Out.t0") != NULL) {
+                if (used && used + 3 < sizeof(e->tex0_summary)) {
+                    e->tex0_summary[used++] = ' '; e->tex0_summary[used++] = '|'; e->tex0_summary[used++] = ' ';
+                }
+                size_t room = sizeof(e->tex0_summary) - 1 - used;
+                if (n > room) n = room;
+                memcpy(e->tex0_summary + used, tmp, n); used += n;
+                e->tex0_summary[used] = 0;
             }
         }
         if (!nl) break;
@@ -3380,6 +3414,51 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, u32 guest_pitch, i
         b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
     }
+
+    /* One-shot GPU texture readback for WA2's 704x512 A8R8G8B8 logo.  This is
+     * observational only.  The copy is ordered after the upload and the
+     * resource is returned to PIXEL_SHADER_RESOURCE before the draw. */
+    if (!s_logo_tex_copy_issued && (key_off & 0x0FFFFFFFu) == 0x01CA8480u &&
+        w == 704u && h == 512u && dxfmt == DXGI_FORMAT_R8G8B8A8_UNORM) {
+        s_logo_tex_readback_pitch = (w * 4u + 255u) & ~255u;
+        if (!s_logo_tex_readback) {
+            D3D12_HEAP_PROPERTIES rhp = {0}; rhp.Type = D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC rbd = {0};
+            rbd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            rbd.Width = (u64)s_logo_tex_readback_pitch * h;
+            rbd.Height = 1; rbd.DepthOrArraySize = 1; rbd.MipLevels = 1;
+            rbd.SampleDesc.Count = 1; rbd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
+                    s_d3d.device, &rhp, D3D12_HEAP_FLAG_NONE, &rbd,
+                    D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+                    &IID_ID3D12Resource, (void**)&s_logo_tex_readback)))
+                s_logo_tex_readback = NULL;
+        }
+        if (s_logo_tex_readback) {
+            D3D12_RESOURCE_BARRIER rb = {0};
+            rb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            rb.Transition.pResource = t->res;
+            rb.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            rb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            rb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &rb);
+            D3D12_TEXTURE_COPY_LOCATION rd = {0}, rs = {0};
+            rd.pResource = s_logo_tex_readback;
+            rd.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            rd.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            rd.PlacedFootprint.Footprint.Width = w;
+            rd.PlacedFootprint.Footprint.Height = h;
+            rd.PlacedFootprint.Footprint.Depth = 1;
+            rd.PlacedFootprint.Footprint.RowPitch = s_logo_tex_readback_pitch;
+            rs.pResource = t->res; rs.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            rs.SubresourceIndex = 0;
+            s_d3d.cmd_list->lpVtbl->CopyTextureRegion(s_d3d.cmd_list, &rd, 0, 0, 0, &rs, NULL);
+            rb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            rb.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &rb);
+            s_logo_tex_copy_issued = 1;
+        }
+    }
     /* SRV at heap slot 1+slot */
     D3D12_SHADER_RESOURCE_VIEW_DESC sv = {0};
     sv.Format = dxfmt;
@@ -3520,6 +3599,8 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
                 VPVSEntry* ve = &s_d3d.vp_vs[vs_idx];
                 fprintf(stderr, "[LOGO_VP] hpos: %s\n",
                         ve->hpos_summary[0] ? ve->hpos_summary : "<no o[0]/Out.pos lines captured>");
+                fprintf(stderr, "[LOGO_VP] tex0: %s\n",
+                        ve->tex0_summary[0] ? ve->tex0_summary : "<no o[7]/Out.t0 write captured>");
                 fprintf(stderr, "[LOGO_VP] refs(%d):", ve->const_ref_count);
                 for (int ri = 0; ri < ve->const_ref_count; ri++) {
                     u32 ci = ve->const_refs[ri];
@@ -4654,6 +4735,11 @@ static void render_frame(void)
                     if (s_duck_off && dr->tex[_u].off == s_duck_off)
                         s_duck_raw = dr->tex[_u].raw;
                     if (ts >= 0) {
+                        if (dr->tex[_u].raw == 0x01CA8480u || dr->tex[_u].raw == 0x01CA3E80u)
+                            fprintf(stderr, "[LOGO_SRV] draw=%u unit=%d heap=%u texslot=%d raw=0x%08X res=%p map=0x%X%c",
+                                    _d, _u, wslot, ts, dr->tex[_u].raw,
+                                    (void*)s_d3d.vp_tex[ts].res,
+                                    (_bf == 0x81) ? 0x1000u : rsx_remap_to_d3d(dr->tex[_u].ctrl1, _bf), 10);
                         DXGI_FORMAT sf =
                             (_bf == 0x85) ? DXGI_FORMAT_R8G8B8A8_UNORM :
                             (_bf == 0x8B) ? DXGI_FORMAT_R8G8_UNORM :
@@ -5424,6 +5510,29 @@ skip_dump_consider: ;
          * No screenshot is needed to answer whether rasterization produced any
          * visible color. */
         wait_for_gpu();
+        if (s_logo_tex_copy_issued && s_logo_tex_readback) {
+            void* _tp = NULL;
+            SIZE_T _tn = (SIZE_T)s_logo_tex_readback_pitch * 512u;
+            D3D12_RANGE _tr = {0, _tn};
+            if (SUCCEEDED(s_logo_tex_readback->lpVtbl->Map(s_logo_tex_readback, 0, &_tr, &_tp)) && _tp) {
+                u32 _rgb = 0, _a = 0, _n = 704u * 512u;
+                u8 _rm=0,_gm=0,_bm=0,_am=0;
+                for (u32 _y=0; _y<512u; _y++) {
+                    const u8* _row=(const u8*)_tp + (u64)_y*s_logo_tex_readback_pitch;
+                    for (u32 _x=0; _x<704u; _x++) {
+                        const u8* _q=_row+(u64)_x*4u;
+                        if (_q[0]||_q[1]||_q[2]) _rgb++;
+                        if (_q[3]) _a++;
+                        if(_q[0]>_rm)_rm=_q[0]; if(_q[1]>_gm)_gm=_q[1];
+                        if(_q[2]>_bm)_bm=_q[2]; if(_q[3]>_am)_am=_q[3];
+                    }
+                }
+                const u8* _c=(const u8*)_tp + (u64)256u*s_logo_tex_readback_pitch + (u64)352u*4u;
+                fprintf(stderr, "[LOGO_GPU_TEX] rgb_nz=%u/%u a_nz=%u/%u max=(%u,%u,%u,%u) center=(%u,%u,%u,%u)%c",
+                        _rgb,_n,_a,_n,_rm,_gm,_bm,_am,_c[0],_c[1],_c[2],_c[3],10);
+                D3D12_RANGE _tw={0,0}; s_logo_tex_readback->lpVtbl->Unmap(s_logo_tex_readback,0,&_tw);
+            } else fprintf(stderr, "[LOGO_GPU_TEX] readback map FAILED%c", 10);
+        }
         if (s_logo_occ_readback && (logo_occ_issued[0] || logo_occ_issued[1])) {
             void* _qp = NULL;
             D3D12_RANGE _qr = {0, 2u * sizeof(UINT64)};
@@ -7306,6 +7415,8 @@ void rsx_d3d12_backend_shutdown(void)
     if (s_d3d.root_signature) s_d3d.root_signature->lpVtbl->Release(s_d3d.root_signature);
     if (s_logo_occ_readback) { s_logo_occ_readback->lpVtbl->Release(s_logo_occ_readback); s_logo_occ_readback = NULL; }
     if (s_logo_occ_heap) { s_logo_occ_heap->lpVtbl->Release(s_logo_occ_heap); s_logo_occ_heap = NULL; }
+    if (s_logo_tex_readback) { s_logo_tex_readback->lpVtbl->Release(s_logo_tex_readback); s_logo_tex_readback = NULL; }
+    s_logo_tex_copy_issued = 0; s_logo_tex_readback_pitch = 0;
     if (s_d3d.fence) s_d3d.fence->lpVtbl->Release(s_d3d.fence);
     if (s_d3d.fence_event) CloseHandle(s_d3d.fence_event);
     if (s_d3d.cmd_list) s_d3d.cmd_list->lpVtbl->Release(s_d3d.cmd_list);
