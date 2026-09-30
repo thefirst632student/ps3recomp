@@ -101,6 +101,10 @@ typedef struct {
         u32 w, h, fmt;  /* dims + RSX base format */
         u32 pitch;      /* NV4097 TEXTURE_CONTROL3 row pitch for linear textures */
         u32 ctrl1;      /* NV4097 TEXTURE_CONTROL1: component remap crossbar */
+        u32 address;    /* NV4097 SET_TEXTURE_ADDRESS: S/T/R wrap modes */
+        u32 control0;   /* enable + min/max LOD state */
+        u32 filter;     /* NV4097 SET_TEXTURE_FILTER: min/mag/mip filtering */
+        u32 border;     /* border colour used by BORDER addressing */
         u32 mips;       /* SET_TEXTURE_FORMAT bits 16..31: mipmap level count.
                          * Cube faces sit one whole mip pyramid apart, so this
                          * is what sets the face stride. */
@@ -158,6 +162,9 @@ typedef struct {
  * interpolation passes sample 3 units). */
 #define DRAW_SRV_BASE 32
 #define SRV_HEAP_SIZE (DRAW_SRV_BASE + MAX_DRAWS * 4)
+#define VP_SMP_TABLE_WIDTH 4
+#define VP_SMP_TABLES 512 /* 512*4 = 2048, D3D12 shader-visible sampler-heap limit */
+#define VP_SMP_HEAP_SIZE (VP_SMP_TABLE_WIDTH * VP_SMP_TABLES)
 
 /* Per-frame VP texture slot: a guest texture uploaded for this frame's VP
  * draws (re-uploaded every frame -- gcm/cube's plasma animates in guest
@@ -327,8 +334,14 @@ typedef struct {
     VPFPEntry             vp_fp[VP_FP_CACHE];   /* guest-FP PSO cache            */
     int                   vp_fp_n;
     u32                   srv_inc;              /* CBV_SRV_UAV descriptor size   */
-    /* VP path: latest texture bound per unit (t0-t3). */
-    struct { u32 off, raw, w, h, fmt, pitch, ctrl1, mips; int cube; int set; } cur_texs[4];
+    ID3D12DescriptorHeap* vp_sampler_heap;       /* shader-visible s0-s3 tables   */
+    u32                   vp_sampler_inc;        /* SAMPLER descriptor size       */
+    /* VP path: latest texture + sampler state bound per unit (t0-t3). */
+    struct {
+        u32 off, raw, w, h, fmt, pitch, ctrl1, mips;
+        u32 address, control0, filter, border;
+        int cube; int set;
+    } cur_texs[4];
 
     /* Render-to-texture: offscreen RT pool + their RTV heap. */
     OffRT                 off_rt[MAX_OFF_RTS];
@@ -365,6 +378,18 @@ typedef struct {
 } D3D12State;
 
 static D3D12State s_d3d;
+
+/* Dynamic RSX fragment-sampler tables.  Guest FPs reference s0-s3; sampler
+ * state is independent of the PSO and changes per draw, so a static sampler in
+ * the root signature is semantically wrong.  Tables are immutable once created
+ * (safe while earlier frames are in flight) and cached by the four guest states. */
+typedef struct {
+    u64 hash;
+    u32 state[4][4]; /* address, control0, filter, border */
+    int valid;
+} VPSamplerTable;
+static VPSamplerTable s_vp_sampler_tables[VP_SMP_TABLES];
+static u32 s_vp_sampler_table_count = 0;
 
 /* WA2 logo root-cause probe: two non-invasive occlusion queries, one for the
  * large A8R8G8B8 logo draw and one for the DXT5 sub-logo draw.  An occlusion
@@ -1124,6 +1149,27 @@ static int init_d3d12(u32 width, u32 height)
             }
         }
 
+        /* Shader-visible dynamic sampler heap for guest fragment samplers.
+         * D3D12 allows at most 2048 sampler descriptors in one visible heap.
+         * We cache 512 immutable four-sampler tables, enough for all measured
+         * guest states without rewriting descriptors still used by the GPU. */
+        {
+            D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
+            hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+            hd.NumDescriptors = VP_SMP_HEAP_SIZE;
+            hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+            hr = s_d3d.device->lpVtbl->CreateDescriptorHeap(
+                s_d3d.device, &hd, &IID_ID3D12DescriptorHeap, (void**)&s_d3d.vp_sampler_heap);
+            if (FAILED(hr)) {
+                printf("[D3D12] sampler heap creation failed (0x%08lX)\n", hr);
+            } else {
+                s_d3d.vp_sampler_inc = s_d3d.device->lpVtbl->GetDescriptorHandleIncrementSize(
+                    s_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+                s_vp_sampler_table_count = 0;
+                memset(s_vp_sampler_tables, 0, sizeof(s_vp_sampler_tables));
+            }
+        }
+
         /* RTV heap for offscreen render targets (CPU-visible only). */
         {
             D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
@@ -1184,7 +1230,13 @@ static int init_d3d12(u32 width, u32 height)
         srv_range.BaseShaderRegister = 0;
         srv_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
-        D3D12_ROOT_PARAMETER rp[3] = {0};
+        D3D12_DESCRIPTOR_RANGE smp_range = {0};
+        smp_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+        smp_range.NumDescriptors = 4;
+        smp_range.BaseShaderRegister = 0;
+        smp_range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+        D3D12_ROOT_PARAMETER rp[4] = {0};
         rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;   /* b0 = vp_c bank */
         rp[0].Descriptor.ShaderRegister = 0;
         rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
@@ -1195,23 +1247,14 @@ static int init_d3d12(u32 width, u32 height)
         rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;   /* b1 = FP texscale */
         rp[2].Descriptor.ShaderRegister = 1;
         rp[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-
-        D3D12_STATIC_SAMPLER_DESC samp[4] = {0};
-        for (int _s = 0; _s < 4; _s++) {
-            samp[_s].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-            samp[_s].AddressU = samp[_s].AddressV = samp[_s].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-            samp[_s].ShaderRegister = (UINT)_s;
-            samp[_s].MaxLOD = D3D12_FLOAT32_MAX;
-            samp[_s].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-        }
-        /* s0 keeps point/clamp: the dbgfont atlas PS samples glyph cells and
-         * linear filtering bleeds neighbouring glyphs. */
-        samp[0].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
-        samp[0].AddressU = samp[0].AddressV = samp[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        rp[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp[3].DescriptorTable.NumDescriptorRanges = 1;
+        rp[3].DescriptorTable.pDescriptorRanges = &smp_range;
+        rp[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
         D3D12_ROOT_SIGNATURE_DESC rd = {0};
-        rd.NumParameters = 3; rd.pParameters = rp;
-        rd.NumStaticSamplers = 4; rd.pStaticSamplers = samp;
+        rd.NumParameters = 4; rd.pParameters = rp;
+        rd.NumStaticSamplers = 0; rd.pStaticSamplers = NULL;
         rd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
         ID3DBlob* sig = NULL; ID3DBlob* err = NULL;
@@ -2439,42 +2482,6 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             logo_fp_dumped = 1;
         }
     }
-    /* WA2 fragment-stage A/B/C root-cause probe. This is deliberately limited
-     * to the known large-logo screen rectangle and its 2-instruction FP. It
-     * does NOT pretend to fix rendering; it makes three independent signals in
-     * one draw so the next log identifies the failing contract:
-     *   left  [288,522): output interpolated tc0 as RG color (no texture read)
-     *   middle[522,757): Texture.Load a known-bright texel (no sampler/tc0)
-     *   right [757,992): original guest Sample path.
-     * All branches return alpha=1 or the texture's opaque alpha, so normal
-     * SRC_ALPHA blending cannot hide the diagnostic color. */
-    if ((fp_addr & ~1u) == 0x01BF9100u) {
-        const char* old_tail =
-            "    float4 _o = r[0];\n"
-            "    return (_o == _o) ? _o : (float4)0;\n}\n";
-        char abc_tail[1280];
-        /* Compile-time diagnostic: do not depend on texture-upload timing.
-         * The known static WA2 logo has an opaque white texel at (130,150),
-         * verified independently by both CPU decode and GPU readback probes. */
-        snprintf(abc_tail, sizeof abc_tail,
-            "    float4 _o = r[0];\n"
-            "    if (input.position.x >= 288.0 && input.position.x < 992.0 && "
-            "input.position.y >= 64.0 && input.position.y < 576.0) {\n"
-            "        if (input.position.x < 464.0) return float4(1.0, 0.0, 0.0, 1.0);\n"
-            "        if (input.position.x < 640.0) return float4(saturate(input.tc0.x), saturate(input.tc0.y), 0.0, 1.0);\n"
-            "        if (input.position.x < 816.0) return rsx_tex[0].Load(int3(130, 150, 0));\n"
-            "    }\n"
-            "    return (_o == _o) ? _o : (float4)0;\n}\n");
-        if (strstr(hlsl, old_tail)) {
-            hlsl_replace_all(hlsl, sizeof(hlsl), old_tail, abc_tail);
-            fprintf(stderr,
-                "[LOGO_STAGE_CFG] quarters=288..464(solid-red),464..640(tc0),"
-                "640..816(load-white@130,150),816..992(sample)%c", 10);
-        } else {
-            fprintf(stderr, "[LOGO_STAGE_CFG] tail replacement FAILED%c", 10);
-        }
-    }
-
     /* FP_LIST=1: every program the title actually compiles, with its size. A
      * fragment program that hangs the GPU shows up here as an implausible
      * instruction count long before it shows up as a TDR. */
@@ -2856,6 +2863,125 @@ static u32 tex_csum(const u8* base, u32 nbytes)
         h ^= w32; h *= 16777619u;
     }
     return h;
+}
+
+static D3D12_TEXTURE_ADDRESS_MODE vp_sampler_wrap(u32 w)
+{
+    switch (w & 0xFu) {
+    case 1: return D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    case 2: return D3D12_TEXTURE_ADDRESS_MODE_MIRROR;
+    case 3: return D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    case 4: return D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    case 5: return D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    case 6:
+    case 7:
+    case 8: return D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE;
+    default: return D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    }
+}
+
+static D3D12_SAMPLER_DESC vp_decode_sampler(u32 address, u32 control0, u32 filter, u32 border)
+{
+    /* Same RSX sampler decode as rsx_live_draw: min/mag/mip filter fields,
+     * independent S/T/R wrap modes, and 8.8 fixed-point LOD clamps. */
+    D3D12_SAMPLER_DESC sd = {0};
+    const u32 minf = (filter >> 16) & 0x7u;
+    const u32 magf = (filter >> 24) & 0x7u;
+    const int min_linear = (minf == 2u || minf == 4u || minf == 6u);
+    const int mag_linear = (magf == 2u);
+    const int mip_linear = (minf == 5u || minf == 6u);
+    const int mip_present = (minf >= 3u);
+    D3D12_FILTER_TYPE mn = min_linear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT;
+    D3D12_FILTER_TYPE mg = mag_linear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT;
+    D3D12_FILTER_TYPE mp = mip_linear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT;
+    sd.Filter = D3D12_ENCODE_BASIC_FILTER(mn, mg, mp, D3D12_FILTER_REDUCTION_TYPE_STANDARD);
+    sd.AddressU = vp_sampler_wrap(address);
+    sd.AddressV = vp_sampler_wrap(address >> 8);
+    sd.AddressW = vp_sampler_wrap(address >> 16);
+    {
+        const u32 max_lod_fx = (control0 >> 7) & 0xFFFu;
+        const u32 min_lod_fx = (control0 >> 19) & 0xFFFu;
+        sd.MinLOD = (float)min_lod_fx / 256.0f;
+        sd.MaxLOD = mip_present ? (float)max_lod_fx / 256.0f : 0.0f;
+        if (sd.MaxLOD < sd.MinLOD) sd.MaxLOD = sd.MinLOD;
+    }
+    sd.MaxAnisotropy = 1;
+    sd.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    /* RSX border colour is A8R8G8B8. Dynamic D3D12 samplers accept arbitrary
+     * float border colours, unlike static samplers. */
+    sd.BorderColor[0] = (float)((border >> 16) & 0xFFu) / 255.0f;
+    sd.BorderColor[1] = (float)((border >> 8) & 0xFFu) / 255.0f;
+    sd.BorderColor[2] = (float)(border & 0xFFu) / 255.0f;
+    sd.BorderColor[3] = (float)((border >> 24) & 0xFFu) / 255.0f;
+    return sd;
+}
+
+static u64 vp_sampler_hash(const D3D12DrawRecord* dr)
+{
+    u64 h = 1469598103934665603ull;
+    for (int u = 0; u < 4; u++) {
+        const u32 v[4] = { dr->tex[u].address, dr->tex[u].control0,
+                           dr->tex[u].filter, dr->tex[u].border };
+        for (int j = 0; j < 4; j++) {
+            h ^= (u64)v[j]; h *= 1099511628211ull;
+        }
+    }
+    return h;
+}
+
+static int vp_sampler_table_for_draw(const D3D12DrawRecord* dr)
+{
+    if (!s_d3d.vp_sampler_heap || !s_d3d.vp_sampler_inc) return -1;
+    const u64 hash = vp_sampler_hash(dr);
+    for (u32 i = 0; i < s_vp_sampler_table_count; i++) {
+        VPSamplerTable* t = &s_vp_sampler_tables[i];
+        if (!t->valid || t->hash != hash) continue;
+        int same = 1;
+        for (int u = 0; u < 4 && same; u++) {
+            if (t->state[u][0] != dr->tex[u].address ||
+                t->state[u][1] != dr->tex[u].control0 ||
+                t->state[u][2] != dr->tex[u].filter ||
+                t->state[u][3] != dr->tex[u].border) same = 0;
+        }
+        if (same) return (int)i;
+    }
+    if (s_vp_sampler_table_count >= VP_SMP_TABLES) {
+        static int warned = 0;
+        if (!warned++) fprintf(stderr, "[D3D12] sampler table cache exhausted; reusing table 0\n");
+        return 0;
+    }
+    const u32 idx = s_vp_sampler_table_count++;
+    VPSamplerTable* t = &s_vp_sampler_tables[idx];
+    t->valid = 1; t->hash = hash;
+    D3D12_CPU_DESCRIPTOR_HANDLE ch;
+    s_d3d.vp_sampler_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.vp_sampler_heap, &ch);
+    ch.ptr += (u64)idx * VP_SMP_TABLE_WIDTH * s_d3d.vp_sampler_inc;
+    for (int u = 0; u < 4; u++) {
+        t->state[u][0] = dr->tex[u].address;
+        t->state[u][1] = dr->tex[u].control0;
+        t->state[u][2] = dr->tex[u].filter;
+        t->state[u][3] = dr->tex[u].border;
+        D3D12_SAMPLER_DESC sd = vp_decode_sampler(dr->tex[u].address,
+                                                  dr->tex[u].control0,
+                                                  dr->tex[u].filter,
+                                                  dr->tex[u].border);
+        s_d3d.device->lpVtbl->CreateSampler(s_d3d.device, &sd, ch);
+        ch.ptr += s_d3d.vp_sampler_inc;
+    }
+    /* Keep one concise root-cause marker for the first logo sampler. */
+    if (dr->tex[0].raw == 0x01CA8480u) {
+        D3D12_SAMPLER_DESC sd = vp_decode_sampler(dr->tex[0].address,
+                                                  dr->tex[0].control0,
+                                                  dr->tex[0].filter,
+                                                  dr->tex[0].border);
+        fprintf(stderr,
+                "[RSX-SAMPLER] logo table=%u addr=0x%08X ctrl0=0x%08X filter=0x%08X "
+                "U/V/W=%u/%u/%u minLOD=%.3f maxLOD=%.3f d3dfilter=0x%X\n",
+                idx, dr->tex[0].address, dr->tex[0].control0, dr->tex[0].filter,
+                (u32)sd.AddressU, (u32)sd.AddressV, (u32)sd.AddressW,
+                (double)sd.MinLOD, (double)sd.MaxLOD, (u32)sd.Filter);
+    }
+    return (int)idx;
 }
 
 static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, u32 guest_pitch, int cube, u32 mips)
@@ -5005,8 +5131,9 @@ static void render_frame(void)
             s_d3d.cmd_list->lpVtbl->IASetPrimitiveTopology(s_d3d.cmd_list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             s_d3d.cmd_list->lpVtbl->SetGraphicsRootConstantBufferView(s_d3d.cmd_list, 0,
                 s_d3d.vp_cb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_cb));
-            ID3D12DescriptorHeap* heaps[] = { s_d3d.srv_heap };
-            s_d3d.cmd_list->lpVtbl->SetDescriptorHeaps(s_d3d.cmd_list, 1, heaps);
+            ID3D12DescriptorHeap* heaps[] = { s_d3d.srv_heap, s_d3d.vp_sampler_heap };
+            s_d3d.cmd_list->lpVtbl->SetDescriptorHeaps(s_d3d.cmd_list,
+                s_d3d.vp_sampler_heap ? 2u : 1u, heaps);
             D3D12_GPU_DESCRIPTOR_HANDLE gh;
             s_d3d.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &gh);
             s_d3d.cmd_list->lpVtbl->SetGraphicsRootDescriptorTable(s_d3d.cmd_list, 1, gh);
@@ -5191,6 +5318,17 @@ static void render_frame(void)
                 D3D12_GPU_DESCRIPTOR_HANDLE gh = gh_base;
                 gh.ptr += (u64)(DRAW_SRV_BASE + d * 4) * s_d3d.srv_inc;
                 s_d3d.cmd_list->lpVtbl->SetGraphicsRootDescriptorTable(s_d3d.cmd_list, 1, gh);
+                if (s_d3d.vp_sampler_heap) {
+                    int sti = vp_sampler_table_for_draw(dr);
+                    if (sti >= 0) {
+                        D3D12_GPU_DESCRIPTOR_HANDLE sg;
+                        s_d3d.vp_sampler_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(
+                            s_d3d.vp_sampler_heap, &sg);
+                        sg.ptr += (u64)sti * VP_SMP_TABLE_WIDTH * s_d3d.vp_sampler_inc;
+                        s_d3d.cmd_list->lpVtbl->SetGraphicsRootDescriptorTable(
+                            s_d3d.cmd_list, 3, sg);
+                    }
+                }
                 /* Per-draw constants: this draw's vp_cb + FP texscale slots. */
                 s_d3d.cmd_list->lpVtbl->SetGraphicsRootConstantBufferView(s_d3d.cmd_list, 0,
                     s_d3d.vp_cb->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_cb)
@@ -5608,7 +5746,6 @@ skip_dump_consider: ;
         D3D12_RANGE _rr = {0, (SIZE_T)s_d3d.readback_pitch * s_d3d.height};
         if (SUCCEEDED(s_d3d.readback_buf->lpVtbl->Map(s_d3d.readback_buf, 0, &_rr, &_mp)) && _mp) {
             u32 nz = 0, rgb_nz = 0, alpha_nz = 0, bbox_rgb = 0, bbox_n = 0;
-            u32 abc_rgb[4] = {0,0,0,0}, abc_n[4] = {0,0,0,0};
             u8 rmax=0,gmax=0,bmax=0,amax=0;
             for (u32 y=0; y<s_d3d.height; y++) {
                 const u8* row=(const u8*)_mp + (u64)y*s_d3d.readback_pitch;
@@ -5619,9 +5756,8 @@ skip_dump_consider: ;
                     if (q[3]) alpha_nz++;
                     if (q[0]>rmax)rmax=q[0]; if(q[1]>gmax)gmax=q[1]; if(q[2]>bmax)bmax=q[2]; if(q[3]>amax)amax=q[3];
                     if (x>=288 && x<992 && y>=64 && y<576) {
-                        int ai = (x < 464) ? 0 : ((x < 640) ? 1 : ((x < 816) ? 2 : 3));
-                        bbox_n++; abc_n[ai]++;
-                        if(q[0]||q[1]||q[2]) { bbox_rgb++; abc_rgb[ai]++; }
+                        bbox_n++;
+                        if(q[0]||q[1]||q[2]) bbox_rgb++;
                     }
                 }
             }
@@ -5632,10 +5768,6 @@ skip_dump_consider: ;
                 s_d3d.frame_count, rgb_nz, s_d3d.width*s_d3d.height,
                 alpha_nz, s_d3d.width*s_d3d.height, nz, bbox_rgb, bbox_n,
                 rmax,gmax,bmax,amax,qc[0],qc[1],qc[2],qc[3],10);
-            fprintf(stderr,
-                "[LOGO_STAGE] solid_rgb=%u/%u tc0_rgb=%u/%u load_rgb=%u/%u sample_rgb=%u/%u%c",
-                abc_rgb[0], abc_n[0], abc_rgb[1], abc_n[1],
-                abc_rgb[2], abc_n[2], abc_rgb[3], abc_n[3], 10);
             D3D12_RANGE _wr = {0,0};
             s_d3d.readback_buf->lpVtbl->Unmap(s_d3d.readback_buf,0,&_wr);
         } else {
@@ -6798,6 +6930,10 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                     dr->tex[_u].fmt = s_d3d.cur_texs[_u].fmt;
                     dr->tex[_u].pitch = s_d3d.cur_texs[_u].pitch;
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
+                    dr->tex[_u].address = s_d3d.cur_texs[_u].address;
+                    dr->tex[_u].control0 = s_d3d.cur_texs[_u].control0;
+                    dr->tex[_u].filter = s_d3d.cur_texs[_u].filter;
+                    dr->tex[_u].border = s_d3d.cur_texs[_u].border;
                     dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
                     dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips;
                     dr->tex[_u].set = s_d3d.cur_texs[_u].set;
@@ -6922,6 +7058,10 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->tex[_u].fmt = s_d3d.cur_texs[_u].fmt;
                     dr->tex[_u].pitch = s_d3d.cur_texs[_u].pitch;
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
+                    dr->tex[_u].address = s_d3d.cur_texs[_u].address;
+                    dr->tex[_u].control0 = s_d3d.cur_texs[_u].control0;
+                    dr->tex[_u].filter = s_d3d.cur_texs[_u].filter;
+                    dr->tex[_u].border = s_d3d.cur_texs[_u].border;
                     dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
                     dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips;
                 dr->tex[_u].set = s_d3d.cur_texs[_u].set;
@@ -7068,6 +7208,10 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
             dr->tex[_u].fmt = s_d3d.cur_texs[_u].fmt;
                     dr->tex[_u].pitch = s_d3d.cur_texs[_u].pitch;
                     dr->tex[_u].ctrl1 = s_d3d.cur_texs[_u].ctrl1;
+                    dr->tex[_u].address = s_d3d.cur_texs[_u].address;
+                    dr->tex[_u].control0 = s_d3d.cur_texs[_u].control0;
+                    dr->tex[_u].filter = s_d3d.cur_texs[_u].filter;
+                    dr->tex[_u].border = s_d3d.cur_texs[_u].border;
                     dr->tex[_u].cube  = s_d3d.cur_texs[_u].cube;
                     dr->tex[_u].mips  = s_d3d.cur_texs[_u].mips;
             dr->tex[_u].set = s_d3d.cur_texs[_u].set;
@@ -7272,6 +7416,10 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
         s_d3d.cur_texs[unit].fmt = format;   /* full byte: LN(0x20)/UN(0x40) kept */
         s_d3d.cur_texs[unit].pitch = tex->control3 & 0xFFFFu;
         s_d3d.cur_texs[unit].ctrl1 = tex->control1;
+        s_d3d.cur_texs[unit].address = tex->address;
+        s_d3d.cur_texs[unit].control0 = tex->control0;
+        s_d3d.cur_texs[unit].filter = tex->filter;
+        s_d3d.cur_texs[unit].border = tex->border_color;
         s_d3d.cur_texs[unit].cube  = (tex->format & 4) ? 1 : 0;
         s_d3d.cur_texs[unit].mips  = (tex->format >> 16) & 0xFFFFu;
         if (getenv("TEXFMTDBG")) { static u32 seen[64]; static int ns=0;
@@ -7487,6 +7635,8 @@ void rsx_d3d12_backend_shutdown(void)
         if (s_d3d.cmd_allocators[i]) s_d3d.cmd_allocators[i]->lpVtbl->Release(s_d3d.cmd_allocators[i]);
         if (s_d3d.render_targets[i]) s_d3d.render_targets[i]->lpVtbl->Release(s_d3d.render_targets[i]);
     }
+    if (s_d3d.vp_sampler_heap) { s_d3d.vp_sampler_heap->lpVtbl->Release(s_d3d.vp_sampler_heap); s_d3d.vp_sampler_heap = NULL; }
+    s_vp_sampler_table_count = 0;
     if (s_d3d.rtv_heap) s_d3d.rtv_heap->lpVtbl->Release(s_d3d.rtv_heap);
     if (s_d3d.swap_chain) s_d3d.swap_chain->lpVtbl->Release(s_d3d.swap_chain);
     if (s_d3d.cmd_queue) s_d3d.cmd_queue->lpVtbl->Release(s_d3d.cmd_queue);
