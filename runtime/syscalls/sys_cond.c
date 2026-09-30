@@ -163,7 +163,9 @@ int64_t sys_cond_wait(ppu_context* ctx)
     }
 
     extern int cellVdec_is_seq_active(void);
-    if ((lr == 0x00087E20U || stack_lr == 0x00087E20U) && !cellVdec_is_seq_active()) {
+    const int wa2_vpost_eos_wait = (lr == 0x00087E20U || stack_lr == 0x00087E20U);
+    const int wa2_vdisp_eos_wait = (lr == 0x0008692CU || stack_lr == 0x0008692CU);
+    if (wa2_vpost_eos_wait && !cellVdec_is_seq_active()) {
         uint32_t vpost = (uint32_t)ctx->gpr[31];
         if (vpost && vm_is_valid_addr(vpost + 0x8C)) {
             uint8_t* p = (uint8_t*)vm_to_host(vpost);
@@ -176,7 +178,7 @@ int64_t sys_cond_wait(ppu_context* ctx)
         return CELL_OK;
     }
 
-    if ((lr == 0x0008692CU || stack_lr == 0x0008692CU) && !cellVdec_is_seq_active()) {
+    if (wa2_vdisp_eos_wait && !cellVdec_is_seq_active()) {
         uint32_t vdisp = (uint32_t)ctx->gpr[31];
         if (vdisp && vm_is_valid_addr(vdisp + 0x38)) {
             uint8_t* p = (uint8_t*)vm_to_host(vdisp);
@@ -236,7 +238,35 @@ int64_t sys_cond_wait(ppu_context* ctx)
             uint64_t remaining = duration - elapsed;
             ms = remaining >= INFINITE ? INFINITE - 1 : (DWORD)remaining;
         }
+        /* The WA2 movie display/post queues can enter an infinite guest wait
+         * while VDEC is still active, then lose the final EOS wake.  Poll only
+         * these already-recognized waitsites so EndSeq can terminate the wait
+         * without changing normal LV2 condition-variable semantics. */
+        if ((wa2_vpost_eos_wait || wa2_vdisp_eos_wait) && (!timeout || ms > 10))
+            ms = 10;
         BOOL ok = SleepConditionVariableCS(&c->cv, &c->signal_lock, ms);
+        if (!ok && GetLastError() == ERROR_TIMEOUT && !waiter.signalled) {
+            if ((wa2_vpost_eos_wait || wa2_vdisp_eos_wait) && !cellVdec_is_seq_active()) {
+                if (wa2_vpost_eos_wait) {
+                    uint32_t vpost = (uint32_t)ctx->gpr[31];
+                    if (vpost && vm_is_valid_addr(vpost + 0x8D)) {
+                        uint8_t* p = (uint8_t*)vm_to_host(vpost);
+                        p[0x8C] = 1; p[0x8D] = 0;
+                    }
+                    fprintf(stderr, "[HLE] WA2 vpost EOS wake after EndSeq\n");
+                } else {
+                    uint32_t vdisp = (uint32_t)ctx->gpr[31];
+                    if (vdisp && vm_is_valid_addr(vdisp + 0x39)) {
+                        uint8_t* p = (uint8_t*)vm_to_host(vdisp);
+                        p[0x38] = 1; p[0x39] = 0;
+                    }
+                    fprintf(stderr, "[HLE] WA2 vdisp EOS wake after EndSeq\n");
+                }
+                result = CELL_OK;
+                break;
+            }
+            if (!timeout) continue;
+        }
         if (!ok && GetLastError() != ERROR_TIMEOUT && !waiter.signalled) {
             result = (int32_t)CELL_EFAULT; break;
         }
@@ -252,8 +282,39 @@ int64_t sys_cond_wait(ppu_context* ctx)
         }
     }
     while (!waiter.signalled) {
-        int rc = timeout ? pthread_cond_timedwait(&c->cv, &c->signal_lock, &deadline)
+        int rc;
+        if ((wa2_vpost_eos_wait || wa2_vdisp_eos_wait) && !timeout) {
+            struct timespec slice;
+            clock_gettime(CLOCK_REALTIME, &slice);
+            slice.tv_nsec += 10 * 1000 * 1000;
+            if (slice.tv_nsec >= 1000000000L) { slice.tv_sec++; slice.tv_nsec -= 1000000000L; }
+            rc = pthread_cond_timedwait(&c->cv, &c->signal_lock, &slice);
+        } else {
+            rc = timeout ? pthread_cond_timedwait(&c->cv, &c->signal_lock, &deadline)
                          : pthread_cond_wait(&c->cv, &c->signal_lock);
+        }
+        if (rc == ETIMEDOUT && !waiter.signalled &&
+            (wa2_vpost_eos_wait || wa2_vdisp_eos_wait) && !cellVdec_is_seq_active()) {
+            if (wa2_vpost_eos_wait) {
+                uint32_t vpost = (uint32_t)ctx->gpr[31];
+                if (vpost && vm_is_valid_addr(vpost + 0x8D)) {
+                    uint8_t* p = (uint8_t*)vm_to_host(vpost);
+                    p[0x8C] = 1; p[0x8D] = 0;
+                }
+                fprintf(stderr, "[HLE] WA2 vpost EOS wake after EndSeq\n");
+            } else {
+                uint32_t vdisp = (uint32_t)ctx->gpr[31];
+                if (vdisp && vm_is_valid_addr(vdisp + 0x39)) {
+                    uint8_t* p = (uint8_t*)vm_to_host(vdisp);
+                    p[0x38] = 1; p[0x39] = 0;
+                }
+                fprintf(stderr, "[HLE] WA2 vdisp EOS wake after EndSeq\n");
+            }
+            result = CELL_OK;
+            break;
+        }
+        if (rc == ETIMEDOUT && !timeout && (wa2_vpost_eos_wait || wa2_vdisp_eos_wait))
+            continue;
         if (rc && !waiter.signalled) {
             result = (int32_t)(rc == ETIMEDOUT ? CELL_ETIMEDOUT : CELL_EFAULT);
             break;
