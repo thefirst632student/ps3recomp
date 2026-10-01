@@ -2626,6 +2626,31 @@ u32 cellGcmResolveLocated(int local, u32 offset)
 {
     if (local)
         return s_config.localAddress + offset;
+
+    /* MAIN is not an ambiguous offset space: bit 31 / the object location
+     * explicitly says to translate through the RSX IO map.  Do not route a
+     * known-MAIN offset through cellGcmResolveOffset(), because that helper
+     * intentionally lets s_local_offset_page win when LOCAL and MAIN use the
+     * same numeric page.  WA2 hits exactly that collision at IO page 1:
+     * 0x80100008 belongs to the mapping created for EA 0x40800000, while the
+     * old resolver returned localAddress + 0x00100008 (0xC0100008). */
+    {
+        u32 io_ea = cellGcmResolveIO(offset);
+        if (io_ea) {
+            u32 guessed = cellGcmResolveOffset(offset);
+            if (guessed != io_ea) {
+                static u32 s_loc_collision_logs = 0;
+                if (s_loc_collision_logs++ < 16)
+                    fprintf(stderr,
+                            "[GCM-LOC-RESOLVE] MAIN off=0x%08X io=0x%08X old=0x%08X -> IO%c",
+                            offset, io_ea, guessed, 10);
+            }
+            return io_ea;
+        }
+    }
+
+    /* Preserve the legacy fallback for genuinely unmapped callers.  The
+     * important difference is that an existing MAIN IO mapping always wins. */
     return cellGcmResolveOffset(offset);
 }
 
