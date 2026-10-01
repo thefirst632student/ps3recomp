@@ -2778,21 +2778,39 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      *             uploaded 704x512 GPU texture.
      * This is diagnostic-only and intentionally limited to FP 0x01BF9101. */
     if ((fp_addr & ~1u) == 0x01BF9100u) {
-        char* rp = strstr(hlsl, "return r[0];");
+        /* The decompiler returns a PSOut struct, so the stable export anchor is
+         * the _po.c0 assignment rather than an old direct `return r[0]` form.
+         * Replace exactly that assignment and leave the existing `return _po;`
+         * intact.  This makes the probe self-verifying: if the rewrite lands,
+         * WARN2_DIAG_PS is always printed before compilation. */
+        char* rp = strstr(hlsl, "_po.c0 = ");
         if (rp) {
-            static const char rep[] =
-                "if (input.position.x < 522.0f) return float4(saturate(input.tc0.xy), 0.0f, 1.0f);\n"
-                "    if (input.position.x < 757.0f) return rsx_tex[0].SampleLevel(rsx_samp[0], input.tc0.xy, 0.0f);\n"
-                "    return rsx_tex[0].SampleLevel(rsx_samp[0], float2(0.1853693182f, 0.2939453125f), 0.0f);";
-            const size_t oldlen = strlen("return r[0];");
-            const size_t newlen = sizeof(rep) - 1u;
-            const size_t used = strlen(hlsl) + 1u;
-            const size_t tail = used - (size_t)(rp - hlsl) - oldlen;
-            if (used + newlen - oldlen <= sizeof(hlsl)) {
-                memmove(rp + newlen, rp + oldlen, tail);
-                memcpy(rp, rep, newlen);
-                fprintf(stderr, "[WARN2_DIAG_PS] tc0/sample/fixed-uv three-band shader active%c", 10);
+            char* semi = strchr(rp, ';');
+            if (semi) {
+                static const char rep[] =
+                    "_po.c0 = (input.position.x < 522.0f) ? "
+                    "float4(saturate(input.tc0.xy), 0.0f, 1.0f) : "
+                    "((input.position.x < 757.0f) ? "
+                    "rsx_tex[0].SampleLevel(rsx_samp[0], input.tc0.xy, 0.0f) : "
+                    "rsx_tex[0].SampleLevel(rsx_samp[0], "
+                    "float2(0.1853693182f, 0.2939453125f), 0.0f))";
+                const size_t oldlen = (size_t)(semi - rp);
+                const size_t newlen = sizeof(rep) - 1u;
+                const size_t tail = strlen(semi) + 1u;
+                if ((size_t)(rp - hlsl) + newlen + tail <= sizeof(hlsl)) {
+                    memmove(rp + newlen, semi, tail);
+                    memcpy(rp, rep, newlen);
+                    fprintf(stderr,
+                            "[WARN2_DIAG_PS] export rewrite active old=%u new=%u%c",
+                            (unsigned)oldlen, (unsigned)newlen, 10);
+                } else {
+                    fprintf(stderr, "[WARN2_DIAG_PS] export rewrite too large%c", 10);
+                }
+            } else {
+                fprintf(stderr, "[WARN2_DIAG_PS] export semicolon not found%c", 10);
             }
+        } else {
+            fprintf(stderr, "[WARN2_DIAG_PS] export anchor not found%c", 10);
         }
     }
 
