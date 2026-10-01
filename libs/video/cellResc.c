@@ -9,7 +9,6 @@
 #include "cellResc.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: translate + byte-swap */
 #include "../guest_struct.h"                /* guest_struct_load: BE struct word-swap */
-#include "ps3emu/guest_call.h"   /* ps3_invoke_guest: handlers are guest OPDs */
 #include <stdio.h>
 #include <string.h>
 
@@ -22,15 +21,7 @@ static CellRescInitConfig s_config;
 static u32 s_display_mode = CELL_RESC_1280x720;
 static CellRescSrc s_src[8]; /* up to 8 color buffers */
 static CellRescDsts s_dsts[4]; /* one per display mode */
-/* Guest OPD addresses, not host function pointers: what a title passes is a
- * guest function descriptor, and calling it as a host pointer is a crash
- * waiting for the first title that sets one. Invoked through ps3_invoke_guest,
- * the same way cellGcmSetFlipHandler's is. */
-static u32 s_flip_handler_opd = 0;
-static u32 s_vblank_handler_opd = 0;
 static u32 s_flip_target = 0;   /* display buffer the next convert-and-flip presents */
-static s32 s_flip_status = 0;
-static u64 s_last_flip_time = 0;
 static float s_aspect_h = 1.0f;
 static float s_aspect_v = 1.0f;
 static float s_pal_ratio = 0.5f;
@@ -52,11 +43,7 @@ s32 cellRescInit(const CellRescInitConfig* initConfig)
     guest_struct_load(&s_config, GUEST_EA(initConfig), sizeof(s_config));
     memset(s_src, 0, sizeof(s_src));
     memset(s_dsts, 0, sizeof(s_dsts));
-    s_flip_handler_opd = 0;
-    s_vblank_handler_opd = 0;
     s_flip_target = 0;
-    s_flip_status = 0;
-    s_last_flip_time = 0;
     s_aspect_h = 1.0f;
     s_aspect_v = 1.0f;
     s_initialized = 1;
@@ -270,7 +257,7 @@ s32 cellRescSetConvertAndFlip(void* context, s32 index)
      * rather than a plain scale. */
     extern s32 cellGcmSetDisplayBuffer(u32 bufferId, u32 offset, u32 pitch,
                                        u32 width, u32 height);
-    extern s32 cellGcmSetFlipCommand(u32 bufferId);
+    extern s32 cellGcmSetFlipCommandForResc(u32 bufferId);
     extern u32 cellGcm_display_buffer_count(void);
     u32 nbuf = cellGcm_display_buffer_count();
 
@@ -294,25 +281,21 @@ s32 cellRescSetConvertAndFlip(void* context, s32 index)
     }
 
     if (nbuf) {
-        cellGcmSetFlipCommand(s_flip_target % nbuf);
+        /* A RESC flip handler is a completion notification.  Do not use the
+         * generic GCM path's legacy request-time callback: WA2's registered
+         * handler (OPD 0x00140C60 -> func_00070E24) sets 0x003F3B8C, and the
+         * render loop waits on/clears that byte before submitting the next
+         * frame.  Signalling it here makes the wait a no-op and allows the
+         * guest to queue multiple frames before the previous one is actually
+         * presented. */
+        cellGcmSetFlipCommandForResc(s_flip_target % nbuf);
         s_flip_target = (u32)((s_flip_target + 1) % nbuf);
     }
-
-    s_flip_status = 0;      /* flip complete */
-    s_last_flip_time++;
 
     { static int n = 0;
       if (n++ < 8)
           printf("[cellResc] SetConvertAndFlip(src=%d) -> flip, %u display buffer(s)\n",
                  index, nbuf); }
-
-    if (s_flip_handler_opd)
-        ps3_invoke_guest(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
-
-    /* WA2: Also ensure the flip completion flag is set in guest memory */
-    if (vm_base) {
-        vm_base[0x003F3B8C] = 1;
-    }
 
     return CELL_OK;
 }
@@ -328,8 +311,7 @@ s32 cellRescSetWaitFlip(void* context)
 s32 cellRescSetFlipHandler(void (*handler)(u32))
 {
     extern void cellGcmSetFlipHandler(void (*)(u32));
-    s_flip_handler_opd = (u32)(uintptr_t)handler;
-    printf("[cellResc] SetFlipHandler(opd=0x%08X)\n", s_flip_handler_opd);
+    printf("[cellResc] SetFlipHandler(opd=0x%08X)\n", (u32)(uintptr_t)handler);
     cellGcmSetFlipHandler(handler);
     return CELL_OK;
 }
@@ -337,8 +319,7 @@ s32 cellRescSetFlipHandler(void (*handler)(u32))
 s32 cellRescSetVBlankHandler(void (*handler)(u32))
 {
     extern void cellGcmSetVBlankHandler(void (*)(u32));
-    s_vblank_handler_opd = (u32)(uintptr_t)handler;
-    printf("[cellResc] SetVBlankHandler(opd=0x%08X)\n", s_vblank_handler_opd);
+    printf("[cellResc] SetVBlankHandler(opd=0x%08X)\n", (u32)(uintptr_t)handler);
     cellGcmSetVBlankHandler(handler);
     return CELL_OK;
 }
@@ -354,31 +335,24 @@ s32 cellRescGetDisplayMode(u32* displayMode)
 
 s32 cellRescGetLastFlipTime(u64* time)
 {
+    extern u64 cellGcmGetLastFlipTime(void);
     if (!time)
         return (s32)CELL_RESC_ERROR_BAD_ARGUMENT;
 
-    vm_write64((uint32_t)(uintptr_t)time, s_last_flip_time);
+    vm_write64((uint32_t)(uintptr_t)time, cellGcmGetLastFlipTime());
     return CELL_OK;
 }
 
 void cellRescResetFlipStatus(void)
 {
-    s_flip_status = 1; /* waiting for next flip */
+    extern void cellGcmResetFlipStatus(void);
+    cellGcmResetFlipStatus();
 }
 
 s32 cellRescGetFlipStatus(void)
 {
-    /* Auto-complete pending flips when polled, so games don't stall
-     * waiting for events in the null renderer. */
-    if (s_flip_status == 1) {
-        s_flip_status = 0;
-        s_last_flip_time++;
-        if (s_flip_handler_opd)
-            ps3_invoke_guest(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
-        if (s_vblank_handler_opd)
-            ps3_invoke_guest(s_vblank_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
-    }
-    return s_flip_status;
+    extern u32 cellGcmGetFlipStatus(void);
+    return (s32)cellGcmGetFlipStatus();
 }
 
 s32 cellRescSetPalInterpolateDropFlexRatio(float ratio)

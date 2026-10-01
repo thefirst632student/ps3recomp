@@ -190,7 +190,12 @@ int cellGcm_take_flip_pending(void)
     return take;
 }
 
-static s32 cellGcmSetFlipCommandImpl(u32 bufferId, int from_fifo);
+static s32 cellGcmSetFlipCommandImplEx(u32 bufferId, int from_fifo,
+                                       int suppress_request_callback);
+static s32 cellGcmSetFlipCommandImpl(u32 bufferId, int from_fifo)
+{
+    return cellGcmSetFlipCommandImplEx(bufferId, from_fifo, 0);
+}
 
 static u32  s_debug_level = CELL_GCM_DEBUG_LEVEL0;
 
@@ -2091,7 +2096,8 @@ u32 cellGcm_display_buffer_count(void)
     return n;
 }
 
-static s32 cellGcmSetFlipCommandImpl(u32 bufferId, int from_fifo)
+static s32 cellGcmSetFlipCommandImplEx(u32 bufferId, int from_fifo,
+                                       int suppress_request_callback)
 {
     /* GCM_FLIPCOUNT=1: every flip, with a timestamp. FLIP_DBG caps at 20 lines,
      * which answers "did it ever flip?" and not "is it still flipping, and how
@@ -2179,7 +2185,8 @@ static s32 cellGcmSetFlipCommandImpl(u32 bufferId, int from_fifo)
      * handler against half-built state. Tokyo Jungle faults that way, in
      * func_001F2D3C, dereferencing a singleton it has not constructed yet.
      * GCM_FLIPCB_ONTICK=1 leaves the callback to the tick alone. */
-    if (s_flip_handler_opd && g_ps3_guest_caller && !gcm_flipcb_on_tick_only())
+    if (!suppress_request_callback && s_flip_handler_opd && g_ps3_guest_caller &&
+        !gcm_flipcb_on_tick_only())
         g_ps3_guest_caller(s_flip_handler_opd, 0, 0, 0, 0, 0, 0, 0, 0);  /* head 0 = primary display */
 
     return CELL_OK;
@@ -2188,6 +2195,18 @@ static s32 cellGcmSetFlipCommandImpl(u32 bufferId, int from_fifo)
 s32 cellGcmSetFlipCommand(u32 bufferId)
 {
     return cellGcmSetFlipCommandImpl(bufferId, 0);
+}
+
+/* RESC owns a completion callback, not a submission callback.  Keep the
+ * legacy early-callback behaviour for direct cellGcm callers, but let RESC
+ * explicitly opt out so its handler is delivered exactly once by
+ * cellGcmTickFlip()/ppu_gcm_pump when the flip completes.  White Album 2's
+ * RESC handler sets the guest frame-completion byte that gates submission of
+ * the next frame; firing it here would defeat that fence and let the producer
+ * run several frames ahead of the FIFO/present path. */
+s32 cellGcmSetFlipCommandForResc(u32 bufferId)
+{
+    return cellGcmSetFlipCommandImplEx(bufferId, 0, 1);
 }
 
 /* cellGcmSetFlip(context, buffer_id) — immediate flip request. PSL1GHT's
