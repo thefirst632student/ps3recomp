@@ -2575,54 +2575,6 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             logo_fp_dumped = 1;
         }
     }
-    /* WA2 logo fragment-stage A/B/C/D/E probe.  The large logo texture has a
-     * CPU/GPU-verified bright texel.  Overlay five tiny diagnostic boxes while
-     * leaving the rest of the shader untouched:
-     *   A: constant magenta            -> PS/color-write/RT path
-     *   B: Texture.Load(bright texel)  -> SRV descriptor/resource visibility
-     *   C: SampleLevel(fixed bright UV)-> sampler state
-     *   D: visualize interpolated tc0  -> VS->PS interpolator
-     *   E: normal SampleLevel(tc0) at the screen pixel mapping to the known
-     *      bright texel                -> complete real sampling path
-     * The framebuffer readback below logs the center pixel of each box, so the
-     * result is machine-readable and does not depend on inspecting a screenshot. */
-    if ((fp_addr & ~1u) == 0x01BF9100u) {
-        static int logo_ps_probe_injected = 0;
-        const char* anchor = "float4 main(PSInput input) : SV_TARGET {\n";
-        char* body = strstr(hlsl, anchor);
-        if (body) {
-            body += strlen(anchor);
-            const u32 probe_x = 130u, probe_y = 150u;
-            const u32 sx = 288u + probe_x;
-            const u32 sy = 64u  + probe_y;
-            char probe[2048];
-            int plen = snprintf(probe, sizeof probe,
-                "    if (input.position.x >= 300.0 && input.position.x < 316.0 && input.position.y >= 80.0 && input.position.y < 96.0) return float4(1.0,0.0,1.0,1.0);\n"
-                "    if (input.position.x >= 320.0 && input.position.x < 336.0 && input.position.y >= 80.0 && input.position.y < 96.0) return rsx_tex[0].Load(int3(%u,%u,0));\n"
-                "    if (input.position.x >= 340.0 && input.position.x < 356.0 && input.position.y >= 80.0 && input.position.y < 96.0) return rsx_tex[0].SampleLevel(rsx_samp[0], float2(%.9ff,%.9ff), 0.0);\n"
-                "    if (input.position.x >= 360.0 && input.position.x < 376.0 && input.position.y >= 80.0 && input.position.y < 96.0) return float4(saturate(input.tc0.x),saturate(input.tc0.y),0.0,1.0);\n"
-                "    if (input.position.x >= %u.0 && input.position.x < %u.0 && input.position.y >= %u.0 && input.position.y < %u.0) return rsx_tex[0].SampleLevel(rsx_samp[0], input.tc0.xy, 0.0);\n",
-                probe_x, probe_y,
-                ((double)probe_x + 0.5) / 704.0,
-                ((double)probe_y + 0.5) / 512.0,
-                sx >= 4u ? sx - 4u : 0u, sx + 5u,
-                sy >= 4u ? sy - 4u : 0u, sy + 5u);
-            if (plen > 0 && (size_t)plen < sizeof probe) {
-                size_t used = strlen(hlsl);
-                size_t tail = strlen(body) + 1u;
-                if (used + (size_t)plen + 1u < sizeof hlsl) {
-                    memmove(body + plen, body, tail);
-                    memcpy(body, probe, (size_t)plen);
-                    if (!logo_ps_probe_injected++)
-                        fprintf(stderr,
-                            "[LOGO_PS_PROBE] injected A=const B=Load(%u,%u) C=fixedUV D=tc0 E=tc0@screen(%u,%u) expected=(%u,%u,%u,%u)%c",
-                            probe_x, probe_y, sx, sy,
-                            255u, 255u, 255u, 255u, 10);
-                }
-            }
-        }
-    }
-
     /* FP_LIST=1: every program the title actually compiles, with its size. A
      * fragment program that hangs the GPU shows up here as an implausible
      * instruction count long before it shows up as a TDR. */
@@ -2751,42 +2703,6 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
                 fprintf(stderr, "[FPLOD0] fp=0x%08X explicit_level0_samples=%d%c",
                         fp_addr, lod0_samples, 10);
         }
-    }
-
-    /* WA2 logo late-stage register probe.  Unlike A-E above, these tests are
-     * inserted immediately before the decompiler's final export, so every guest
-     * fragment instruction has already executed:
-     *   F: return r0          -> value in the fp32 color register after the body
-     *   G: return h0          -> value in the fp16 color register after the body
-     *   H: return COLOR0      -> interpolated vertex colour actually seen by PS
-     *   I: direct LOD0 sample -> control value after the body, bypassing export
-     * This separates TEX/register execution from final r0/h0 export selection. */
-    if ((fp_addr & ~1u) == 0x01BF9100u) {
-        const char* tail_anchor = "    float4 _o = ";
-        char* tail = strstr(hlsl, tail_anchor);
-        if (tail) {
-            static const char late_probe[] =
-                "    if (input.position.x >= 380.0 && input.position.x < 396.0 && input.position.y >= 80.0 && input.position.y < 96.0) return r[0];\n"
-                "    if (input.position.x >= 400.0 && input.position.x < 416.0 && input.position.y >= 80.0 && input.position.y < 96.0) return h[0];\n"
-                "    if (input.position.x >= 420.0 && input.position.x < 436.0 && input.position.y >= 80.0 && input.position.y < 96.0) return input.col0;\n"
-                "    if (input.position.x >= 440.0 && input.position.x < 456.0 && input.position.y >= 80.0 && input.position.y < 96.0) return rsx_tex[0].SampleLevel(rsx_samp[0], input.tc0.xy, 0.0);\n";
-            const size_t add = strlen(late_probe);
-            const size_t used = strlen(hlsl) + 1u;
-            const size_t off_tail = (size_t)(tail - hlsl);
-            if (used + add < sizeof(hlsl)) {
-                memmove(tail + add, tail, used - off_tail);
-                memcpy(tail, late_probe, add);
-                static int late_once = 0;
-                if (!late_once++)
-                    fprintf(stderr, "[LOGO_FP_LATE] injected F=r0 G=h0 H=col0 I=SampleLevel(tc0,0)%c", 10);
-            }
-        }
-
-        static int hlsl_dumped = 0;
-        if (!hlsl_dumped++) {
-            fprintf(stderr, "[LOGO_FP_HLSL_BEGIN]%c%s[LOGO_FP_HLSL_END]%c", 10, hlsl, 10);
-        }
-
     }
 
     /* FP_IDCOLOR=1: give every fragment program a distinct flat colour derived
@@ -5993,36 +5909,6 @@ skip_dump_consider: ;
                 }
             }
             const u8* qc=(const u8*)_mp + (u64)360*s_d3d.readback_pitch + (u64)640*4u;
-            {
-                const u32 ex = 288u + 130u;
-                const u32 ey = 64u  + 150u;
-                const u32 px[9] = {308u, 328u, 348u, 368u, ex, 388u, 408u, 428u, 448u};
-                const u32 py[9] = { 88u,  88u,  88u,  88u, ey,  88u,  88u,  88u,  88u};
-                u8 pv[9][4] = {{0}};
-                for (int pi = 0; pi < 9; pi++) {
-                    if (px[pi] < s_d3d.width && py[pi] < s_d3d.height) {
-                        const u8* pq = (const u8*)_mp +
-                            (u64)py[pi] * s_d3d.readback_pitch + (u64)px[pi] * 4u;
-                        pv[pi][0]=pq[0]; pv[pi][1]=pq[1]; pv[pi][2]=pq[2]; pv[pi][3]=pq[3];
-                    }
-                }
-                fprintf(stderr,
-                    "[LOGO_PS_PROBE] A_const=(%u,%u,%u,%u) B_load=(%u,%u,%u,%u) "
-                    "C_fixedSample=(%u,%u,%u,%u) D_tc0=(%u,%u,%u,%u) "
-                    "E_realSample=(%u,%u,%u,%u) E_xy=(%u,%u) expected=(%u,%u,%u,%u) "
-                    "F_r0=(%u,%u,%u,%u) G_h0=(%u,%u,%u,%u) "
-                    "H_col0=(%u,%u,%u,%u) I_postSample=(%u,%u,%u,%u)%c",
-                    pv[0][0],pv[0][1],pv[0][2],pv[0][3],
-                    pv[1][0],pv[1][1],pv[1][2],pv[1][3],
-                    pv[2][0],pv[2][1],pv[2][2],pv[2][3],
-                    pv[3][0],pv[3][1],pv[3][2],pv[3][3],
-                    pv[4][0],pv[4][1],pv[4][2],pv[4][3], ex, ey,
-                    255u,255u,255u,255u,
-                    pv[5][0],pv[5][1],pv[5][2],pv[5][3],
-                    pv[6][0],pv[6][1],pv[6][2],pv[6][3],
-                    pv[7][0],pv[7][1],pv[7][2],pv[7][3],
-                    pv[8][0],pv[8][1],pv[8][2],pv[8][3],10);
-            }
             fprintf(stderr,
                 "[LOGO_FB] frame=%u rgb_nz=%u/%u alpha_nz=%u/%u any_nz=%u "
                 "bbox_rgb=%u/%u max=(%u,%u,%u,%u) center=(%u,%u,%u,%u)%c",
@@ -7105,6 +6991,107 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                (unsigned long long)s_total, primitive, first, count);
     }
     s_total++;
+
+    /* WA2 boot-stage draw signature probe (observational only).
+     * The earlier coloured shader probes turned out to target warning #2, not
+     * necessarily the two static logos.  Record each distinct draw/content
+     * signature without modifying any GPU state or pixel output.  The texture
+     * fingerprint is sampled across level 0, so reuse of the same RSX offset
+     * for a later boot image is still detected.  Raw attrib3 bytes distinguish
+     * "guest really wrote black" from a host vertex-conversion bug. */
+    if (s_d3d.current_rsx_state && vm_base) {
+        typedef struct {
+            u32 fp, traw, tw, th, tfmt, tcs;
+            u32 prim, first, count;
+            u32 a3fmt, a3stride, a3freq;
+            u32 cword, posx_bits, posy_bits;
+        } BootSig;
+        static BootSig seen[160];
+        static u32 seen_n = 0;
+        const rsx_state* bst = s_d3d.current_rsx_state;
+        const rsx_vertex_attrib* a3 = &bst->vertex_attribs[3];
+        u32 tcs = 0;
+        if (s_d3d.cur_texs[0].set && s_d3d.cur_texs[0].off &&
+            s_d3d.cur_texs[0].off < 0xE0000000u &&
+            s_d3d.cur_texs[0].w && s_d3d.cur_texs[0].h) {
+            rsx_tex_layout bl;
+            rsx_texture_layout_pitched(s_d3d.cur_texs[0].fmt,
+                s_d3d.cur_texs[0].w, s_d3d.cur_texs[0].h,
+                s_d3d.cur_texs[0].pitch, &bl);
+            u32 bytes = bl.row_bytes * bl.rows;
+            if (bytes && s_d3d.cur_texs[0].off + bytes >= s_d3d.cur_texs[0].off &&
+                s_d3d.cur_texs[0].off + bytes < 0xE0000000u) {
+                const u8* tp = vm_base + s_d3d.cur_texs[0].off;
+                u32 step = bytes / 257u;
+                if (!step) step = 1u;
+                u32 h = 2166136261u;
+                for (u32 bi = 0; bi < bytes; bi += step) {
+                    h ^= tp[bi]; h *= 16777619u;
+                }
+                h ^= tp[bytes - 1u]; h *= 16777619u;
+                tcs = h;
+            }
+        }
+
+        u32 cword = 0;
+        u8 rawc[4] = {0,0,0,0};
+        u32 cea = 0;
+        if (a3->enabled && a3->stride) {
+            u32 ei = first;
+            if (a3->frequency > 1u) {
+                ei = (bst->frequency_divider_op & (1u << 3))
+                    ? (first % a3->frequency) : (first / a3->frequency);
+            }
+            u32 aoff = (a3->offset & 0x7FFFFFFFu) + ei * a3->stride;
+            extern u32 cellGcmResolveLocated(int local, u32 offset);
+            cea = (a3->offset & 0x80000000u)
+                ? cellGcmResolveLocated(0, aoff)
+                : cellGcmResolveLocated(1, aoff);
+            if (cea && cea + 4u > cea && cea + 4u < 0xE0000000u) {
+                memcpy(rawc, vm_base + cea, 4);
+                cword = ((u32)rawc[0] << 24) | ((u32)rawc[1] << 16) |
+                        ((u32)rawc[2] << 8) | (u32)rawc[3];
+            }
+        }
+
+        VPSlot bv[16];
+        read_vp_vertex(bst, first, bv);
+        u32 posx_bits = 0, posy_bits = 0;
+        memcpy(&posx_bits, &bv[0].v[0], 4);
+        memcpy(&posy_bits, &bv[0].v[1], 4);
+        BootSig bs = {
+            bst->shader_program,
+            s_d3d.cur_texs[0].raw, s_d3d.cur_texs[0].w,
+            s_d3d.cur_texs[0].h, s_d3d.cur_texs[0].fmt, tcs,
+            primitive, first, count,
+            a3->format, a3->stride, a3->frequency, cword,
+            posx_bits, posy_bits
+        };
+        int known = 0;
+        for (u32 si = 0; si < seen_n; si++) {
+            if (!memcmp(&seen[si], &bs, sizeof(bs))) { known = 1; break; }
+        }
+        if (!known && seen_n < (u32)(sizeof(seen) / sizeof(seen[0]))) {
+            seen[seen_n++] = bs;
+            fprintf(stderr,
+                "[BOOT-DRAW] #%llu fp=0x%08X tex0=0x%08X %ux%u fmt=0x%02X tcs=%08X "
+                "prim=%u first=%u count=%u a3(en=%d type=%u size=%u stride=%u "
+                "off=0x%08X freq=%u fmt=0x%08X ea=0x%08X raw=%02X%02X%02X%02X) "
+                "col=(%.4g %.4g %.4g %.4g) pos=(%.4g %.4g %.4g %.4g) "
+                "uv=(%.4g %.4g %.4g %.4g)%c",
+                (unsigned long long)s_total,
+                bst->shader_program,
+                s_d3d.cur_texs[0].raw, s_d3d.cur_texs[0].w,
+                s_d3d.cur_texs[0].h, s_d3d.cur_texs[0].fmt, tcs,
+                primitive, first, count,
+                a3->enabled, a3->type, a3->size, a3->stride,
+                a3->offset, a3->frequency, a3->format, cea,
+                rawc[0], rawc[1], rawc[2], rawc[3],
+                bv[3].v[0], bv[3].v[1], bv[3].v[2], bv[3].v[3],
+                bv[0].v[0], bv[0].v[1], bv[0].v[2], bv[0].v[3],
+                bv[8].v[0], bv[8].v[1], bv[8].v[2], bv[8].v[3], 10);
+        }
+    }
 
     /* WA2 logo root-cause probe: inspect the actual post-fetch attributes for
      * the two characteristic boot-logo draws.  In particular attrib3 is the
