@@ -2132,6 +2132,34 @@ static int vp_get_vs(const rsx_state* st)
     static char hlsl[262144];
     int ni = rsx_vp_decompile(vuc, vlen, hlsl, sizeof hlsl);
     if (ni <= 0) return -1;
+
+    /* WA2 warning-2 probe: dump only the colour data-flow of the VP that is
+     * paired with the 704x512 warning texture / FP 0x01BF9101.  Observational
+     * only; no shader text or render state is modified. */
+    if (((st->shader_program & ~1u) == 0x01BF9100u) &&
+        s_d3d.cur_texs[0].raw == 0x01CA8480u) {
+        static int warn2_vp_dumped = 0;
+        if (!warn2_vp_dumped) {
+            warn2_vp_dumped = 1;
+            fprintf(stderr, "[WARN2_VP] instrs=%d hash=0x%08X start=%u\n",
+                    ni, hash, st->transform_program_start);
+            const char* line = hlsl;
+            while (*line) {
+                const char* nl = strchr(line, '\n');
+                size_t len = nl ? (size_t)(nl - line) : strlen(line);
+                if (len) {
+                    char tmp[768];
+                    size_t n = len < sizeof(tmp)-1 ? len : sizeof(tmp)-1;
+                    memcpy(tmp, line, n); tmp[n] = 0;
+                    if (strstr(tmp, "v[3]") || strstr(tmp, "o[1]") ||
+                        strstr(tmp, "Out.col0") || strstr(tmp, "input.a3"))
+                        fprintf(stderr, "[WARN2_VP] %s\n", tmp);
+                }
+                if (!nl) break;
+                line = nl + 1;
+            }
+        }
+    }
     if (getenv("VP_DUMP")) { static int _d=0; if (_d++ < 4) {
         FILE* f = fopen("vp2_dump.hlsl", _d==1 ? "w" : "a");
         if (f) { fprintf(f, "/* per-draw VS hash pending, %d instrs */%s%s", ni, hlsl, "\n"); fclose(f); } } }
@@ -6991,6 +7019,50 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                (unsigned long long)s_total, primitive, first, count);
     }
     s_total++;
+
+    /* WA2 warning-2 raw colour probe.  The 704x512 warning uses FP
+     * 0x01BF9101, which samples tex0 and multiplies by COLOR0.  Log the exact
+     * guest bytes feeding ATTR3 over several frames, plus both LOCAL/MAIN
+     * views, so a black COLOR0 can be attributed to guest data, location
+     * resolution, or VP swizzle rather than guessed from the final image. */
+    if (s_d3d.current_rsx_state &&
+        ((s_d3d.current_rsx_state->shader_program & ~1u) == 0x01BF9100u) &&
+        primitive == RSX_PRIMITIVE_TRIANGLE_STRIP && first == 10u && count == 4u &&
+        s_d3d.cur_texs[0].raw == 0x01CA8480u) {
+        static int warn2_seen = 0;
+        if (warn2_seen < 24) {
+            const rsx_state* st = s_d3d.current_rsx_state;
+            const rsx_vertex_attrib* a = &st->vertex_attribs[3];
+            extern uint8_t* vm_base;
+            extern u32 cellGcmResolveLocated(int, u32);
+            fprintf(stderr,
+                    "[WARN2_COLOR] n=%d frame=%llu a3 off=0x%08X stride=%u size=%u type=%u const=(%.6g %.6g %.6g %.6g)\n",
+                    warn2_seen, (unsigned long long)s_d3d.frame_count, a->offset,
+                    a->stride, a->size, a->type,
+                    st->vertex_data4f[3][0], st->vertex_data4f[3][1],
+                    st->vertex_data4f[3][2], st->vertex_data4f[3][3]);
+            for (u32 k = 0; k < 4; k++) {
+                u32 vi = first + k;
+                u32 off = (a->offset & 0x7FFFFFFFu) + vi * a->stride;
+                u32 ea_sel = (a->offset & 0x80000000u)
+                    ? cellGcmResolveLocated(0, off)
+                    : cellGcmResolveLocated(1, off);
+                u32 ea_l = cellGcmResolveLocated(1, off);
+                u32 ea_m = cellGcmResolveLocated(0, off);
+                float dec[4]; rsx_fetch_attrib(st, 3, vi, dec);
+                const u8* q = vm_base + ea_sel;
+                const u8* ql = vm_base + ea_l;
+                const u8* qm = vm_base + ea_m;
+                fprintf(stderr,
+                        "[WARN2_COLOR] v%u off=0x%08X sel=0x%08X raw=%02X%02X%02X%02X dec=(%.6g %.6g %.6g %.6g) LOCAL@%08X=%02X%02X%02X%02X MAIN@%08X=%02X%02X%02X%02X\n",
+                        vi, off, ea_sel, q[0],q[1],q[2],q[3],
+                        dec[0],dec[1],dec[2],dec[3],
+                        ea_l, ql[0],ql[1],ql[2],ql[3],
+                        ea_m, qm[0],qm[1],qm[2],qm[3]);
+            }
+            warn2_seen++;
+        }
+    }
 
     /* WA2 logo root-cause probe: inspect the actual post-fetch attributes for
      * the two characteristic boot-logo draws.  In particular attrib3 is the
