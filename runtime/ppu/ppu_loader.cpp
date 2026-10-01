@@ -1385,22 +1385,24 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
      * a struct field (e.g. FMOD's overlay descriptor source at 0x94F680). */
     { static uint32_t s_ww = 0xFFFFFFFFu;
       if (s_ww == 0xFFFFFFFFu) { const char* e = getenv("PPU_WWATCH");
-                                 /* base 16, not 0: the variable is documented as <hexEA>
-                                  * and everyone writes it bare. Under base 0 "10708A14"
-                                  * parses as DECIMAL and stops at the 'A', arming the
-                                  * watch on a different address entirely -- which then
-                                  * reports "nothing writes this" for an address that is
-                                  * written constantly. A 0x prefix still works. */
-                                 s_ww = e ? (uint32_t)strtoul(e,0,16) : 0;
-                                 ww_arm_inline_window(s_ww); }
+                                 /* Warning-2 diagnostic build: if no explicit watch is
+                                  * supplied, arm the first LOCAL vertex-ring page used
+                                  * by the boot composition. This removes shell/env setup
+                                  * from the experiment; an explicit PPU_WWATCH still wins. */
+                                 s_ww = e ? (uint32_t)strtoul(e,0,16) : 0xC00000F0u;
+                                 ww_arm_inline_window(s_ww);
+                                 fprintf(stderr, "[WARN2_WW_ARM] base=0x%08X%s\n",
+                                         s_ww, e ? " (env)" : " (probe default)"); }
       /* PPU_WWATCH_LEN=<bytes>: widen the watched span. 0x20 is fine for a single
        * field but useless for "who fills this struct" -- the SPURS instance is
        * 0x1000+ and a 32-byte window reported "nothing writes it" twice while
        * the writes were landing at higher offsets. */
       static uint32_t s_wwlen = 0;
       if (!s_wwlen) { const char* e2 = getenv("PPU_WWATCH_LEN");
-                      s_wwlen = e2 ? (uint32_t)strtoul(e2,0,0) : 0x20;
-                      if (s_wwlen < 0x20) s_wwlen = 0x20; }
+                      s_wwlen = e2 ? (uint32_t)strtoul(e2,0,0) : 0x380u;
+                      if (s_wwlen < 0x20) s_wwlen = 0x20;
+                      fprintf(stderr, "[WARN2_WW_ARM] len=0x%X%s\n",
+                              s_wwlen, e2 ? " (env)" : " (probe default)"); }
       if (s_ww && a >= (s_ww & ~15u) && a < (s_ww & ~15u) + s_wwlen) {
           /* PPU_WW_GUARD=1: once the watched word is first SET, page-guard it.
            * The store watch only sees lifted guest stores -- a host-side memset
@@ -1428,7 +1430,9 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
           static long _n = 0;
           static long _cap = -1;
           if (_cap < 0) { const char* e = getenv("PPU_WWATCH_MAX");
-                          _cap = e ? atol(e) : 64; }
+                          _cap = e ? atol(e) : 0;
+                          fprintf(stderr, "[WARN2_WW_ARM] cap=%ld%s\n",
+                                  _cap, e ? " (env)" : " (probe default/unlimited)"); }
           long _i = ++_n;
           if (_cap == 0 || _i <= _cap) {
               fprintf(stderr, "[ww] 0x%08X <- 0x%X (w%d) guest-fn=0x%08X\n",
