@@ -2766,6 +2766,36 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         }
     }
 
+    /* WA2 warning-2 one-run fragment-link diagnostic.  The ordinary probes
+     * have already proven that the guest texture contains colour, the GPU copy
+     * contains the same colour, the quad covers exactly 704x512 samples, and
+     * COLOR0 reaches white after the guest fade.  Split only this two-op boot
+     * FP into three screen-space bands so one readback distinguishes the last
+     * unresolved stages without relying on visual inspection:
+     *   x < 522: expose interpolated TEXCOORD0 directly;
+     *   522..756: sample normally with TEXCOORD0;
+     *   x >= 757: sample a fixed texel (130,150), already observed white in the
+     *             uploaded 704x512 GPU texture.
+     * This is diagnostic-only and intentionally limited to FP 0x01BF9101. */
+    if ((fp_addr & ~1u) == 0x01BF9100u) {
+        char* rp = strstr(hlsl, "return r[0];");
+        if (rp) {
+            static const char rep[] =
+                "if (input.position.x < 522.0f) return float4(saturate(input.tc0.xy), 0.0f, 1.0f);\n"
+                "    if (input.position.x < 757.0f) return rsx_tex[0].SampleLevel(rsx_samp[0], input.tc0.xy, 0.0f);\n"
+                "    return rsx_tex[0].SampleLevel(rsx_samp[0], float2(0.1853693182f, 0.2939453125f), 0.0f);";
+            const size_t oldlen = strlen("return r[0];");
+            const size_t newlen = sizeof(rep) - 1u;
+            const size_t used = strlen(hlsl) + 1u;
+            const size_t tail = used - (size_t)(rp - hlsl) - oldlen;
+            if (used + newlen - oldlen <= sizeof(hlsl)) {
+                memmove(rp + newlen, rp + oldlen, tail);
+                memcpy(rp, rep, newlen);
+                fprintf(stderr, "[WARN2_DIAG_PS] tc0/sample/fixed-uv three-band shader active%c", 10);
+            }
+        }
+    }
+
     /* FP_IDCOLOR=1: give every fragment program a distinct flat colour derived
      * from its address. One frame then shows which program paints which surface,
      * instead of one run per candidate to test them by elimination. */
@@ -5928,8 +5958,10 @@ skip_dump_consider: ;
                     }
                 }
                 const u8* _c=(const u8*)_tp + (u64)256u*s_logo_tex_readback_pitch + (u64)352u*4u;
-                fprintf(stderr, "[LOGO_GPU_TEX] rgb_nz=%u/%u a_nz=%u/%u max=(%u,%u,%u,%u) center=(%u,%u,%u,%u)%c",
-                        _rgb,_n,_a,_n,_rm,_gm,_bm,_am,_c[0],_c[1],_c[2],_c[3],10);
+                const u8* _p=(const u8*)_tp + (u64)150u*s_logo_tex_readback_pitch + (u64)130u*4u;
+                fprintf(stderr, "[LOGO_GPU_TEX] rgb_nz=%u/%u a_nz=%u/%u max=(%u,%u,%u,%u) center=(%u,%u,%u,%u) p130_150=(%u,%u,%u,%u)%c",
+                        _rgb,_n,_a,_n,_rm,_gm,_bm,_am,_c[0],_c[1],_c[2],_c[3],
+                        _p[0],_p[1],_p[2],_p[3],10);
                 D3D12_RANGE _tw={0,0}; s_logo_tex_readback->lpVtbl->Unmap(s_logo_tex_readback,0,&_tw);
             } else fprintf(stderr, "[LOGO_GPU_TEX] readback map FAILED%c", 10);
         }
@@ -5954,6 +5986,7 @@ skip_dump_consider: ;
         D3D12_RANGE _rr = {0, (SIZE_T)s_d3d.readback_pitch * s_d3d.height};
         if (SUCCEEDED(s_d3d.readback_buf->lpVtbl->Map(s_d3d.readback_buf, 0, &_rr, &_mp)) && _mp) {
             u32 nz = 0, rgb_nz = 0, alpha_nz = 0, bbox_rgb = 0, bbox_n = 0;
+            u32 diag_rgb[3] = {0,0,0}, diag_n[3] = {0,0,0};
             u8 rmax=0,gmax=0,bmax=0,amax=0;
             for (u32 y=0; y<s_d3d.height; y++) {
                 const u8* row=(const u8*)_mp + (u64)y*s_d3d.readback_pitch;
@@ -5966,6 +5999,9 @@ skip_dump_consider: ;
                     if (x>=288 && x<992 && y>=64 && y<576) {
                         bbox_n++;
                         if(q[0]||q[1]||q[2]) bbox_rgb++;
+                        int band = (x < 522) ? 0 : ((x < 757) ? 1 : 2);
+                        diag_n[band]++;
+                        if(q[0]||q[1]||q[2]) diag_rgb[band]++;
                     }
                 }
             }
@@ -5976,6 +6012,10 @@ skip_dump_consider: ;
                 s_d3d.frame_count, rgb_nz, s_d3d.width*s_d3d.height,
                 alpha_nz, s_d3d.width*s_d3d.height, nz, bbox_rgb, bbox_n,
                 rmax,gmax,bmax,amax,qc[0],qc[1],qc[2],qc[3],10);
+            fprintf(stderr,
+                "[WARN2_DIAG_FB] frame=%u tc0_rgb=%u/%u sample_rgb=%u/%u fixed_rgb=%u/%u%c",
+                s_d3d.frame_count, diag_rgb[0], diag_n[0],
+                diag_rgb[1], diag_n[1], diag_rgb[2], diag_n[2], 10);
             D3D12_RANGE _wr = {0,0};
             s_d3d.readback_buf->lpVtbl->Unmap(s_d3d.readback_buf,0,&_wr);
         } else {
