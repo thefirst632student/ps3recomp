@@ -2586,14 +2586,15 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      *      bright texel                -> complete real sampling path
      * The framebuffer readback below logs the center pixel of each box, so the
      * result is machine-readable and does not depend on inspecting a screenshot. */
-    if ((fp_addr & ~1u) == 0x01BF9100u && s_logo_probe_ready) {
+    if ((fp_addr & ~1u) == 0x01BF9100u) {
         static int logo_ps_probe_injected = 0;
         const char* anchor = "float4 main(PSInput input) : SV_TARGET {\n";
         char* body = strstr(hlsl, anchor);
         if (body) {
             body += strlen(anchor);
-            const u32 sx = 288u + s_logo_probe_x;
-            const u32 sy = 64u  + s_logo_probe_y;
+            const u32 probe_x = 130u, probe_y = 150u;
+            const u32 sx = 288u + probe_x;
+            const u32 sy = 64u  + probe_y;
             char probe[2048];
             int plen = snprintf(probe, sizeof probe,
                 "    if (input.position.x >= 300.0 && input.position.x < 316.0 && input.position.y >= 80.0 && input.position.y < 96.0) return float4(1.0,0.0,1.0,1.0);\n"
@@ -2601,9 +2602,9 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
                 "    if (input.position.x >= 340.0 && input.position.x < 356.0 && input.position.y >= 80.0 && input.position.y < 96.0) return rsx_tex[0].SampleLevel(rsx_samp[0], float2(%.9ff,%.9ff), 0.0);\n"
                 "    if (input.position.x >= 360.0 && input.position.x < 376.0 && input.position.y >= 80.0 && input.position.y < 96.0) return float4(saturate(input.tc0.x),saturate(input.tc0.y),0.0,1.0);\n"
                 "    if (input.position.x >= %u.0 && input.position.x < %u.0 && input.position.y >= %u.0 && input.position.y < %u.0) return rsx_tex[0].SampleLevel(rsx_samp[0], input.tc0.xy, 0.0);\n",
-                s_logo_probe_x, s_logo_probe_y,
-                ((double)s_logo_probe_x + 0.5) / 704.0,
-                ((double)s_logo_probe_y + 0.5) / 512.0,
+                probe_x, probe_y,
+                ((double)probe_x + 0.5) / 704.0,
+                ((double)probe_y + 0.5) / 512.0,
                 sx >= 4u ? sx - 4u : 0u, sx + 5u,
                 sy >= 4u ? sy - 4u : 0u, sy + 5u);
             if (plen > 0 && (size_t)plen < sizeof probe) {
@@ -2615,9 +2616,8 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
                     if (!logo_ps_probe_injected++)
                         fprintf(stderr,
                             "[LOGO_PS_PROBE] injected A=const B=Load(%u,%u) C=fixedUV D=tc0 E=tc0@screen(%u,%u) expected=(%u,%u,%u,%u)%c",
-                            s_logo_probe_x, s_logo_probe_y, sx, sy,
-                            s_logo_probe_rgba[0], s_logo_probe_rgba[1],
-                            s_logo_probe_rgba[2], s_logo_probe_rgba[3], 10);
+                            probe_x, probe_y, sx, sy,
+                            255u, 255u, 255u, 255u, 10);
                 }
             }
         }
@@ -5957,9 +5957,9 @@ skip_dump_consider: ;
                 }
             }
             const u8* qc=(const u8*)_mp + (u64)360*s_d3d.readback_pitch + (u64)640*4u;
-            if (s_logo_probe_ready) {
-                const u32 ex = 288u + s_logo_probe_x;
-                const u32 ey = 64u  + s_logo_probe_y;
+            {
+                const u32 ex = 288u + 130u;
+                const u32 ey = 64u  + 150u;
                 const u32 px[5] = {308u, 328u, 348u, 368u, ex};
                 const u32 py[5] = { 88u,  88u,  88u,  88u, ey};
                 u8 pv[5][4] = {{0}};
@@ -5979,8 +5979,7 @@ skip_dump_consider: ;
                     pv[2][0],pv[2][1],pv[2][2],pv[2][3],
                     pv[3][0],pv[3][1],pv[3][2],pv[3][3],
                     pv[4][0],pv[4][1],pv[4][2],pv[4][3], ex, ey,
-                    s_logo_probe_rgba[0],s_logo_probe_rgba[1],
-                    s_logo_probe_rgba[2],s_logo_probe_rgba[3],10);
+                    255u,255u,255u,255u,10);
             }
             fprintf(stderr,
                 "[LOGO_FB] frame=%u rgb_nz=%u/%u alpha_nz=%u/%u any_nz=%u "
