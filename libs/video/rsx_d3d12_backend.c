@@ -2575,6 +2575,54 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             logo_fp_dumped = 1;
         }
     }
+    /* WA2 logo fragment-stage A/B/C/D/E probe.  The large logo texture has a
+     * CPU/GPU-verified bright texel.  Overlay five tiny diagnostic boxes while
+     * leaving the rest of the shader untouched:
+     *   A: constant magenta            -> PS/color-write/RT path
+     *   B: Texture.Load(bright texel)  -> SRV descriptor/resource visibility
+     *   C: SampleLevel(fixed bright UV)-> sampler state
+     *   D: visualize interpolated tc0  -> VS->PS interpolator
+     *   E: normal SampleLevel(tc0) at the screen pixel mapping to the known
+     *      bright texel                -> complete real sampling path
+     * The framebuffer readback below logs the center pixel of each box, so the
+     * result is machine-readable and does not depend on inspecting a screenshot. */
+    if ((fp_addr & ~1u) == 0x01BF9100u && s_logo_probe_ready) {
+        static int logo_ps_probe_injected = 0;
+        const char* anchor = "float4 main(PSInput input) : SV_TARGET {\n";
+        char* body = strstr(hlsl, anchor);
+        if (body) {
+            body += strlen(anchor);
+            const u32 sx = 288u + s_logo_probe_x;
+            const u32 sy = 64u  + s_logo_probe_y;
+            char probe[2048];
+            int plen = snprintf(probe, sizeof probe,
+                "    if (input.position.x >= 300.0 && input.position.x < 316.0 && input.position.y >= 80.0 && input.position.y < 96.0) return float4(1.0,0.0,1.0,1.0);\n"
+                "    if (input.position.x >= 320.0 && input.position.x < 336.0 && input.position.y >= 80.0 && input.position.y < 96.0) return rsx_tex[0].Load(int3(%u,%u,0));\n"
+                "    if (input.position.x >= 340.0 && input.position.x < 356.0 && input.position.y >= 80.0 && input.position.y < 96.0) return rsx_tex[0].SampleLevel(rsx_samp[0], float2(%.9ff,%.9ff), 0.0);\n"
+                "    if (input.position.x >= 360.0 && input.position.x < 376.0 && input.position.y >= 80.0 && input.position.y < 96.0) return float4(saturate(input.tc0.x),saturate(input.tc0.y),0.0,1.0);\n"
+                "    if (input.position.x >= %u.0 && input.position.x < %u.0 && input.position.y >= %u.0 && input.position.y < %u.0) return rsx_tex[0].SampleLevel(rsx_samp[0], input.tc0.xy, 0.0);\n",
+                s_logo_probe_x, s_logo_probe_y,
+                ((double)s_logo_probe_x + 0.5) / 704.0,
+                ((double)s_logo_probe_y + 0.5) / 512.0,
+                sx >= 4u ? sx - 4u : 0u, sx + 5u,
+                sy >= 4u ? sy - 4u : 0u, sy + 5u);
+            if (plen > 0 && (size_t)plen < sizeof probe) {
+                size_t used = strlen(hlsl);
+                size_t tail = strlen(body) + 1u;
+                if (used + (size_t)plen + 1u < sizeof hlsl) {
+                    memmove(body + plen, body, tail);
+                    memcpy(body, probe, (size_t)plen);
+                    if (!logo_ps_probe_injected++)
+                        fprintf(stderr,
+                            "[LOGO_PS_PROBE] injected A=const B=Load(%u,%u) C=fixedUV D=tc0 E=tc0@screen(%u,%u) expected=(%u,%u,%u,%u)%c",
+                            s_logo_probe_x, s_logo_probe_y, sx, sy,
+                            s_logo_probe_rgba[0], s_logo_probe_rgba[1],
+                            s_logo_probe_rgba[2], s_logo_probe_rgba[3], 10);
+                }
+            }
+        }
+    }
+
     /* FP_LIST=1: every program the title actually compiles, with its size. A
      * fragment program that hangs the GPU shows up here as an implausible
      * instruction count long before it shows up as a TDR. */
@@ -5909,6 +5957,31 @@ skip_dump_consider: ;
                 }
             }
             const u8* qc=(const u8*)_mp + (u64)360*s_d3d.readback_pitch + (u64)640*4u;
+            if (s_logo_probe_ready) {
+                const u32 ex = 288u + s_logo_probe_x;
+                const u32 ey = 64u  + s_logo_probe_y;
+                const u32 px[5] = {308u, 328u, 348u, 368u, ex};
+                const u32 py[5] = { 88u,  88u,  88u,  88u, ey};
+                u8 pv[5][4] = {{0}};
+                for (int pi = 0; pi < 5; pi++) {
+                    if (px[pi] < s_d3d.width && py[pi] < s_d3d.height) {
+                        const u8* pq = (const u8*)_mp +
+                            (u64)py[pi] * s_d3d.readback_pitch + (u64)px[pi] * 4u;
+                        pv[pi][0]=pq[0]; pv[pi][1]=pq[1]; pv[pi][2]=pq[2]; pv[pi][3]=pq[3];
+                    }
+                }
+                fprintf(stderr,
+                    "[LOGO_PS_PROBE] A_const=(%u,%u,%u,%u) B_load=(%u,%u,%u,%u) "
+                    "C_fixedSample=(%u,%u,%u,%u) D_tc0=(%u,%u,%u,%u) "
+                    "E_realSample=(%u,%u,%u,%u) E_xy=(%u,%u) expected=(%u,%u,%u,%u)%c",
+                    pv[0][0],pv[0][1],pv[0][2],pv[0][3],
+                    pv[1][0],pv[1][1],pv[1][2],pv[1][3],
+                    pv[2][0],pv[2][1],pv[2][2],pv[2][3],
+                    pv[3][0],pv[3][1],pv[3][2],pv[3][3],
+                    pv[4][0],pv[4][1],pv[4][2],pv[4][3], ex, ey,
+                    s_logo_probe_rgba[0],s_logo_probe_rgba[1],
+                    s_logo_probe_rgba[2],s_logo_probe_rgba[3],10);
+            }
             fprintf(stderr,
                 "[LOGO_FB] frame=%u rgb_nz=%u/%u alpha_nz=%u/%u any_nz=%u "
                 "bbox_rgb=%u/%u max=(%u,%u,%u,%u) center=(%u,%u,%u,%u)%c",
