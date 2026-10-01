@@ -2787,31 +2787,6 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             fprintf(stderr, "[LOGO_FP_HLSL_BEGIN]%c%s[LOGO_FP_HLSL_END]%c", 10, hlsl, 10);
         }
 
-        /* Dump the guest instruction words too.  In NV40 SRC1 bit 31 is the
-         * opcode high bit; the current decompiler also uses that bit as a
-         * generic branch marker, so this makes any affected logo instruction
-         * immediately visible without another instrumented build. */
-        static int raw_dumped = 0;
-        if (!raw_dumped++ && ucode) {
-            u32 roff = 0;
-            for (u32 ri = 0; ri < 8u && roff + 16u <= max_bytes; ri++) {
-                const u32 rw0 = rsx_fp_read_word(ucode + roff + 0u);
-                const u32 rw1 = rsx_fp_read_word(ucode + roff + 4u);
-                const u32 rw2 = rsx_fp_read_word(ucode + roff + 8u);
-                const u32 rw3 = rsx_fp_read_word(ucode + roff + 12u);
-                const u32 op_lo = (rw0 >> 24) & 0x3Fu;
-                const u32 op_hi = (rw2 >> 31) & 1u;
-                fprintf(stderr,
-                    "[LOGO_FP_RAW] i=%u off=0x%X w=%08X %08X %08X %08X op_lo=0x%02X op_hi=%u op_full=0x%02X end=%u%c",
-                    ri, roff, rw0, rw1, rw2, rw3, op_lo, op_hi,
-                    op_lo | (op_hi << 6), rw0 & 1u, 10);
-                roff += 16u;
-                const u32 t0 = rw1 & 3u, t1 = rw2 & 3u, t2 = rw3 & 3u;
-                if ((t0 == 2u || t1 == 2u || t2 == 2u) && roff + 16u <= max_bytes)
-                    roff += 16u;
-                if (rw0 & 1u) break;
-            }
-        }
     }
 
     /* FP_IDCOLOR=1: give every fragment program a distinct flat colour derived
