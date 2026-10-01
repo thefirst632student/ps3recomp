@@ -7,11 +7,18 @@
  */
 
 #include "cellResc.h"
+#include "cellGcmSys.h"
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: translate + byte-swap */
 #include "../guest_struct.h"                /* guest_struct_load: BE struct word-swap */
 #include "ps3emu/guest_call.h"   /* ps3_invoke_guest: handlers are guest OPDs */
 #include <stdio.h>
 #include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <sched.h>
+#include <time.h>
+#endif
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -272,7 +279,49 @@ s32 cellRescSetConvertAndFlip(void* context, s32 index)
                                        u32 width, u32 height);
     extern s32 cellGcmSetFlipCommand(u32 bufferId);
     extern u32 cellGcm_display_buffer_count(void);
+    extern void cellGcm_label_on_poll(void);
     u32 nbuf = cellGcm_display_buffer_count();
+
+    /* Preserve the guest command-stream ordering of RESC's convert+flip.
+     * The HLE implementation emits the flip as a host call, not as an RSX
+     * FIFO method.  If the present thread consumes that flip while commands
+     * from this frame are still queued, it can present the previous/empty
+     * batch and then drain through the next frame's CLEAR_SURFACE before the
+     * next present.  WA2 exposes exactly that race: the logo draw rasterizes
+     * correctly, but the visible swapchain stays black.
+     *
+     * Snapshot put while the guest render thread is inside this HLE call and
+     * wait until RSX get reaches it.  The guest cannot append the next frame
+     * while blocked here, so equality is an exact frame boundary.  Wake the
+     * FIFO owner while waiting; keep the wait bounded so a malformed/stalled
+     * FIFO cannot deadlock the title inside RESC. */
+    {
+        CellGcmControl* ctrl = cellGcmGetControlRegister();
+        if (ctrl) {
+            const u32 ctrl_ea = GUEST_EA(ctrl);
+            const u32 target_put = vm_read32(ctrl_ea + 0);
+            u32 get = vm_read32(ctrl_ea + 4);
+            u32 spins = 0;
+            while (get != target_put && spins < 100) {
+                cellGcm_label_on_poll();
+#ifdef _WIN32
+                Sleep(1);
+#else
+                { struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL); }
+#endif
+                get = vm_read32(ctrl_ea + 4);
+                spins++;
+            }
+            {
+                static int n = 0;
+                if (n++ < 16)
+                    fprintf(stderr,
+                            "[RESC-SYNC] put=0x%08X get=0x%08X wait=%u ms %s\n",
+                            target_put, get, spins,
+                            get == target_put ? "drained" : "TIMEOUT");
+            }
+        }
+    }
 
     /* RESC-only games (White Album 2, etc.) never call cellGcmSetDisplayBuffer
      * themselves. On real hardware RESC internally allocates output buffers and
