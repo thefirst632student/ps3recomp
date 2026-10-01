@@ -2753,6 +2753,67 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         }
     }
 
+    /* WA2 logo late-stage register probe.  Unlike A-E above, these tests are
+     * inserted immediately before the decompiler's final export, so every guest
+     * fragment instruction has already executed:
+     *   F: return r0          -> value in the fp32 color register after the body
+     *   G: return h0          -> value in the fp16 color register after the body
+     *   H: return COLOR0      -> interpolated vertex colour actually seen by PS
+     *   I: direct LOD0 sample -> control value after the body, bypassing export
+     * This separates TEX/register execution from final r0/h0 export selection. */
+    if ((fp_addr & ~1u) == 0x01BF9100u) {
+        const char* tail_anchor = "    float4 _o = ";
+        char* tail = strstr(hlsl, tail_anchor);
+        if (tail) {
+            static const char late_probe[] =
+                "    if (input.position.x >= 380.0 && input.position.x < 396.0 && input.position.y >= 80.0 && input.position.y < 96.0) return r[0];\n"
+                "    if (input.position.x >= 400.0 && input.position.x < 416.0 && input.position.y >= 80.0 && input.position.y < 96.0) return h[0];\n"
+                "    if (input.position.x >= 420.0 && input.position.x < 436.0 && input.position.y >= 80.0 && input.position.y < 96.0) return input.col0;\n"
+                "    if (input.position.x >= 440.0 && input.position.x < 456.0 && input.position.y >= 80.0 && input.position.y < 96.0) return rsx_tex[0].SampleLevel(rsx_samp[0], input.tc0.xy, 0.0);\n";
+            const size_t add = strlen(late_probe);
+            const size_t used = strlen(hlsl) + 1u;
+            const size_t off_tail = (size_t)(tail - hlsl);
+            if (used + add < sizeof(hlsl)) {
+                memmove(tail + add, tail, used - off_tail);
+                memcpy(tail, late_probe, add);
+                static int late_once = 0;
+                if (!late_once++)
+                    fprintf(stderr, "[LOGO_FP_LATE] injected F=r0 G=h0 H=col0 I=SampleLevel(tc0,0)%c", 10);
+            }
+        }
+
+        static int hlsl_dumped = 0;
+        if (!hlsl_dumped++) {
+            fprintf(stderr, "[LOGO_FP_HLSL_BEGIN]%c%s[LOGO_FP_HLSL_END]%c", 10, hlsl, 10);
+        }
+
+        /* Dump the guest instruction words too.  In NV40 SRC1 bit 31 is the
+         * opcode high bit; the current decompiler also uses that bit as a
+         * generic branch marker, so this makes any affected logo instruction
+         * immediately visible without another instrumented build. */
+        static int raw_dumped = 0;
+        if (!raw_dumped++ && ucode) {
+            u32 roff = 0;
+            for (u32 ri = 0; ri < 8u && roff + 16u <= max_bytes; ri++) {
+                const u32 rw0 = rsx_fp_read_word(ucode + roff + 0u);
+                const u32 rw1 = rsx_fp_read_word(ucode + roff + 4u);
+                const u32 rw2 = rsx_fp_read_word(ucode + roff + 8u);
+                const u32 rw3 = rsx_fp_read_word(ucode + roff + 12u);
+                const u32 op_lo = (rw0 >> 24) & 0x3Fu;
+                const u32 op_hi = (rw2 >> 31) & 1u;
+                fprintf(stderr,
+                    "[LOGO_FP_RAW] i=%u off=0x%X w=%08X %08X %08X %08X op_lo=0x%02X op_hi=%u op_full=0x%02X end=%u%c",
+                    ri, roff, rw0, rw1, rw2, rw3, op_lo, op_hi,
+                    op_lo | (op_hi << 6), rw0 & 1u, 10);
+                roff += 16u;
+                const u32 t0 = rw1 & 3u, t1 = rw2 & 3u, t2 = rw3 & 3u;
+                if ((t0 == 2u || t1 == 2u || t2 == 2u) && roff + 16u <= max_bytes)
+                    roff += 16u;
+                if (rw0 & 1u) break;
+            }
+        }
+    }
+
     /* FP_IDCOLOR=1: give every fragment program a distinct flat colour derived
      * from its address. One frame then shows which program paints which surface,
      * instead of one run per candidate to test them by elimination. */
@@ -5960,10 +6021,10 @@ skip_dump_consider: ;
             {
                 const u32 ex = 288u + 130u;
                 const u32 ey = 64u  + 150u;
-                const u32 px[5] = {308u, 328u, 348u, 368u, ex};
-                const u32 py[5] = { 88u,  88u,  88u,  88u, ey};
-                u8 pv[5][4] = {{0}};
-                for (int pi = 0; pi < 5; pi++) {
+                const u32 px[9] = {308u, 328u, 348u, 368u, ex, 388u, 408u, 428u, 448u};
+                const u32 py[9] = { 88u,  88u,  88u,  88u, ey,  88u,  88u,  88u,  88u};
+                u8 pv[9][4] = {{0}};
+                for (int pi = 0; pi < 9; pi++) {
                     if (px[pi] < s_d3d.width && py[pi] < s_d3d.height) {
                         const u8* pq = (const u8*)_mp +
                             (u64)py[pi] * s_d3d.readback_pitch + (u64)px[pi] * 4u;
@@ -5973,13 +6034,19 @@ skip_dump_consider: ;
                 fprintf(stderr,
                     "[LOGO_PS_PROBE] A_const=(%u,%u,%u,%u) B_load=(%u,%u,%u,%u) "
                     "C_fixedSample=(%u,%u,%u,%u) D_tc0=(%u,%u,%u,%u) "
-                    "E_realSample=(%u,%u,%u,%u) E_xy=(%u,%u) expected=(%u,%u,%u,%u)%c",
+                    "E_realSample=(%u,%u,%u,%u) E_xy=(%u,%u) expected=(%u,%u,%u,%u) "
+                    "F_r0=(%u,%u,%u,%u) G_h0=(%u,%u,%u,%u) "
+                    "H_col0=(%u,%u,%u,%u) I_postSample=(%u,%u,%u,%u)%c",
                     pv[0][0],pv[0][1],pv[0][2],pv[0][3],
                     pv[1][0],pv[1][1],pv[1][2],pv[1][3],
                     pv[2][0],pv[2][1],pv[2][2],pv[2][3],
                     pv[3][0],pv[3][1],pv[3][2],pv[3][3],
                     pv[4][0],pv[4][1],pv[4][2],pv[4][3], ex, ey,
-                    255u,255u,255u,255u,10);
+                    255u,255u,255u,255u,
+                    pv[5][0],pv[5][1],pv[5][2],pv[5][3],
+                    pv[6][0],pv[6][1],pv[6][2],pv[6][3],
+                    pv[7][0],pv[7][1],pv[7][2],pv[7][3],
+                    pv[8][0],pv[8][1],pv[8][2],pv[8][3],10);
             }
             fprintf(stderr,
                 "[LOGO_FB] frame=%u rgb_nz=%u/%u alpha_nz=%u/%u any_nz=%u "
