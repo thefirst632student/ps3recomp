@@ -7035,6 +7035,49 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             const rsx_vertex_attrib* a = &st->vertex_attribs[3];
             extern uint8_t* vm_base;
             extern u32 cellGcmResolveLocated(int, u32);
+
+            /* Decompile the active warning-2 VP here, at draw time.  vp_get_vs()
+             * may have cached this program before tex0 was known, which made the
+             * earlier WARN2_VP cache-miss probe silent.  This path is logging
+             * only and does not alter the cached shader or draw state. */
+            if (warn2_seen == 0 && st->vp_ucode && st->vp_ucode_bytes >= 16) {
+                extern int rsx_vp_decompile(const uint8_t*, u32, char*, u32);
+                u32 vstart = st->transform_program_start * 16u;
+                if (vstart >= st->vp_ucode_bytes) vstart = 0;
+                const u8* vuc = st->vp_ucode + vstart;
+                u32 vlen = st->vp_ucode_bytes - vstart;
+                static char whlsl[262144];
+                int wni = rsx_vp_decompile(vuc, vlen, whlsl, sizeof whlsl);
+                fprintf(stderr, "[WARN2_VP_DRAW] instrs=%d start=%u bytes=%u\n",
+                        wni, st->transform_program_start, vlen);
+                if (wni > 0) {
+                    const char* line = whlsl;
+                    while (*line) {
+                        const char* nl = strchr(line, '\n');
+                        size_t len = nl ? (size_t)(nl - line) : strlen(line);
+                        if (len) {
+                            char tmp[1024];
+                            size_t n = len < sizeof(tmp)-1 ? len : sizeof(tmp)-1;
+                            memcpy(tmp, line, n); tmp[n] = 0;
+                            if (strstr(tmp, "v[3]") || strstr(tmp, "o[1]") ||
+                                strstr(tmp, "Out.col0") || strstr(tmp, "input.a3") ||
+                                strstr(tmp, "float4 _v ="))
+                                fprintf(stderr, "[WARN2_VP_DRAW] %s\n", tmp);
+                        }
+                        if (!nl) break;
+                        line = nl + 1;
+                    }
+                    u32 raw_n = (u32)wni;
+                    if (raw_n > 12u) raw_n = 12u;
+                    for (u32 ii = 0; ii < raw_n; ++ii) {
+                        const u8* q = vuc + ii * 16u;
+                        fprintf(stderr,
+                                "[WARN2_VP_RAW] i=%u %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                                ii, q[0],q[1],q[2],q[3], q[4],q[5],q[6],q[7],
+                                q[8],q[9],q[10],q[11], q[12],q[13],q[14],q[15]);
+                    }
+                }
+            }
             fprintf(stderr,
                     "[WARN2_COLOR] n=%d frame=%llu a3 off=0x%08X stride=%u size=%u type=%u const=(%.6g %.6g %.6g %.6g)\n",
                     warn2_seen, (unsigned long long)s_d3d.frame_count, a->offset,
