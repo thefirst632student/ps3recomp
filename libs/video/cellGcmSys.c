@@ -71,37 +71,132 @@ static u64 get_timestamp_ns(void)
 static int  s_gcm_initialized = 0;
 static u32  s_flip_mode   = CELL_GCM_DISPLAY_VSYNC;
 static u32  s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+static u32  s_current_display_buffer_id = 0;
 
-/* Count of guest flip requests (SetFlipCommand / SetPrepareFlip). The present
- * loop uses this as the frame boundary: presenting only when a flip arrived
- * keeps partially-drained frames off screen (the ticker otherwise presents on
- * a fixed 16ms clock, and a drain that catches the guest mid-frame -- e.g.
- * while it's blocked in the FIFO-wrap recycle callback -- would show a
- * clear+few-draws frame as a visible flicker). */
-static volatile u32 s_flip_request_count = 0;
+/* Host-side flip boundaries.
+ *
+ * HLE/RESC flips are requested by the guest CPU after it has published the
+ * completed frame to ctrl->put.  A raw boolean (the old s_flip_pending) loses
+ * that position: the host FIFO walker can then drain several following frames
+ * before the ticker notices the flag, so Present() shows whatever happened to
+ * be last rather than the frame the guest flipped.  WA2 exposes this exactly:
+ * the logo frame readback is correct, then dozens of CLEAR_SURFACE commands are
+ * consumed before the next host present.
+ *
+ * Keep the ctrl->put value for every HLE flip.  The FIFO walker stops at the
+ * oldest boundary; only after get reaches it does that flip become presentable.
+ * This also preserves multiple queued flips instead of collapsing them into one
+ * bit while the guest runs ahead. */
+#define GCM_FLIP_QUEUE_CAP 256u
+typedef struct GcmFlipBoundary {
+    u32 boundary;
+    u32 buffer_id;
+    int ready;
+} GcmFlipBoundary;
+
+static GcmFlipBoundary s_flip_q[GCM_FLIP_QUEUE_CAP];
+static u32 s_flip_q_head = 0;
+static u32 s_flip_q_tail = 0;
+static SRWLOCK s_flip_q_lock = SRWLOCK_INIT;
+
+/* Raw guest submissions are diagnostic only.  The public host-side counter is
+ * deliberately the number of PRESENTABLE flip boundaries, because eboot_port
+ * and the D3D12 backend use it as a present gate.  Advancing that counter at
+ * request time is what allowed a later CLEAR to consume the flip before the
+ * corresponding frame reached the backend. */
+static volatile u32 s_flip_submit_count = 0;
+static volatile u32 s_flip_ready_count = 0;
 
 u32 cellGcm_flip_request_count(void)
 {
-    return s_flip_request_count;
+    return s_flip_ready_count;
 }
+
+static void gcm_flipq_reset(void)
+{
+    AcquireSRWLockExclusive(&s_flip_q_lock);
+    s_flip_q_head = s_flip_q_tail = 0;
+    s_flip_submit_count = 0;
+    s_flip_ready_count = 0;
+    memset(s_flip_q, 0, sizeof(s_flip_q));
+    ReleaseSRWLockExclusive(&s_flip_q_lock);
+}
+
+static int gcm_flipq_push(u32 buffer_id, u32 boundary, int ready)
+{
+    int ok = 0;
+    AcquireSRWLockExclusive(&s_flip_q_lock);
+    u32 next = (s_flip_q_tail + 1u) % GCM_FLIP_QUEUE_CAP;
+    if (next != s_flip_q_head) {
+        GcmFlipBoundary* q = &s_flip_q[s_flip_q_tail];
+        q->boundary = boundary;
+        q->buffer_id = buffer_id;
+        q->ready = ready ? 1 : 0;
+        s_flip_q_tail = next;
+        s_flip_submit_count++;
+        if (q->ready) s_flip_ready_count++;
+        ok = 1;
+    }
+    ReleaseSRWLockExclusive(&s_flip_q_lock);
+    if (!ok) {
+        static int warned = 0;
+        if (warned++ < 8)
+            fprintf(stderr, "[FLIP-BOUNDARY] queue full -- dropping flip buf=%u boundary=0x%08X\n",
+                    buffer_id, boundary);
+    }
+    return ok;
+}
+
+static int gcm_flipq_peek(u32* boundary, int* ready)
+{
+    int have = 0;
+    AcquireSRWLockShared(&s_flip_q_lock);
+    if (s_flip_q_head != s_flip_q_tail) {
+        const GcmFlipBoundary* q = &s_flip_q[s_flip_q_head];
+        if (boundary) *boundary = q->boundary;
+        if (ready) *ready = q->ready;
+        have = 1;
+    }
+    ReleaseSRWLockShared(&s_flip_q_lock);
+    return have;
+}
+
+static int gcm_flipq_mark_head_ready(u32 getoff)
+{
+    int became_ready = 0;
+    AcquireSRWLockExclusive(&s_flip_q_lock);
+    if (s_flip_q_head != s_flip_q_tail) {
+        GcmFlipBoundary* q = &s_flip_q[s_flip_q_head];
+        if (!q->ready && q->boundary == getoff) {
+            q->ready = 1;
+            s_flip_ready_count++;
+            became_ready = 1;
+        }
+    }
+    ReleaseSRWLockExclusive(&s_flip_q_lock);
+    return became_ready;
+}
+
+int cellGcm_take_flip_pending(void)
+{
+    int take = 0;
+    AcquireSRWLockExclusive(&s_flip_q_lock);
+    if (s_flip_q_head != s_flip_q_tail && s_flip_q[s_flip_q_head].ready) {
+        s_current_display_buffer_id = s_flip_q[s_flip_q_head].buffer_id;
+        s_flip_q_head = (s_flip_q_head + 1u) % GCM_FLIP_QUEUE_CAP;
+        take = 1;
+    }
+    ReleaseSRWLockExclusive(&s_flip_q_lock);
+    return take;
+}
+
+static s32 cellGcmSetFlipCommandImpl(u32 bufferId, int from_fifo);
+
 static u32  s_debug_level = CELL_GCM_DEBUG_LEVEL0;
 
 /* Display buffers */
 static CellGcmDisplayInfo s_display_buffers[CELL_GCM_MAX_DISPLAY_BUFFER_NUM];
 static int s_display_buffer_set[CELL_GCM_MAX_DISPLAY_BUFFER_NUM];
-static u32 s_current_display_buffer_id = 0;
-/* Set by the flip (guest thread, at a get==put frame boundary); consumed by
- * the ticker, which presents the accumulated batch BEFORE draining further --
- * presenting on a raw flip-count change raced the drain and showed empty or
- * mixed batches (wave: black flashes, layout flicker). */
-static volatile int s_flip_pending = 0;
-
-int cellGcm_take_flip_pending(void)
-{
-    int v = s_flip_pending;
-    s_flip_pending = 0;
-    return v;
-}
 
 
 /* Configuration */
@@ -434,6 +529,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     s_last_flip_time = get_timestamp_ns();
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
     s_flip_mode = CELL_GCM_DISPLAY_VSYNC;
+    gcm_flipq_reset();
     s_debug_level = CELL_GCM_DEBUG_LEVEL0;
     s_vblank_count = 0;
     s_io_map_reserved = 0;
@@ -1039,19 +1135,12 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
                subch, method);
 }
 
-/* Present gate for the ticker: a flip is ready once the drain has consumed
- * everything up to put. The guest blocks in its own WaitFlip right after
- * flipping, so the FIFO holds EXACTLY the completed frame -- no guest-side
- * blocking needed (the old spin serialized two vsync-class waits per frame
- * and halved the frame rate). Call AFTER draining. */
+/* The queue marks a flip ready only when the FIFO walker has reached the
+ * exact put snapshot captured by that request, so the synced and normal take
+ * paths are now identical. */
 int cellGcm_take_flip_pending_synced(void)
 {
-    if (!s_flip_pending) return 0;
-    u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
-    u32 get = vm_read32(GCM_CONTROL_GUEST_ADDR + 4);
-    if (get != put) return 0;   /* frame not fully drained yet */
-    s_flip_pending = 0;
-    return 1;
+    return cellGcm_take_flip_pending();
 }
 
 /* ---- fence (SET_REFERENCE) observability ---------------------------------
@@ -1329,7 +1418,19 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * one flat ring (cellmark), but PSL1GHT/Tiny3D immediately JUMPs into its
      * own command ring, so everything after the jump (including the reference
      * writes its waits spin on) silently never executed. */
-    u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+    u32 live_put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+    u32 put = live_put;
+    u32 flip_boundary = 0;
+    int flip_head_ready = 0;
+    int flip_capped = gcm_flipq_peek(&flip_boundary, &flip_head_ready);
+    if (flip_capped) {
+        /* A ready head must be presented before any command from the next
+         * frame is consumed.  This is the host equivalent of the RSX stopping
+         * exactly at an in-FIFO flip word. */
+        if (flip_head_ready)
+            return;
+        put = flip_boundary;
+    }
     /* The words behind `put` were stored by another thread (the title, or the
      * recycle below) before it stored `put`. On x86 the hardware keeps loads
      * in order; on arm64 it does not, so without an acquire here the ring
@@ -1452,7 +1553,6 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * flip-gated present shows exactly the completed frame -- draining
              * on would mix the next frame's head into the batch (wave: every
              * frame split across 4 presents, layout flashing/zooming). */
-            extern s32 cellGcmSetFlipCommand(u32 bufferId);
             s_fifo_getoff += 4;
             /* Count the flip WORDS the title actually writes into the FIFO,
              * separately from the presents that result. When a title stops
@@ -1465,7 +1565,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
               if (dbg && (flips <= 8ull || (flips % 200ull) == 0))
                   fprintf(stderr, "[flipword] %llu FIFO flip words decoded%c",
                           flips, 10); }
-            cellGcmSetFlipCommand(w & 0xFFu);
+            cellGcmSetFlipCommandImpl(w & 0xFFu, 1);
             /* ...unless the FIFO is badly backlogged. One flip per drain is
              * right while `get` is keeping up with `put`; when it is megabytes
              * behind it is a deadlock, because the title's ring can only be
@@ -1696,7 +1796,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 if (mfull == 0xEB00u || mfull == 0xEB04u) {
                     cellGcmQueueUserCommand(vm_read32(dea));
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
-                    cellGcmSetFlipCommand(vm_read32(dea) & 7u);
+                    cellGcmSetFlipCommandImpl(vm_read32(dea) & 7u, 1);
                 } else if (subch == 0 || (subch == 1 && !s1_2d)) {
                     rsx_process_method(&s_state, m, vm_read32(dea));
                     /* NV406E_SET_REFERENCE: queue the fence value for PACED
@@ -1713,6 +1813,17 @@ static void gcm_rsx_process_fifo_unlocked(void)
         { static int _uw = 0; if (_uw++ < 16 && getenv("RTT_DUMP"))
             fprintf(stderr, "[FIFOUW] unknown word 0x%08X at getoff 0x%X\n", w, s_fifo_getoff); }
         s_fifo_getoff += 4;                    /* unknown word: skip */
+    }
+
+    if (flip_capped && s_fifo_getoff == flip_boundary) {
+        if (gcm_flipq_mark_head_ready(s_fifo_getoff)) {
+            static int n = 0;
+            if (n++ < 64)
+                fprintf(stderr,
+                        "[FLIP-BOUNDARY] reached get=put_snapshot=0x%08X ready=%u submitted=%u\n",
+                        s_fifo_getoff, s_flip_ready_count, s_flip_submit_count);
+        }
+        why = "flip-boundary";
     }
 
     /* Walker watchdog. Everything above recovers from a *recognised* stall --
@@ -1808,7 +1919,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
         u32 io_begin_chk = begin ? gcm_ea2io(begin) : 0xFFFFFFFFu;
         int head_consumed =
             (io_begin_chk != 0xFFFFFFFFu) &&
-            (s_fifo_getoff == put ||
+            (s_fifo_getoff == live_put ||
              (s_fifo_getoff > io_begin_chk &&
               s_fifo_getoff - io_begin_chk >= GCM_RECYCLE_MARGIN));
         /* Already overrun. gcmReserve writes past `end` when its callback
@@ -1980,7 +2091,7 @@ u32 cellGcm_display_buffer_count(void)
     return n;
 }
 
-s32 cellGcmSetFlipCommand(u32 bufferId)
+static s32 cellGcmSetFlipCommandImpl(u32 bufferId, int from_fifo)
 {
     /* GCM_FLIPCOUNT=1: every flip, with a timestamp. FLIP_DBG caps at 20 lines,
      * which answers "did it ever flip?" and not "is it still flipping, and how
@@ -2037,8 +2148,26 @@ s32 cellGcmSetFlipCommand(u32 bufferId)
     /* Flip requested but not yet shown: a subsequent cellGcmSetWaitFlip blocks
      * until the present thread's cellGcmTickFlip marks it done (vsync). */
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
-    s_flip_pending = 1;   /* ticker: present BEFORE the next drain */
-    s_flip_request_count++;
+
+    if (from_fifo) {
+        /* The walker is already sitting exactly at this flip boundary.  Queue
+         * it ready-to-present and return to the ticker before any following
+         * frame is drained. */
+        gcm_flipq_push(bufferId, s_fifo_getoff, 1);
+    } else {
+        /* HLE/RESC flip: capture the producer's write head.  The walker will
+         * cap its next drain at this exact offset and only then make the flip
+         * visible to the host present loop. */
+        u32 boundary = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+        if (gcm_flipq_push(bufferId, boundary, 0)) {
+            static int n = 0;
+            if (n++ < 64)
+                fprintf(stderr,
+                        "[FLIP-BOUNDARY] queued buf=%u put_snapshot=0x%08X submitted=%u ready=%u\n",
+                        bufferId, boundary, s_flip_submit_count, s_flip_ready_count);
+        }
+        if (s_gcm_kick_ev) SetEvent(s_gcm_kick_ev);
+    }
     s_last_flip_time = get_timestamp_ns();
 
     /* Invoke via OPD resolution, not a raw call into guest code.
@@ -2054,6 +2183,11 @@ s32 cellGcmSetFlipCommand(u32 bufferId)
         g_ps3_guest_caller(s_flip_handler_opd, 0, 0, 0, 0, 0, 0, 0, 0);  /* head 0 = primary display */
 
     return CELL_OK;
+}
+
+s32 cellGcmSetFlipCommand(u32 bufferId)
+{
+    return cellGcmSetFlipCommandImpl(bufferId, 0);
 }
 
 /* cellGcmSetFlip(context, buffer_id) — immediate flip request. PSL1GHT's
@@ -2093,7 +2227,10 @@ s32 cellGcmSetPrepareFlip(void* ctx, u32 bufferId)
 
     s_current_display_buffer_id = bufferId;
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
-    s_flip_request_count++;
+    /* Legacy SetPrepareFlip had no separate pending bit but did advance the
+     * host present counter. Keep that behaviour as an immediately-ready
+     * boundary so callers outside WA2 do not silently lose their present. */
+    gcm_flipq_push(bufferId, vm_read32(GCM_CONTROL_GUEST_ADDR + 0), 1);
     s_last_flip_time = get_timestamp_ns();
 
     /* Invoke the guest flip handler via OPD resolution -- s_flip_handler holds
@@ -2780,6 +2917,7 @@ void cellGcmTerminate(void)
     s_gcm_initialized = 0;
     s_flip_mode   = CELL_GCM_DISPLAY_VSYNC;
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+    gcm_flipq_reset();
     s_debug_level = CELL_GCM_DEBUG_LEVEL0;
     s_vblank_count = 0;
     s_io_map_reserved = 0;
