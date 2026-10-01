@@ -7104,7 +7104,13 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
         primitive == RSX_PRIMITIVE_TRIANGLE_STRIP && first == 10u && count == 4u &&
         s_d3d.cur_texs[0].raw == 0x01CA8480u) {
         static int warn2_seen = 0;
-        if (warn2_seen < 24) {
+        /* Keep the probe alive through both guest fade thresholds (60/120),
+         * but only print dense samples around the interesting transitions. */
+        if (warn2_seen < 132 &&
+            (warn2_seen < 24 ||
+             (warn2_seen >= 56 && warn2_seen <= 64) ||
+             (warn2_seen >= 116 && warn2_seen <= 124) ||
+             warn2_seen == 131)) {
             const rsx_state* st = s_d3d.current_rsx_state;
             const rsx_vertex_attrib* a = &st->vertex_attribs[3];
             extern uint8_t* vm_base;
@@ -7177,8 +7183,8 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                         ea_l, ql[0],ql[1],ql[2],ql[3],
                         ea_m, qm[0],qm[1],qm[2],qm[3]);
             }
-            warn2_seen++;
         }
+        if (warn2_seen < 132) warn2_seen++;
     }
 
     /* WA2 logo root-cause probe: inspect the actual post-fetch attributes for
