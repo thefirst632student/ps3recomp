@@ -2575,6 +2575,19 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             logo_fp_dumped = 1;
         }
     }
+    /* WA2 late-boot/static-logo stage probe.  Unlike the earlier coloured
+     * 0x01BF9101 probe this is observational only: print the exact translated
+     * shader used by the 0x01E08481 stage so we can see whether the black output
+     * is caused by its arithmetic/inputs or by the texture fed to it. */
+    if ((fp_addr & ~1u) == 0x01E08480u) {
+        static int boot_fp_dumped = 0;
+        if (!boot_fp_dumped) {
+            boot_fp_dumped = 1;
+            fprintf(stderr, "[BOOT_FP_HLSL_BEGIN] fp=0x%08X instrs=%d ctrl=0x%02X%c%s[BOOT_FP_HLSL_END]%c",
+                    fp_addr, n, fp_ctrl, 10, hlsl, 10);
+        }
+    }
+
     /* FP_LIST=1: every program the title actually compiles, with its size. A
      * fragment program that hangs the GPU shows up here as an implausible
      * instruction count long before it shows up as a TDR. */
@@ -3192,7 +3205,24 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, u32 guest_pitch, i
         VPTexSlot* c = &s_d3d.vp_tex[i];
         if (c->res && c->key == key_off && c->w == w && c->h == h && c->fmt == fmt
             && c->guest_pitch == guest_pitch && c->cube == cube) {
-            if (c->used) return i;                /* already bound this frame */
+            if (c->used) {
+                /* If the guest rewrites a texture between two draws in the same
+                 * recorded frame, the old fast path silently reuses the first
+                 * upload.  Observe that race without changing rendering. */
+                if ((w == 704u && h == 512u) || (w == 224u && h == 80u) ||
+                    (w == s_d3d.width && h == s_d3d.height)) {
+                    u32 nb_now = tl.row_bytes * tl.rows;
+                    u32 cs_now = TEX_CSUM(vm_base + c->off, nb_now);
+                    if (cs_now != c->csum) {
+                        static int race_n = 0;
+                        if (race_n++ < 64)
+                            fprintf(stderr, "[BOOT-TEX-RACE] frame=%llu key=0x%08X src=0x%08X %ux%u fmt=0x%02X uploaded=%08X now=%08X%c",
+                                    (unsigned long long)s_d3d.frame_count, key_off, c->off,
+                                    w, h, fmt, c->csum, cs_now, 10);
+                    }
+                }
+                return i;                         /* already bound this frame */
+            }
             { static int nocache = -1;            /* TEX_NOCACHE=1: always re-upload */
               if (nocache < 0) { const char* e = getenv("TEX_NOCACHE");
                                  nocache = e ? atoi(e) : 0; }
@@ -3203,6 +3233,14 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, u32 guest_pitch, i
             u32 nb = tl.row_bytes * tl.rows;
             u32 cs = TEX_CSUM(vm_base + c->off, nb);
             if (cs == c->csum) { c->used = 1; return i; }
+            if ((w == 704u && h == 512u) || (w == 224u && h == 80u) ||
+                (w == s_d3d.width && h == s_d3d.height)) {
+                static int stale_n = 0;
+                if (stale_n++ < 64)
+                    fprintf(stderr, "[BOOT-TEX-REUPLOAD] frame=%llu key=0x%08X src=0x%08X %ux%u fmt=0x%02X old=%08X new=%08X%c",
+                            (unsigned long long)s_d3d.frame_count, key_off, c->off,
+                            w, h, fmt, c->csum, cs, 10);
+            }
             slot = i; break;                      /* stale: fall through and redo */
         }
         if (!c->used && freeslot < 0) freeslot = i;
@@ -6999,18 +7037,18 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
      * fingerprint is sampled across level 0, so reuse of the same RSX offset
      * for a later boot image is still detected.  Raw attrib3 bytes distinguish
      * "guest really wrote black" from a host vertex-conversion bug. */
-    if (s_d3d.current_rsx_state && vm_base) {
+    if (s_d3d.current_rsx_state && vm_base && s_total >= 2200 && s_total < 5000) {
         typedef struct {
             u32 fp, traw, tw, th, tfmt, tcs;
             u32 prim, first, count;
             u32 a3fmt, a3stride, a3freq;
             u32 cword, posx_bits, posy_bits;
         } BootSig;
-        static BootSig seen[160];
+        static BootSig seen[768];
         static u32 seen_n = 0;
         const rsx_state* bst = s_d3d.current_rsx_state;
         const rsx_vertex_attrib* a3 = &bst->vertex_attribs[3];
-        u32 tcs = 0;
+        u32 tcs = 0, tnz = 0, tsamples = 0;
         if (s_d3d.cur_texs[0].set && s_d3d.cur_texs[0].off &&
             s_d3d.cur_texs[0].off < 0xE0000000u &&
             s_d3d.cur_texs[0].w && s_d3d.cur_texs[0].h) {
@@ -7026,9 +7064,14 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 if (!step) step = 1u;
                 u32 h = 2166136261u;
                 for (u32 bi = 0; bi < bytes; bi += step) {
-                    h ^= tp[bi]; h *= 16777619u;
+                    const u8 tv = tp[bi];
+                    if (tv) tnz++;
+                    tsamples++;
+                    h ^= tv; h *= 16777619u;
                 }
-                h ^= tp[bytes - 1u]; h *= 16777619u;
+                { const u8 tv = tp[bytes - 1u];
+                  if (tv) tnz++; tsamples++;
+                  h ^= tv; h *= 16777619u; }
                 tcs = h;
             }
         }
@@ -7074,15 +7117,18 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
         if (!known && seen_n < (u32)(sizeof(seen) / sizeof(seen[0]))) {
             seen[seen_n++] = bs;
             fprintf(stderr,
-                "[BOOT-DRAW] #%llu fp=0x%08X tex0=0x%08X %ux%u fmt=0x%02X tcs=%08X "
+                "[BOOT-DRAW] #%llu frame=%llu fp=0x%08X tex0=0x%08X res=0x%08X %ux%u fmt=0x%02X pitch=%u tcs=%08X nz=%u/%u rt0=0x%08X "
                 "prim=%u first=%u count=%u a3(en=%d type=%u size=%u stride=%u "
                 "off=0x%08X freq=%u fmt=0x%08X ea=0x%08X raw=%02X%02X%02X%02X) "
                 "col=(%.4g %.4g %.4g %.4g) pos=(%.4g %.4g %.4g %.4g) "
                 "uv=(%.4g %.4g %.4g %.4g)%c",
                 (unsigned long long)s_total,
+                (unsigned long long)s_d3d.frame_count,
                 bst->shader_program,
-                s_d3d.cur_texs[0].raw, s_d3d.cur_texs[0].w,
-                s_d3d.cur_texs[0].h, s_d3d.cur_texs[0].fmt, tcs,
+                s_d3d.cur_texs[0].raw, s_d3d.cur_texs[0].off,
+                s_d3d.cur_texs[0].w, s_d3d.cur_texs[0].h,
+                s_d3d.cur_texs[0].fmt, s_d3d.cur_texs[0].pitch, tcs, tnz, tsamples,
+                bst->surface_color_offset[0],
                 primitive, first, count,
                 a3->enabled, a3->type, a3->size, a3->stride,
                 a3->offset, a3->frequency, a3->format, cea,
