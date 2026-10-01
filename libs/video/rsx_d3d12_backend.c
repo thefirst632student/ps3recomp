@@ -2572,6 +2572,39 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     int n = rsx_fp_decompile(vm_base + off, 4096, fp_ctrl, hlsl, sizeof(hlsl));
     if (n <= 0) { static int _e=0; if(_e++<16) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr); return NULL; }
 
+    /* WA2 warning-2 FP raw probe.  Dump the exact guest microcode for
+     * 0x01BF9101 once, using the same resolved address and byte order consumed
+     * by rsx_fp_decompiler.  Logging only; shader behavior is unchanged. */
+    if ((fp_addr & ~1u) == 0x01BF9100u) {
+        static int warn2_fp_raw_dumped = 0;
+        if (!warn2_fp_raw_dumped) {
+            warn2_fp_raw_dumped = 1;
+            u32 psz = rsx_fp_program_size(vm_base + off, 4096);
+            fprintf(stderr, "[WARN2_FP_RAW] fp=0x%08X off=0x%08X bytes=%u instrs=%d\n",
+                    fp_addr, off, psz, n);
+            u32 roff = 0, ri = 0;
+            while (roff + 16u <= psz && ri < 16u) {
+                const u8* q = vm_base + off + roff;
+                u32 w0 = rsx_fp_read_word(q + 0);
+                u32 w1 = rsx_fp_read_word(q + 4);
+                u32 w2 = rsx_fp_read_word(q + 8);
+                u32 w3 = rsx_fp_read_word(q + 12);
+                u32 op_lo = (w0 >> 24) & 0x3Fu;
+                u32 op_hi = (w2 >> 31) & 1u;
+                u32 attr = (w0 >> 13) & 0xFu;
+                fprintf(stderr,
+                    "[WARN2_FP_RAW] i=%u bytes=%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X w=%08X/%08X/%08X/%08X op_lo=0x%02X op_hi=%u op_full=0x%02X attr=%u end=%u\n",
+                    ri, q[0],q[1],q[2],q[3], q[4],q[5],q[6],q[7],
+                    q[8],q[9],q[10],q[11], q[12],q[13],q[14],q[15],
+                    w0,w1,w2,w3,op_lo,op_hi,op_lo | (op_hi << 6),attr,w0 & 1u);
+                roff += 16u; ri++;
+                if (((w1 & 3u) == 2u) || ((w2 & 3u) == 2u) || ((w3 & 3u) == 2u))
+                    roff += 16u;
+                if (w0 & 1u) break;
+            }
+        }
+    }
+
     /* WA2 logo root-cause probe: do not alter shader behavior.  The two boot
      * logo draws use this fragment program.  Report which sampler units and
      * interpolants the translated program actually consumes so a black result
