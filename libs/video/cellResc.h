@@ -1,64 +1,32 @@
 /*
  * ps3recomp - cellResc HLE
  *
- * Resolution scaling/conversion module. Handles scaling of render targets
- * to display resolution (e.g., rendering at 720p, output at 1080p).
+ * Minimal RESC state/presentation support used by titles that render through
+ * cellResc instead of registering/flipping GCM display buffers directly.
  */
-
 #ifndef PS3RECOMP_CELL_RESC_H
 #define PS3RECOMP_CELL_RESC_H
 
 #include "ps3emu/ps3types.h"
 #include "ps3emu/error_codes.h"
+#include "cellGcmSys.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* ---------------------------------------------------------------------------
- * Error codes
- * -----------------------------------------------------------------------*/
-#define CELL_RESC_ERROR_NOT_INITIALIZED    0x80210301
-#define CELL_RESC_ERROR_REINITIALIZED      0x80210302
-#define CELL_RESC_ERROR_BAD_ARGUMENT       0x80210303
-#define CELL_RESC_ERROR_BAD_COMBINATION    0x80210304
-#define CELL_RESC_ERROR_BAD_ALIGNMENT      0x80210305
-#define CELL_RESC_ERROR_INSUFFICIENT_BUFFER 0x80210306
+#define CELL_RESC_ERROR_NOT_INITIALIZED    0x80210301u
+#define CELL_RESC_ERROR_REINITIALIZED      0x80210302u
+#define CELL_RESC_ERROR_BAD_ALIGNMENT      0x80210303u
+#define CELL_RESC_ERROR_BAD_ARGUMENT       0x80210304u
+#define CELL_RESC_ERROR_LESS_MEMORY        0x80210305u
+#define CELL_RESC_ERROR_GCM_FLIP_QUE_FULL  0x80210306u
+#define CELL_RESC_ERROR_BAD_COMBINATION    0x80210307u
 
-/* ---------------------------------------------------------------------------
- * Display buffer modes
- * -----------------------------------------------------------------------*/
-#define CELL_RESC_720x480                  0x01
-#define CELL_RESC_720x576                  0x02
-#define CELL_RESC_1280x720                 0x04
-#define CELL_RESC_1920x1080                0x08
-
-/* ---------------------------------------------------------------------------
- * Conversion modes
- * -----------------------------------------------------------------------*/
-#define CELL_RESC_FULLSCREEN               0
-#define CELL_RESC_LETTERBOX                1
-#define CELL_RESC_PANSCAN                  2
-
-/* ---------------------------------------------------------------------------
- * Pal temporal mode
- * -----------------------------------------------------------------------*/
-#define CELL_RESC_PAL_50                   0
-#define CELL_RESC_PAL_60_DROP              1
-#define CELL_RESC_PAL_60_INTERPOLATE       2
-#define CELL_RESC_PAL_60_INTERPOLATE_30_DROP   3
-#define CELL_RESC_PAL_60_INTERPOLATE_DROP_FLEXIBLE 4
-
-/* ---------------------------------------------------------------------------
- * Ratio conversion mode
- * -----------------------------------------------------------------------*/
-#define CELL_RESC_INTERLACE_FILTER         0
-#define CELL_RESC_NORMAL_BILINEAR          1
-#define CELL_RESC_ELEMENT_BILINEAR         2
-
-/* ---------------------------------------------------------------------------
- * Types
- * -----------------------------------------------------------------------*/
+#define CELL_RESC_720x480                  0x01u
+#define CELL_RESC_720x576                  0x02u
+#define CELL_RESC_1280x720                 0x04u
+#define CELL_RESC_1920x1080                0x08u
 
 typedef struct CellRescInitConfig {
     u32 size;
@@ -70,11 +38,12 @@ typedef struct CellRescInitConfig {
     u32 flipMode;
 } CellRescInitConfig;
 
+/* SDK layout is 16 bytes: width/height are BE u16 fields. */
 typedef struct CellRescSrc {
     u32 format;
     u32 pitch;
-    u32 width;
-    u32 height;
+    u16 width;
+    u16 height;
     u32 offset;
 } CellRescSrc;
 
@@ -84,40 +53,23 @@ typedef struct CellRescDsts {
     u32 heightAlign;
 } CellRescDsts;
 
-/* ---------------------------------------------------------------------------
- * Functions
- * -----------------------------------------------------------------------*/
+typedef void (*CellRescFlipHandler)(u32 head);
 
 s32 cellRescInit(const CellRescInitConfig* initConfig);
-void cellRescExit(void);
-
-s32 cellRescSetDisplayMode(u32 displayMode);
-s32 cellRescGetNumColorBuffers(u32 displayMode, u32 palTemporalMode, u32* numBufs);
 s32 cellRescVideoOutResolutionId2RescBufferMode(u32 resolutionId, u32* bufferMode);
-
-s32 cellRescGetBufferSize(u32* colorBufSize, u32* vertexBufSize, u32* fragmentBufSize);
-s32 cellRescSetBufferAddress(void* colorBuf, void* vertexBuf, void* fragmentBuf);
-
-s32 cellRescGcmSurface2RescSrc(const void* surface, CellRescSrc* src);
-s32 cellRescSetSrc(s32 index, const CellRescSrc* src);
-s32 cellRescSetDsts(u32 displayMode, const CellRescDsts* dsts);
-s32 cellRescSetConvertAndFlip(void* context, s32 index);
-s32 cellRescSetWaitFlip(void* context);
-
-s32 cellRescSetFlipHandler(void (*handler)(u32));
-s32 cellRescSetVBlankHandler(void (*handler)(u32));
-
-s32 cellRescGetDisplayMode(u32* displayMode);
-s32 cellRescGetLastFlipTime(u64* time);
-void cellRescResetFlipStatus(void);
-s32 cellRescGetFlipStatus(void);
-
-s32 cellRescSetPalInterpolateDropFlexRatio(float ratio);
-s32 cellRescCreateInterlaceTable(void* buf, float ea, u32 tableLen, s32 depth);
+s32 cellRescSetDsts(u32 bufferMode, const CellRescDsts* dsts);
+s32 cellRescSetDisplayMode(u32 bufferMode);
 s32 cellRescAdjustAspectRatio(float horizontal, float vertical);
+s32 cellRescGetBufferSize(s32* colorBuffers, s32* vertexArray, s32* fragmentShader);
+s32 cellRescGcmSurface2RescSrc(const void* gcmSurface, CellRescSrc* rescSrc);
+s32 cellRescSetSrc(s32 idx, const CellRescSrc* src);
+s32 cellRescSetConvertAndFlip(CellGcmContextData* context, s32 idx);
+s32 cellRescSetWaitFlip(CellGcmContextData* context);
+s32 cellRescSetBufferAddress(const u32* colorBuffers, const u32* vertexArray,
+                             const u32* fragmentShader);
+void cellRescSetFlipHandler(CellRescFlipHandler handler);
 
 #ifdef __cplusplus
 }
 #endif
-
-#endif /* PS3RECOMP_CELL_RESC_H */
+#endif
