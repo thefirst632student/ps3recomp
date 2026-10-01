@@ -7053,6 +7053,47 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
     }
     s_total++;
 
+    /* WA2 warning-2 composition probe.  The screen is built from four
+     * consecutive draws.  Log each pass once, including post-fetch vertex
+     * attributes and blend/texture state.  This is diagnostic only and does
+     * not modify guest state or shader output. */
+    if (s_d3d.current_rsx_state &&
+        ((s_d3d.current_rsx_state->shader_program & ~1u) == 0x01BF9100u)) {
+        const rsx_state* _ws = s_d3d.current_rsx_state;
+        int _pass = -1;
+        if (primitive == RSX_PRIMITIVE_TRIANGLE_STRIP && first == 0u  && count == 6u) _pass = 0;
+        else if (primitive == RSX_PRIMITIVE_TRIANGLE_STRIP && first == 6u  && count == 4u) _pass = 1;
+        else if (primitive == RSX_PRIMITIVE_TRIANGLE_STRIP && first == 10u && count == 4u) _pass = 2;
+        else if (first == 0u && count == 24u) _pass = 3;
+        if (_pass >= 0) {
+            static unsigned _seen = 0;
+            const unsigned _bit = 1u << (unsigned)_pass;
+            if (!(_seen & _bit)) {
+                _seen |= _bit;
+                fprintf(stderr,
+                    "[WARN2_PASS] pass=%d prim=%u first=%u count=%u fp=0x%08X tex0=0x%08X blend=%d sf=0x%X df=0x%X a0off=0x%08X a3off=0x%08X a8off=0x%08X\n",
+                    _pass, primitive, first, count, _ws->shader_program,
+                    s_d3d.cur_texs[0].raw, _ws->blend_enable,
+                    _ws->blend_sfactor, _ws->blend_dfactor,
+                    _ws->vertex_attribs[0].offset, _ws->vertex_attribs[3].offset,
+                    _ws->vertex_attribs[8].offset);
+                u32 _n = count;
+                if (_n > 8u) _n = 8u;
+                for (u32 _j = 0; _j < _n; ++_j) {
+                    const u32 _vi = first + _j;
+                    float _p[4], _c[4], _t[4];
+                    rsx_fetch_attrib(_ws, 0, _vi, _p);
+                    rsx_fetch_attrib(_ws, 3, _vi, _c);
+                    rsx_fetch_attrib(_ws, 8, _vi, _t);
+                    fprintf(stderr,
+                        "[WARN2_PASS_VTX] pass=%d vi=%u pos=(%.6g %.6g %.6g %.6g) col=(%.6g %.6g %.6g %.6g) uv=(%.6g %.6g %.6g %.6g)\n",
+                        _pass, _vi, _p[0],_p[1],_p[2],_p[3],
+                        _c[0],_c[1],_c[2],_c[3], _t[0],_t[1],_t[2],_t[3]);
+                }
+            }
+        }
+    }
+
     /* WA2 warning-2 raw colour probe.  The 704x512 warning uses FP
      * 0x01BF9101, which samples tex0 and multiplies by COLOR0.  Log the exact
      * guest bytes feeding ATTR3 over several frames, plus both LOCAL/MAIN
