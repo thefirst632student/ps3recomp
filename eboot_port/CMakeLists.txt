@@ -13,14 +13,13 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Fast Debug keeps the generated guest code optimized while leaving the host
-# runtime/scaffold at conventional Debug codegen.  The guest lift dominates
-# execution time; keeping host code unoptimized preserves useful diagnostics and
-# avoids making Debug needlessly resemble a Release executable.
+# Fast Debug keeps symbols/assertions but restores the optimized Debug codegen
+# that is required for practical static-recompilation performance.  v26's
+# VERSIONINFO/provenance resource is retained independently of optimization.
 option(PS3RECOMP_FAST_DEBUG
-    "Keep Debug symbols/asserts but optimize lifted guest code" ON)
+    "Keep Debug symbols/asserts while using optimized Debug codegen" ON)
 option(PS3RECOMP_FAST_DEBUG_RUNTIME
-    "Also optimize host runtime/HLE in Debug" OFF)
+    "Also optimize host runtime/HLE in Debug" ON)
 
 # Prefer Ninja if available
 if(NOT CMAKE_GENERATOR MATCHES "Ninja" AND NOT DEFINED ENV{CMAKE_GENERATOR})
@@ -288,19 +287,18 @@ else()
         COMPILE_OPTIONS "-w;-ffp-contract=off")
 endif()
 
-# CMake's Debug configuration normally emits -O0 (or /Od).  Optimizing the
-# entire executable was the original Fast-Debug implementation, but that also
-# optimized main/stubs/loader/crash diagnostics and made Windows Debug codegen
-# unnecessarily Release-like.  Append optimization only to the generated PPU
-# TUs after their warning/FP options above have been installed, so neither set of
-# per-source flags overwrites the other.
-if(PS3RECOMP_FAST_DEBUG AND RECOMP_SOURCES)
+# CMake's normal Debug configuration emits -O0 (or /Od), which is too costly
+# for a static recompiler: main/scaffold dispatch and generated PPU code execute
+# in the same hot target.  Restore v14's target-wide O1 while keeping Debug
+# symbols/assertions and frame pointers.  The v26 VERSIONINFO resource remains
+# unchanged so this build is a clean A/B test of codegen vs PE provenance.
+if(PS3RECOMP_FAST_DEBUG)
     if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" OR MSVC)
-        set_property(SOURCE ${RECOMP_SOURCES} APPEND PROPERTY COMPILE_OPTIONS
+        target_compile_options(${PROJECT_NAME} PRIVATE
             "$<$<CONFIG:Debug>:/O1>"
             "$<$<CONFIG:Debug>:/Oy->")
     elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        set_property(SOURCE ${RECOMP_SOURCES} APPEND PROPERTY COMPILE_OPTIONS
+        target_compile_options(${PROJECT_NAME} PRIVATE
             "$<$<CONFIG:Debug>:-O1>"
             "$<$<CONFIG:Debug>:-fno-omit-frame-pointer>")
     endif()

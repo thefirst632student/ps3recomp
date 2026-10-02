@@ -20,14 +20,13 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Options
 # ---------------------------------------------------------------------------
 option(PS3RECOMP_BUILD_TESTS "Build unit tests" OFF)
-option(PS3RECOMP_FAST_DEBUG "Keep Debug symbols/asserts while optimizing lifted guest code" ON)
-# Keep the host runtime/HLE at ordinary Debug codegen by default.  The lifted
-# guest is the dominant performance cost, while optimizing the whole Windows
-# runtime makes a Fast-Debug executable unnecessarily close to Release codegen
-# (and makes host-side debugging harder).  This can be re-enabled explicitly
-# when profiling shows the runtime itself is the bottleneck.
+option(PS3RECOMP_FAST_DEBUG "Keep Debug symbols/asserts while using optimized Debug codegen" ON)
+# Runtime/HLE is also performance-critical for static recompilation (syscalls,
+# RSX, synchronization, audio/video and memory helpers are crossed constantly).
+# Keep it optimized by default in Fast Debug; it can still be disabled for deep
+# host-side stepping without changing the guest-code setting.
 option(PS3RECOMP_FAST_DEBUG_RUNTIME
-    "Also optimize the host runtime/HLE in Debug" OFF)
+    "Also optimize the host runtime/HLE in Debug" ON)
 
 # ---------------------------------------------------------------------------
 # Collect source files
@@ -331,10 +330,9 @@ elseif(MSVC)
     )
 endif()
 
-# Fast Debug deliberately optimizes the lifted guest separately in the game
-# target.  Leave the host runtime/HLE at normal Debug codegen unless explicitly
-# requested.  Besides making stack traces and source stepping much better, this
-# avoids turning the entire Debug executable into Release-like optimized code.
+# Runtime/HLE sits directly on hot guest paths.  Fast Debug therefore restores
+# the v14-style optimized Debug runtime while retaining symbols/assertions and
+# the ordinary Windows VERSIONINFO resource added by v26.
 if(PS3RECOMP_FAST_DEBUG AND PS3RECOMP_FAST_DEBUG_RUNTIME)
     if(CMAKE_C_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" OR MSVC)
         target_compile_options(ps3recomp_runtime PRIVATE
