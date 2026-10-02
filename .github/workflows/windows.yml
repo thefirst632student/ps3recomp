@@ -216,26 +216,59 @@ jobs:
           cmake --build build-sync --target test_cond_semantics
           ctest --test-dir build-sync -R "^cond_" --output-on-failure
 
-      # V51 AV false-positive root-cause control. The repository already
-      # contains the lifted PPU source, so CI does NOT need EBOOT.ELF. Split
-      # ppu_recomp_000.cpp into temporary build shards and keep every shard at
-      # normal Release optimization. This establishes whether source/object
-      # splitting alone changes the Edge/Defender result before we vary O1 at
-      # function granularity. recompiled/ remains read-only.
-      - name: Prepare Release PPU function-bisect split control
+      # V52 AV false-positive control. V51 became clean merely by splitting one
+      # lifted TU into two objects, so function bisection cannot use multi-TU
+      # shards. Instead make a BYTE-IDENTICAL temporary copy of the original
+      # ppu_recomp_000.cpp and compile it as ONE TU / ONE object. CMake replaces
+      # the original source at the same source-list slot to preserve object/link
+      # ordering as closely as possible. recompiled/ remains read-only.
+      - name: Prepare Release PPU single-TU copy control
         if: matrix.build_type == 'Release'
         shell: pwsh
         run: |
           $outDir = Join-Path $env:GITHUB_WORKSPACE "eboot_port\build\av_bisect_generated"
-          python tools/ppu_build_bisect.py `
-            --input "eboot_port/recompiled/ppu_recomp_000.cpp" `
-            --output-dir "$outDir" `
-            --function-path A `
-            --selected-optimization release
-          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Remove-Item -Recurse -Force $outDir -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
+          $input = (Resolve-Path "eboot_port/recompiled/ppu_recomp_000.cpp").Path
+          $copy = Join-Path $outDir "ppu_recomp_000_av_single.cpp"
+          Copy-Item -LiteralPath $input -Destination $copy -Force
+
+          $inputHash = (Get-FileHash -Algorithm SHA256 $input).Hash.ToLowerInvariant()
+          $copyHash = (Get-FileHash -Algorithm SHA256 $copy).Hash.ToLowerInvariant()
+          if ($inputHash -ne $copyHash) {
+            throw "V52 control copy is not byte-identical: $inputHash != $copyHash"
+          }
+          $functionCount = (Select-String -Path $input -Pattern '^void\s+func_[0-9A-Fa-f]+\(ppu_context\*\s+ctx\)\s*\{' -AllMatches).Count
+
+          $manifestText = @(
+            "PS3Recomp V52 single-TU copy control",
+            "input: $input",
+            "input sha256: $inputHash",
+            "copy: $copy",
+            "copy sha256: $copyHash",
+            "byte identical: yes",
+            "functions: $functionCount",
+            "translation units replacing original: 1",
+            "selected optimization: release"
+          ) -join "`n"
+          $manifestText | Set-Content -Path (Join-Path $outDir "bisect_manifest.txt") -Encoding utf8
+          @{
+            schema = 2
+            mode = "single-tu-copy-control"
+            input = $input
+            input_sha256 = $inputHash
+            copy = $copy
+            copy_sha256 = $copyHash
+            byte_identical = $true
+            function_count = $functionCount
+            translation_units = 1
+            selected_optimization = "release"
+          } | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $outDir "bisect_manifest.json") -Encoding utf8
+
           "PS3RECOMP_AV_BISECT_DIR=$outDir" |
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          Write-Host "--- bisect manifest ---"
+          Write-Host "--- V52 AV control manifest ---"
           Get-Content (Join-Path $outDir "bisect_manifest.txt")
 
       - name: Build eboot_port (Game Port)
