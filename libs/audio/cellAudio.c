@@ -30,6 +30,9 @@ extern int      sys_event_queue_push_by_id(uint32_t queue_id,
 extern uint32_t sys_event_find_queue_by_key(uint64_t key);
 extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
 
+/* Shared boot-relative guest clock used by sys_time_get_system_time(). */
+extern u64 ps3_system_time_us(void);
+
 /* ---------------------------------------------------------------------------
  * Backend selection
  * -----------------------------------------------------------------------*/
@@ -140,6 +143,11 @@ static AudioNotifySlot s_notify_queues[CELL_AUDIO_MAX_NOTIFY_EVENT_QUEUES];
 
 /* Timestamp anchor for cellAudioGetPortTimestamp (microseconds, set at init) */
 static u64            s_audio_start_us = 0;
+/* CELL_AUDIO block tags live on one global server timeline.  A per-port
+ * read_index is only the ring cursor; it must not become the global tag. */
+static u64            s_audio_block_counter = 0;
+static u8             s_audio_port_seen_pcm[CELL_AUDIO_PORT_MAX];
+static int            s_audio_mix_seen_pcm = 0;
 
 /* Mixing thread */
 static volatile int  s_mix_thread_running = 0;
@@ -308,7 +316,18 @@ static int audio_backend_init(void)
         return -1;
     }
 
-    s_wasapi_client->lpVtbl->Start(s_wasapi_client);
+    hr = s_wasapi_client->lpVtbl->Start(s_wasapi_client);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[cellAudio] WASAPI Start failed: 0x%08lX\n", (unsigned long)hr);
+        s_wasapi_render->lpVtbl->Release(s_wasapi_render);
+        s_wasapi_render = NULL;
+        s_wasapi_client->lpVtbl->Release(s_wasapi_client);
+        s_wasapi_client = NULL;
+        if (s_wasapi_event) { CloseHandle(s_wasapi_event); s_wasapi_event = NULL; }
+        return -1;
+    }
+    fprintf(stderr, "[cellAudio] WASAPI ready: buffer=%u frames, 48000 Hz stereo float\n",
+            (unsigned)s_wasapi_buf_frames);
     return 0;
 }
 
@@ -387,6 +406,9 @@ static void audio_mix_one_block(void)
 
     mutex_lock(&s_audio_mutex);
 
+    /* One hardware audio period has elapsed for every started port. */
+    s_audio_block_counter++;
+
     for (int p = 0; p < CELL_AUDIO_PORT_MAX; p++) {
         AudioPortSlot* port = &s_ports[p];
         /* Diagnostic: a port that HOLDS PCM but was never started is inaudible
@@ -419,6 +441,7 @@ static void audio_mix_one_block(void)
         u32 block_idx = (u32)(port->read_index % nblock);
         u32 block_offset = block_idx * CELL_AUDIO_BLOCK_SAMPLES * nch;
         float* src = port->buffer + block_offset;
+        float first_pcm_peak = 0.0f;
 
         /* AUDIO_PEAK diag: which blocks of this port's WHOLE ring hold data,
          * vs which block the read cursor is on -- distinguishes "writer never
@@ -461,8 +484,22 @@ static void audio_mix_one_block(void)
                 right += center + lfe + rr + sr;
             }
 
+            if (!s_audio_port_seen_pcm[p]) {
+                float al = left < 0.0f ? -left : left;
+                float ar = right < 0.0f ? -right : right;
+                if (al > first_pcm_peak) first_pcm_peak = al;
+                if (ar > first_pcm_peak) first_pcm_peak = ar;
+            }
+
             s_mix_buffer[s * 2 + 0] += left;
             s_mix_buffer[s * 2 + 1] += right;
+        }
+
+        if (!s_audio_port_seen_pcm[p] && first_pcm_peak > 0.00001f) {
+            s_audio_port_seen_pcm[p] = 1;
+            fprintf(stderr,
+                    "[cellAudio] port %d first PCM: ridx=%llu block=%u peak=%.6f\n",
+                    p, (unsigned long long)port->read_index, block_idx, first_pcm_peak);
         }
 
         /* Firmware clears a ring-buffer block after consuming it. Besides
@@ -528,6 +565,17 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
                 float a = s_mix_buffer[i]; if (a < 0) a = -a; if (a > pk) pk = a; }
             if ((++_n % 200) == 0 || (pk > 0.001f && _n < 40))
                 fprintf(stderr, "[audio-peak] block#%u peak=%.4f\n", _n, pk); } }
+        if (!s_audio_mix_seen_pcm) {
+            float pk = 0.0f;
+            for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
+                float a = s_mix_buffer[i]; if (a < 0.0f) a = -a;
+                if (a > pk) pk = a;
+            }
+            if (pk > 0.00001f) {
+                s_audio_mix_seen_pcm = 1;
+                fprintf(stderr, "[cellAudio] first nonzero host mix: peak=%.6f\n", pk);
+            }
+        }
         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
 
         /* Notify event queues */
@@ -671,15 +719,11 @@ s32 cellAudioInit(void)
     }
 
 
-#ifdef _WIN32
-    { LARGE_INTEGER f, c;
-      QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
-      s_audio_start_us = (u64)(c.QuadPart / f.QuadPart) * 1000000ULL +
-          (u64)(c.QuadPart % f.QuadPart) * 1000000ULL / (u64)f.QuadPart; }
-#else
-    { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-      s_audio_start_us = (u64)ts.tv_sec * 1000000ULL + (u64)ts.tv_nsec / 1000ULL; }
-#endif
+    /* Same origin/domain as the guest's sys_time_get_system_time(). */
+    s_audio_start_us = ps3_system_time_us();
+    s_audio_block_counter = 0;
+    memset(s_audio_port_seen_pcm, 0, sizeof(s_audio_port_seen_pcm));
+    s_audio_mix_seen_pcm = 0;
     if (audio_start_mix_thread() < 0) {
         printf("[cellAudio] WARNING: Could not start mixing thread\n");
     }
@@ -879,10 +923,19 @@ s32 cellAudioGetPortBlockTag(u32 portNum, u64 blockNo, u64* tag)
         mutex_unlock(&s_audio_mutex);
         return CELL_AUDIO_ERROR_PARAM;
     }
-    u64 t = port->read_index + blockNo - (port->read_index % nblk);
-    if (blockNo < port->read_index % nblk) t += nblk;
+    /* RPCS3/Cell semantics: identify the tag belonging to this physical ring
+     * slot on the current global audio timeline.  Do NOT force the result into
+     * the future; callers commonly ask for a slot that has just elapsed and
+     * immediately pass that tag to GetPortTimestamp(). */
+    u64 t = s_audio_block_counter + blockNo - (port->read_index % nblk);
+    u64 gc = s_audio_block_counter;
+    u64 rp = port->read_index % nblk;
     mutex_unlock(&s_audio_mutex);
 
+    { static unsigned s_tag_log = 0; if (s_tag_log++ < 8)
+        fprintf(stderr, "[cellAudio-clock] BlockTag port=%u block=%llu cur=%llu global=%llu -> tag=%llu\n",
+                portNum, (unsigned long long)blockNo, (unsigned long long)rp,
+                (unsigned long long)gc, (unsigned long long)t); }
     vm_write64(tag_ea, t);
     return CELL_OK;
 }
@@ -900,12 +953,16 @@ s32 cellAudioGetPortTimestamp(u32 portNum, u64 tag, u64* stamp)
         return CELL_AUDIO_ERROR_PARAM;
 
     mutex_lock(&s_audio_mutex);
-    u64 global_counter = s_ports[portNum].read_index;
+    u64 global_counter = s_audio_block_counter;
     mutex_unlock(&s_audio_mutex);
     if (tag > global_counter)
         return CELL_AUDIO_ERROR_TAG_NOT_FOUND;
 
     u64 t = s_audio_start_us + tag * 256000000ULL / 48000ULL;
+    { static unsigned s_stamp_log = 0; if (s_stamp_log++ < 8)
+        fprintf(stderr, "[cellAudio-clock] Timestamp port=%u tag=%llu global=%llu -> %llu us (now=%llu)\n",
+                portNum, (unsigned long long)tag, (unsigned long long)global_counter,
+                (unsigned long long)t, (unsigned long long)ps3_system_time_us()); }
     vm_write64(stamp_ea, t);
     return CELL_OK;
 }
