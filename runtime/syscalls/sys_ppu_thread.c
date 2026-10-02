@@ -571,6 +571,45 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
     }
     table_unlock();
 
+    /* WA2: once the title reaches join(vpostStart), its video decode worker has
+     * already been joined and no more post-processing work can legitimately be
+     * produced.  The retail worker normally observes that EOS through its own
+     * callback/condition state.  With the HLE VDEC/VPOST split, the final wake
+     * can be lost and vpostStart sleeps forever before the existing vdispStart
+     * EOS bridge gets a chance to run.
+     *
+     * vpostStart (EBOOT 0x00087C6C) uses the same object layout pattern as the
+     * display worker: +0x10 is the active state, +0x14/+0x18 are the mutex/cond
+     * ids, and +0x8C/+0x8D are retained wake bytes.  Clear the active state,
+     * arm the retained byte, and broadcast the worker's own condition before
+     * blocking in the host join.  This does not terminate the host thread; it
+     * lets the guest worker follow its normal drain/return path. */
+    if (strcmp(t->name, "vpostStart") == 0) {
+        const uint32_t vpost = (uint32_t)t->entry_arg;
+        if (vpost && vm_is_valid_addr(vpost + 0x8D)) {
+            uint8_t* obj = (uint8_t*)vm_to_host(vpost);
+            const uint32_t old_state = ((uint32_t)obj[0x10] << 24) |
+                                       ((uint32_t)obj[0x11] << 16) |
+                                       ((uint32_t)obj[0x12] << 8)  |
+                                       (uint32_t)obj[0x13];
+            obj[0x10] = 0;
+            obj[0x11] = 0;
+            obj[0x12] = 0;
+            obj[0x13] = 0;
+            obj[0x8C] = 1;
+            obj[0x8D] = 0;
+            const uint8_t* cond_p = (const uint8_t*)vm_to_host(vpost + 0x18);
+            const uint32_t cond_id = ((uint32_t)cond_p[0] << 24) |
+                                     ((uint32_t)cond_p[1] << 16) |
+                                     ((uint32_t)cond_p[2] << 8)  |
+                                     (uint32_t)cond_p[3];
+            const int32_t wake_rc = sys_cond_signal_all_id(cond_id);
+            fprintf(stderr,
+                    "[HLE] WA2 vpost EOS wake: vpost=0x%08X state=0x%08X->0 cond=%u rc=0x%08X\n",
+                    vpost, old_state, cond_id, (uint32_t)wake_rc);
+        }
+    }
+
     /* WA2: vpostStart being fully joined is the producer-side EOS.  vdispStart
      * can otherwise sleep forever on its empty-queue condition because older
      * HLE code gated the wakeup on cellVdec_is_seq_active(), whose bit can stay
