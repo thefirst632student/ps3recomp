@@ -3498,6 +3498,13 @@ class PPULifter:
                 f"  Release-codegen function bisect: logical chunk "
                 f"{chunk_idx:03d}, path {bisect_function_path.upper()} -> "
                 f"{count}/{len(funcs)} functions at O1", flush=True)
+            if len(chosen) <= 16:
+                print("  Release-codegen selected function(s):", flush=True)
+                for local_idx, func in enumerate(chosen, start=start):
+                    print(
+                        f"    [{local_idx:04d}] {func.name} "
+                        f"0x{func.start_addr:08X}-0x{func.end_addr:08X}",
+                        flush=True)
 
         return written
 
@@ -3951,9 +3958,9 @@ def main() -> None:
                                  "A2A1A", "A2A1B", "A2A1B1", "A2A1B2", "B"],
                         help="Preserve the historical Release TU-bisect tree and "
                              "split the selected logical chunk(s) at function boundaries")
-    parser.add_argument("--release-codegen-bisect-function-path", default="AAAAAAA",
+    parser.add_argument("--release-codegen-bisect-function-path", default="AAAAAAAA",
                         help="Recursive A/B function half to emit as *_avbisect_o1.cpp "
-                             "inside the selected logical chunk slice (default: AAAAAAA)")
+                             "inside the selected logical chunk slice (default: AAAAAAAA)")
     parser.add_argument("--single-file", action="store_true",
                         help="Emit one ppu_recomp.c instead of split chunks (for "
                              "single-file post-processing, e.g. flOw's vmx_splice)")
