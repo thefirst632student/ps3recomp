@@ -23,7 +23,10 @@ option(PS3RECOMP_FAST_DEBUG_RUNTIME
 option(PS3RECOMP_RELEASE_RUNTIME_BISECT_O1
     "Bisect Defender false-positive by compiling only ps3recomp_runtime at O1 in Release" OFF)
 option(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_O1
-    "Bisect Defender false-positive by compiling only lifted PPU sources at O1 in Release" ON)
+    "Legacy whole-lifted-PPU Defender bisect at O1 in Release" OFF)
+set(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_HALF "A" CACHE STRING
+    "Defender bisect for lifted PPU Release codegen: OFF, A (first half), or B (second half)")
+set_property(CACHE PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_HALF PROPERTY STRINGS OFF A B)
 
 # Prefer Ninja if available
 if(NOT CMAKE_GENERATOR MATCHES "Ninja" AND NOT DEFINED ENV{CMAKE_GENERATOR})
@@ -69,6 +72,8 @@ file(GLOB RECOMP_SOURCES CONFIGURE_DEPENDS
     "${RECOMP_DIR}/*.c"
     "${RECOMP_DIR}/*.cpp"
 )
+# Keep Defender bisects reproducible across filesystems/generators.
+list(SORT RECOMP_SOURCES)
 if(NOT RECOMP_SOURCES)
     message(FATAL_ERROR
         "${RECOMP_DIR} has a ppu_recomp.h but no .c or .cpp beside it. The "
@@ -308,19 +313,61 @@ if(PS3RECOMP_FAST_DEBUG)
     endif()
 endif()
 
-# V34 disjoint Release bisect: keep the runtime, main/stubs and the per-game
-# PPU scaffold at normal Release optimization and lower only the machine-
-# generated lifted PPU translation units to O1.  This isolates RECOMP_SOURCES
-# from the host/scaffold half of the executable.  Lifted SPU TUs keep their
-# explicit per-source -O2.  No Debug feature, CRT mode, NDEBUG setting or
-# linker option is changed.
-if(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_O1 AND RECOMP_SOURCES)
+# V35 lifted-PPU binary search.  V34 proved that keeping every lifted PPU TU
+# at O1 makes Release clean while the host/scaffold/runtime may remain fully
+# optimized.  Split the sorted lifted source list in half and lower only one
+# half to O1; the other half stays at the normal Release optimization level.
+# This is a localization experiment only: no Debug feature, CRT, NDEBUG or
+# linker setting is changed.
+# Restrict the binary search to the numbered lifter chunks.  Helper sources
+# such as ppu_hle_nids.cpp are not guest machine-code chunks and would skew the
+# split boundary without helping localize the signature.
+set(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES ${RECOMP_SOURCES})
+list(FILTER PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES INCLUDE
+    REGEX "ppu_recomp_[0-9]+\.(c|cpp)$")
+list(SORT PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES)
+
+set(PS3RECOMP_RELEASE_LIFTED_PPU_O1_SOURCES "")
+if(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_O1 AND
+   PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES)
+    # Legacy whole-chunk mode retained for reproducibility of v34's result.
+    set(PS3RECOMP_RELEASE_LIFTED_PPU_O1_SOURCES
+        ${PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES})
+elseif(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES AND
+       NOT PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_HALF STREQUAL "OFF")
+    if(NOT PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_HALF STREQUAL "A" AND
+       NOT PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_HALF STREQUAL "B")
+        message(FATAL_ERROR
+            "PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_HALF must be OFF, A, or B")
+    endif()
+
+    list(LENGTH PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES _recomp_bisect_count)
+    math(EXPR _recomp_bisect_mid "(${_recomp_bisect_count} + 1) / 2")
+    if(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_HALF STREQUAL "A")
+        list(SUBLIST PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES 0 ${_recomp_bisect_mid}
+            PS3RECOMP_RELEASE_LIFTED_PPU_O1_SOURCES)
+    else()
+        math(EXPR _recomp_bisect_tail
+            "${_recomp_bisect_count} - ${_recomp_bisect_mid}")
+        if(_recomp_bisect_tail GREATER 0)
+            list(SUBLIST PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES ${_recomp_bisect_mid} ${_recomp_bisect_tail}
+                PS3RECOMP_RELEASE_LIFTED_PPU_O1_SOURCES)
+        endif()
+    endif()
+
+    list(LENGTH PS3RECOMP_RELEASE_LIFTED_PPU_O1_SOURCES _recomp_bisect_o1_count)
+    message(STATUS
+        "Release lifted-PPU Defender bisect half ${PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_HALF}: "
+        "${_recomp_bisect_o1_count}/${_recomp_bisect_count} TU(s) at O1")
+endif()
+
+if(PS3RECOMP_RELEASE_LIFTED_PPU_O1_SOURCES)
     if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" OR MSVC)
-        set_property(SOURCE ${RECOMP_SOURCES} APPEND PROPERTY COMPILE_OPTIONS
-            "$<$<CONFIG:Release>:/O1>")
+        set_property(SOURCE ${PS3RECOMP_RELEASE_LIFTED_PPU_O1_SOURCES}
+            APPEND PROPERTY COMPILE_OPTIONS "$<$<CONFIG:Release>:/O1>")
     elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        set_property(SOURCE ${RECOMP_SOURCES} APPEND PROPERTY COMPILE_OPTIONS
-            "$<$<CONFIG:Release>:-O1>")
+        set_property(SOURCE ${PS3RECOMP_RELEASE_LIFTED_PPU_O1_SOURCES}
+            APPEND PROPERTY COMPILE_OPTIONS "$<$<CONFIG:Release>:-O1>")
     endif()
 endif()
 

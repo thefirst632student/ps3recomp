@@ -30,7 +30,10 @@ option(PS3RECOMP_FAST_DEBUG_RUNTIME
 option(PS3RECOMP_RELEASE_RUNTIME_BISECT_O1
     "Bisect Defender false-positive: compile only ps3recomp_runtime at O1 in Release" OFF)
 option(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_O1
-    "Bisect Defender false-positive: compile only lifted PPU sources at O1 in Release" OFF)
+    "Legacy whole-lifted-PPU Defender bisect at O1 in Release" OFF)
+set(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_HALF "OFF" CACHE STRING
+    "Defender bisect for lifted PPU Release codegen: OFF, A (first half), or B (second half)")
+set_property(CACHE PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_HALF PROPERTY STRINGS OFF A B)
 
 # ---------------------------------------------------------------------------
 # Collect source files
@@ -353,7 +356,9 @@ endif()
 # normal Release optimization and lower only the game-agnostic runtime/HLE
 # static library to O1.  This cleanly separates ps3recomp_runtime from the
 # executable target without adding any Debug feature or changing NDEBUG/CRT.
-if(PS3RECOMP_RELEASE_RUNTIME_BISECT_O1 AND NOT PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_O1)
+if(PS3RECOMP_RELEASE_RUNTIME_BISECT_O1 AND
+   NOT PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_O1 AND
+   PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_HALF STREQUAL "OFF")
     if(CMAKE_C_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" OR MSVC)
         target_compile_options(ps3recomp_runtime PRIVATE
             "$<$<CONFIG:Release>:/O1>")
