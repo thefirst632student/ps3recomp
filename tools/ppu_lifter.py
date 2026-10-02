@@ -3311,6 +3311,101 @@ class PPULifter:
         lines.append("")
         return lines
 
+    @staticmethod
+    def _bisect_select_half(items: list, first: bool) -> list:
+        """Return the ceil-first-half or remainder second-half of *items*.
+
+        This intentionally mirrors the CMake Release-codegen bisect used by
+        the project template: the first side always receives ceil(N/2).  The
+        rule must stay identical or a function-level relift could silently
+        select a different logical chunk than the preceding TU-level bisect.
+        """
+        cut = (len(items) + 1) // 2
+        return items[:cut] if first else items[cut:]
+
+    @classmethod
+    def _select_bisect_chunk_indices(cls, chunk_count: int,
+                                     selector: str | None) -> set[int]:
+        """Resolve the historical TU-bisect selector to logical chunk indices.
+
+        The names preserve the v35-v41 search tree rather than inventing a new
+        ordering at function-bisect time.  Logical chunks are planned before
+        any physical source is split, so adding *_avbisect_*.cpp files cannot
+        move the boundary being investigated.
+        """
+        if not selector:
+            return set()
+        steps = {
+            "A1":       (True, True),
+            "A2":       (True, False),
+            "A2A":      (True, False, True),
+            "A2B":      (True, False, False),
+            "A2A1":     (True, False, True, True),
+            "A2A2":     (True, False, True, False),
+            "A2A1A":    (True, False, True, True, True),
+            "A2A1B":    (True, False, True, True, False),
+            "A2A1B1":   (True, False, True, True, False, True),
+            "A2A1B2":   (True, False, True, True, False, False),
+            "B":        (False,),
+        }
+        if selector not in steps:
+            raise ValueError(f"unknown Release-codegen chunk bisect slice: {selector}")
+        cur = list(range(chunk_count))
+        for first in steps[selector]:
+            cur = cls._bisect_select_half(cur, first)
+        return set(cur)
+
+    @classmethod
+    def _select_bisect_function_range(cls, function_count: int,
+                                      path: str) -> tuple[int, int]:
+        """Return (start,count) for a recursive A/B function-bisect path.
+
+        A selects ceil(N/2), B selects the remainder.  Paths compose (AA, AB,
+        BA, ...), allowing later rounds to keep narrowing the same generated
+        source without any hand-edit of recompiled output.
+        """
+        if not path or any(ch not in "AB" for ch in path.upper()):
+            raise ValueError("function bisect path must contain only A/B")
+        start = 0
+        count = function_count
+        for ch in path.upper():
+            first_count = (count + 1) // 2
+            if ch == "A":
+                count = first_count
+            else:
+                start += first_count
+                count -= first_count
+        return start, count
+
+    def _function_def_line_count(self, func) -> int:
+        """Exact line count of _function_def_lines without materialising it."""
+        # Definition + closing brace + trailing blank line.
+        n = len(func.body_lines) + 3
+        if self.name_map.get(func.start_addr):
+            n += 1
+        if func.fallthrough_to:
+            n += 1
+        return n
+
+    def _plan_source_chunks(self, max_lines: int) -> list[list["LiftedFunction"]]:
+        """Plan the legacy logical chunks without writing any generated file."""
+        emit_funcs = self._emit_functions()
+        preamble_len = len(self._preamble_lines())
+        chunks: list[list["LiftedFunction"]] = []
+        cur: list["LiftedFunction"] = []
+        cur_len = preamble_len
+        for func in emit_funcs:
+            def_len = self._function_def_line_count(func)
+            if cur and cur_len + def_len > max_lines:
+                chunks.append(cur)
+                cur = []
+                cur_len = preamble_len
+            cur.append(func)
+            cur_len += def_len
+        if cur:
+            chunks.append(cur)
+        return chunks
+
     def emit_source(self) -> str:
         """Full single-file C source (kept for small binaries and tests; the
         default build path uses write_source_files, which splits the output
@@ -3326,48 +3421,84 @@ class PPULifter:
         return "\n".join(lines)
 
     def write_source_files(self, out_dir: str, base: str = "ppu_recomp",
-                           ext: str = ".cpp", max_lines: int = 600_000) -> list[str]:
-        """Write the C source split across chunk files. MSVC refuses sources
-        past 16,777,215 lines (C4049/C1088), which a large game exceeds in a
-        single file; splitting also lets the build compile chunks in parallel
-        and rebuild incrementally. Chunks are cut only at function
-        boundaries. Returns the list of written paths."""
+                           ext: str = ".cpp", max_lines: int = 600_000,
+                           bisect_chunk_slice: str | None = None,
+                           bisect_function_path: str = "A") -> list[str]:
+        """Write lifted C/C++ split at function boundaries.
+
+        With *bisect_chunk_slice*, preserve the normal logical chunk plan, then
+        physically split only that historical TU-bisect slice around the
+        recursively-selected function range.  The selected range is emitted as
+        ``*_avbisect_o1.cpp``; CMake recognizes that suffix and lowers only
+        those functions to O1 in Release.  Generated output remains generated:
+        no recompiled file needs to be edited by hand.
+        """
         emit_funcs = self._emit_functions()
         func_by_addr = {f.start_addr: f for f in emit_funcs}
         sorted_addrs = sorted(func_by_addr.keys())
         addr_index = {a: i for i, a in enumerate(sorted_addrs)}
-
         preamble = self._preamble_lines()
-        written: list[str] = []
-        chunk_idx = 0
 
-        def flush(body_lines: list[str], trailer: list[str] | None = None) -> None:
-            nonlocal chunk_idx
-            path = os.path.join(out_dir, f"{base}_{chunk_idx:03d}{ext}")
+        logical_chunks = self._plan_source_chunks(max_lines)
+        selected_chunks = self._select_bisect_chunk_indices(
+            len(logical_chunks), bisect_chunk_slice)
+        if bisect_chunk_slice and not selected_chunks:
+            raise ValueError(
+                f"Release-codegen chunk slice {bisect_chunk_slice} is empty "
+                f"for {len(logical_chunks)} logical chunks")
+
+        written: list[str] = []
+
+        def write_part(path: str, funcs: list["LiftedFunction"],
+                       trailer: list[str] | None = None) -> None:
+            body_lines: list[str] = []
+            for func in funcs:
+                body_lines += self._function_def_lines(
+                    func, func_by_addr, sorted_addrs, addr_index)
             with open(path, "w") as f:
                 f.write("\n".join(preamble + body_lines + (trailer or [])))
             written.append(path)
             print(f"  wrote {os.path.basename(path)} "
-                  f"({len(preamble) + len(body_lines) + len(trailer or [])} lines)",
-                  flush=True)
-            chunk_idx += 1
+                  f"({len(preamble) + len(body_lines) + len(trailer or [])} lines, "
+                  f"{len(funcs)} functions)", flush=True)
 
-        cur: list[str] = []
-        cur_len = len(preamble)
-        n = len(emit_funcs)
-        for i, func in enumerate(emit_funcs):
-            if i % 10000 == 0:
-                print(f"  ... emitting {i}/{n} functions", flush=True)
-            deflines = self._function_def_lines(func, func_by_addr, sorted_addrs, addr_index)
-            if cur and cur_len + len(deflines) > max_lines:
-                flush(cur)
-                cur = []
-                cur_len = len(preamble)
-            cur += deflines
-            cur_len += len(deflines)
+        last_logical = len(logical_chunks) - 1
+        for chunk_idx, funcs in enumerate(logical_chunks):
+            is_final = chunk_idx == last_logical
+            table = self._table_lines() if is_final else None
+            if chunk_idx not in selected_chunks:
+                path = os.path.join(out_dir, f"{base}_{chunk_idx:03d}{ext}")
+                write_part(path, funcs, table)
+                continue
 
-        # Final chunk carries the function table.
-        flush(cur, self._table_lines())
+            start, count = self._select_bisect_function_range(
+                len(funcs), bisect_function_path)
+            if count <= 0:
+                raise ValueError(
+                    f"function bisect path {bisect_function_path} is empty in "
+                    f"logical chunk {chunk_idx:03d} ({len(funcs)} functions)")
+            before = funcs[:start]
+            chosen = funcs[start:start + count]
+            after = funcs[start + count:]
+
+            parts: list[tuple[str, list["LiftedFunction"]]] = []
+            if before:
+                parts.append(("pre", before))
+            parts.append(("avbisect_o1", chosen))
+            if after:
+                parts.append(("post", after))
+
+            for part_idx, (tag, part_funcs) in enumerate(parts):
+                part_table = table if is_final and part_idx == len(parts) - 1 else None
+                path = os.path.join(
+                    out_dir, f"{base}_{chunk_idx:03d}_{tag}{ext}")
+                write_part(path, part_funcs, part_table)
+
+            print(
+                f"  Release-codegen function bisect: logical chunk "
+                f"{chunk_idx:03d}, path {bisect_function_path.upper()} -> "
+                f"{count}/{len(funcs)} functions at O1", flush=True)
+
         return written
 
 
@@ -3815,6 +3946,14 @@ def main() -> None:
     parser.add_argument("--output", "-o", default=".", help="Output directory")
     parser.add_argument("--header-name", default="ppu_recomp.h", help="Header file name")
     parser.add_argument("--source-name", default="ppu_recomp.c", help="Source file name")
+    parser.add_argument("--release-codegen-bisect-chunk-slice", default=None,
+                        choices=["A1", "A2", "A2A", "A2B", "A2A1", "A2A2",
+                                 "A2A1A", "A2A1B", "A2A1B1", "A2A1B2", "B"],
+                        help="Preserve the historical Release TU-bisect tree and "
+                             "split the selected logical chunk(s) at function boundaries")
+    parser.add_argument("--release-codegen-bisect-function-path", default="A",
+                        help="Recursive A/B function half to emit as *_avbisect_o1.cpp "
+                             "inside the selected logical chunk slice (default: A)")
     parser.add_argument("--single-file", action="store_true",
                         help="Emit one ppu_recomp.c instead of split chunks (for "
                              "single-file post-processing, e.g. flOw's vmx_splice)")
@@ -3855,6 +3994,14 @@ def main() -> None:
                              "split out as its own 0x20-byte function so direct "
                              "calls to it dispatch to the HLE handler.")
     args = parser.parse_args()
+
+    if args.release_codegen_bisect_chunk_slice:
+        _fp = args.release_codegen_bisect_function_path.upper()
+        if not _fp or any(ch not in "AB" for ch in _fp):
+            parser.error("--release-codegen-bisect-function-path must contain only A/B")
+        args.release_codegen_bisect_function_path = _fp
+        if args.single_file:
+            parser.error("Release function bisect requires split output; remove --single-file")
 
     # Load firmware-import stubs (addr -> NID) up front; applied to func_bounds
     # and the lifter below.
@@ -4374,7 +4521,10 @@ def main() -> None:
         print(f"Wrote {os.path.basename(src_path)}")
     else:
         print("Writing C source (split into chunks)...", flush=True)
-        paths = lifter.write_source_files(args.output, base=base)
+        paths = lifter.write_source_files(
+            args.output, base=base,
+            bisect_chunk_slice=args.release_codegen_bisect_chunk_slice,
+            bisect_function_path=args.release_codegen_bisect_function_path)
         print(f"Wrote {header_path}")
         print(f"Wrote {len(paths)} source chunks: "
               f"{os.path.basename(paths[0])} .. {os.path.basename(paths[-1])}")
