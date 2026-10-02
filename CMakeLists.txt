@@ -20,7 +20,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Options
 # ---------------------------------------------------------------------------
 option(PS3RECOMP_BUILD_TESTS "Build unit tests" OFF)
-option(PS3RECOMP_FAST_DEBUG "Keep Debug symbols/asserts but optimize hot runtime code" ON)
+option(PS3RECOMP_FAST_DEBUG "Keep Debug symbols/asserts while optimizing lifted guest code" ON)
+# Keep the host runtime/HLE at ordinary Debug codegen by default.  The lifted
+# guest is the dominant performance cost, while optimizing the whole Windows
+# runtime makes a Fast-Debug executable unnecessarily close to Release codegen
+# (and makes host-side debugging harder).  This can be re-enabled explicitly
+# when profiling shows the runtime itself is the bottleneck.
+option(PS3RECOMP_FAST_DEBUG_RUNTIME
+    "Also optimize the host runtime/HLE in Debug" OFF)
 
 # ---------------------------------------------------------------------------
 # Collect source files
@@ -324,20 +331,19 @@ elseif(MSVC)
     )
 endif()
 
-# Debug builds of a static recompiler are pathologically slow at -O0: every
-# guest instruction helper, syscall shim and RSX state update is host code.
-# Keep Debug's symbols and assertions, but let the hot runtime receive modest
-# optimization.  Target options are appended after CMake's configuration flags,
-# so -O1 overrides Debug's earlier -O0 while -g / CodeView information remains.
-if(PS3RECOMP_FAST_DEBUG)
-    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
-        target_compile_options(ps3recomp_runtime PRIVATE
-            "$<$<CONFIG:Debug>:-O1>"
-            "$<$<CONFIG:Debug>:-fno-omit-frame-pointer>")
-    elseif(MSVC)
+# Fast Debug deliberately optimizes the lifted guest separately in the game
+# target.  Leave the host runtime/HLE at normal Debug codegen unless explicitly
+# requested.  Besides making stack traces and source stepping much better, this
+# avoids turning the entire Debug executable into Release-like optimized code.
+if(PS3RECOMP_FAST_DEBUG AND PS3RECOMP_FAST_DEBUG_RUNTIME)
+    if(CMAKE_C_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" OR MSVC)
         target_compile_options(ps3recomp_runtime PRIVATE
             "$<$<CONFIG:Debug>:/O1>"
             "$<$<CONFIG:Debug>:/Oy->")
+    elseif(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(ps3recomp_runtime PRIVATE
+            "$<$<CONFIG:Debug>:-O1>"
+            "$<$<CONFIG:Debug>:-fno-omit-frame-pointer>")
     endif()
 endif()
 

@@ -13,10 +13,14 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Debug should remain diagnosable without forcing the entire static recompile
-# through -O0.  This keeps symbols/assertions and only changes optimization.
+# Fast Debug keeps the generated guest code optimized while leaving the host
+# runtime/scaffold at conventional Debug codegen.  The guest lift dominates
+# execution time; keeping host code unoptimized preserves useful diagnostics and
+# avoids making Debug needlessly resemble a Release executable.
 option(PS3RECOMP_FAST_DEBUG
-    "Keep Debug symbols/asserts but optimize lifted guest/scaffold code" ON)
+    "Keep Debug symbols/asserts but optimize lifted guest code" ON)
+option(PS3RECOMP_FAST_DEBUG_RUNTIME
+    "Also optimize host runtime/HLE in Debug" OFF)
 
 # Prefer Ninja if available
 if(NOT CMAKE_GENERATOR MATCHES "Ninja" AND NOT DEFINED ENV{CMAKE_GENERATOR})
@@ -187,11 +191,26 @@ if(SPU_SOURCES)
     endif()
 endif()
 
-# app.rc carries the icon, the version block and the manifest, and needs a
-# resource compiler. Listing it as a source on a host that has none is not a
-# link error, it is a "no rule to make" for a file nothing can consume.
-if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/app.rc")
-    target_sources(${PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/app.rc")
+# Give Windows executables stable, human-readable VERSIONINFO.  This is useful
+# for crash reports, Explorer properties and security-product provenance.  It is
+# intentionally ordinary metadata: no packing, obfuscation or post-link byte
+# rewriting.  Ports may override the strings from the CMake command line.
+if(WIN32)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/app.rc")
+        # A port-specific resource wins when present.
+        target_sources(${PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/app.rc")
+    else()
+        set(PS3RECOMP_WINDOWS_COMPANY_NAME "PS3Recomp Project" CACHE STRING
+            "CompanyName stored in the Windows VERSIONINFO resource")
+        set(PS3RECOMP_WINDOWS_PRODUCT_NAME "${PROJECT_NAME}" CACHE STRING
+            "ProductName stored in the Windows VERSIONINFO resource")
+        set(PS3RECOMP_WINDOWS_FILE_DESCRIPTION "${PROJECT_DESCRIPTION}" CACHE STRING
+            "FileDescription stored in the Windows VERSIONINFO resource")
+        configure_file(
+            "${CMAKE_CURRENT_SOURCE_DIR}/app.rc.in"
+            "${CMAKE_CURRENT_BINARY_DIR}/app.rc" @ONLY)
+        target_sources(${PROJECT_NAME} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/app.rc")
+    endif()
 endif()
 
 target_include_directories(${PROJECT_NAME} PRIVATE
@@ -213,24 +232,6 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 # The runtime is C++, and on Apple also Objective-C. Letting CMake infer the
 # link language from the generated C would leave the C++ standard library out.
 set_target_properties(${PROJECT_NAME} PROPERTIES LINKER_LANGUAGE CXX)
-
-# CMake's Debug configuration normally emits -O0 (or /Od).  That is especially
-# expensive for statically recompiled guest code because the generated TUs are
-# the emulated CPU itself.  Append a modest optimization level while retaining
-# Debug's symbols, assertions and frame pointers.  Disable with
-# -DPS3RECOMP_FAST_DEBUG=OFF when instruction-by-instruction host debugging is
-# more important than runtime speed.
-if(PS3RECOMP_FAST_DEBUG)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        target_compile_options(${PROJECT_NAME} PRIVATE
-            "$<$<CONFIG:Debug>:-O1>"
-            "$<$<CONFIG:Debug>:-fno-omit-frame-pointer>")
-    elseif(MSVC)
-        target_compile_options(${PROJECT_NAME} PRIVATE
-            "$<$<CONFIG:Debug>:/O1>"
-            "$<$<CONFIG:Debug>:/Oy->")
-    endif()
-endif()
 
 # Windows system import libraries. dbghelp symbolizes crash-handler addresses
 # against the PDB, user32 and gdi32 are what the backend's window and its GDI
@@ -285,6 +286,24 @@ if(MSVC)
 else()
     set_source_files_properties(${RECOMP_SOURCES} PROPERTIES
         COMPILE_OPTIONS "-w;-ffp-contract=off")
+endif()
+
+# CMake's Debug configuration normally emits -O0 (or /Od).  Optimizing the
+# entire executable was the original Fast-Debug implementation, but that also
+# optimized main/stubs/loader/crash diagnostics and made Windows Debug codegen
+# unnecessarily Release-like.  Append optimization only to the generated PPU
+# TUs after their warning/FP options above have been installed, so neither set of
+# per-source flags overwrites the other.
+if(PS3RECOMP_FAST_DEBUG AND RECOMP_SOURCES)
+    if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" OR MSVC)
+        set_property(SOURCE ${RECOMP_SOURCES} APPEND PROPERTY COMPILE_OPTIONS
+            "$<$<CONFIG:Debug>:/O1>"
+            "$<$<CONFIG:Debug>:/Oy->")
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        set_property(SOURCE ${RECOMP_SOURCES} APPEND PROPERTY COMPILE_OPTIONS
+            "$<$<CONFIG:Debug>:-O1>"
+            "$<$<CONFIG:Debug>:-fno-omit-frame-pointer>")
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
