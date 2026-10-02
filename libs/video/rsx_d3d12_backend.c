@@ -422,10 +422,11 @@ static u32               s_logo_probe_x = 0;
 static u32               s_logo_probe_y = 0;
 static u8                s_logo_probe_rgba[4] = {0,0,0,0};
 static int               s_logo_probe_ready = 0;
-/* WA2 warning colour-link probe. Set by the draw path once the guest ATTR3
- * feeding the large warning quad becomes non-black; the frame readback waits
- * for this so COL0 is tested after the intentional black phase. */
-static int               s_warn2_col0_nonzero = 0;
+/* WA2 warning native-output probe. Stage 1 arms when guest ATTR3 first becomes
+ * non-black; stage 2 arms once it is effectively white. The end-of-frame
+ * readback runs with the fragment shader completely unmodified, so it measures
+ * the exact swapchain render target immediately before Present. */
+static int               s_warn2_native_stage = 0;
 
 /* Host movie bridge for eboot_port.  This is the renderer instance that owns
  * the window/swap chain created by eboot_port/main.cpp.  cellVpost workers run
@@ -2770,51 +2771,10 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         }
     }
 
-    /* WA2 warning colour-link diagnostic. Earlier probes proved TEXCOORD0,
-     * normal sampling, and fixed-UV sampling all work. The only remaining
-     * operand in the real two-op FP is COLOR0, so split this FP into three
-     * screen-space bands:
-     *   x < 522: interpolated COLOR0 directly;
-     *   522..756: texture sample only;
-     *   x >= 757: texture sample * COLOR0 (the real shader expression).
-     * Frame readback is delayed until the guest ATTR3 is non-black. */
-    if ((fp_addr & ~1u) == 0x01BF9100u) {
-        /* Current rsx_fp_decompiler terminates single-target programs as:
-         *     float4 _o = r[0];   (or h[0])
-         *     return (_o == _o) ? _o : (float4)0;
-         * Rewrite the _o assignment, leaving the NaN guard intact.  Matching
-         * the declaration rather than a particular r/h export also survives
-         * the FP32/FP16 export mode. */
-        char* rp = strstr(hlsl, "    float4 _o = ");
-        if (rp) {
-            char* semi = strchr(rp, ';');
-            if (semi) {
-                static const char rep[] =
-                    "    float4 _o = (input.position.x < 522.0f) ? "
-                    "float4(saturate(input.col0.rgb), 1.0f) : "
-                    "((input.position.x < 757.0f) ? "
-                    "rsx_tex[0].SampleLevel(rsx_samp[0], input.tc0.xy, 0.0f) : "
-                    "(rsx_tex[0].SampleLevel(rsx_samp[0], input.tc0.xy, 0.0f) * "
-                    "saturate(input.col0)))";
-                const size_t oldlen = (size_t)(semi - rp);
-                const size_t newlen = sizeof(rep) - 1u;
-                const size_t tail = strlen(semi) + 1u;
-                if ((size_t)(rp - hlsl) + newlen + tail <= sizeof(hlsl)) {
-                    memmove(rp + newlen, semi, tail);
-                    memcpy(rp, rep, newlen);
-                    fprintf(stderr,
-                            "[WARN2_DIAG_PS] output rewrite active old=%u new=%u%c",
-                            (unsigned)oldlen, (unsigned)newlen, 10);
-                } else {
-                    fprintf(stderr, "[WARN2_DIAG_PS] output rewrite too large%c", 10);
-                }
-            } else {
-                fprintf(stderr, "[WARN2_DIAG_PS] output semicolon not found%c", 10);
-            }
-        } else {
-            fprintf(stderr, "[WARN2_DIAG_PS] output anchor not found%c", 10);
-        }
-    }
+    /* WA2 native-output probe intentionally does NOT rewrite this fragment
+     * program. Earlier A/B probes established TEXCOORD0, texture sampling and
+     * COLOR0 independently. What matters now is whether the title's untouched
+     * two-op FP survives the full draw/composite path into the final backbuffer. */
 
     /* FP_IDCOLOR=1: give every fragment program a distinct flat colour derived
      * from its address. One frame then shows which program paints which surface,
@@ -5868,9 +5828,11 @@ static void render_frame(void)
 skip_dump_consider: ;
     guest_fb_present(fi);
     composite_present(fi);
-    static int s_logo_fb_done = 0;
-    int logo_fb_probe = logo_probe_batch && !s_logo_fb_done &&
-                        s_warn2_col0_nonzero && s_d3d.readback_buf;
+    static int s_warn2_native_done_stage = 0;
+    const int warn2_native_capture_stage = s_warn2_native_stage;
+    int logo_fb_probe = logo_probe_batch &&
+                        warn2_native_capture_stage > s_warn2_native_done_stage &&
+                        s_d3d.readback_buf;
     int dumping = (s_d3d.dump_frames_left > 0 && s_d3d.readback_buf
                    && s_d3d.dump_skip_left == 0);
     { static int mind2 = -1;
@@ -6034,15 +5996,17 @@ skip_dump_consider: ;
                 alpha_nz, s_d3d.width*s_d3d.height, nz, bbox_rgb, bbox_n,
                 rmax,gmax,bmax,amax,qc[0],qc[1],qc[2],qc[3],10);
             fprintf(stderr,
-                "[WARN2_COL_DIAG_FB] frame=%u col0_rgb=%u/%u sample_rgb=%u/%u product_rgb=%u/%u%c",
-                s_d3d.frame_count, diag_rgb[0], diag_n[0],
-                diag_rgb[1], diag_n[1], diag_rgb[2], diag_n[2], 10);
+                "[WARN2_NATIVE_FB] stage=%d frame=%u band0_rgb=%u/%u band1_rgb=%u/%u band2_rgb=%u/%u%c",
+                warn2_native_capture_stage, s_d3d.frame_count,
+                diag_rgb[0], diag_n[0], diag_rgb[1], diag_n[1],
+                diag_rgb[2], diag_n[2], 10);
             D3D12_RANGE _wr = {0,0};
             s_d3d.readback_buf->lpVtbl->Unmap(s_d3d.readback_buf,0,&_wr);
         } else {
             fprintf(stderr, "[LOGO_FB] readback map FAILED%c", 10);
         }
-        s_logo_fb_done = 1;
+        if (warn2_native_capture_stage > s_warn2_native_done_stage)
+            s_warn2_native_done_stage = warn2_native_capture_stage;
     }
 
     if (s_sc_dump_pending) {
@@ -7127,20 +7091,22 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
         else if (primitive == RSX_PRIMITIVE_TRIANGLE_STRIP && first == 10u && count == 4u) _pass = 2;
         else if (first == 0u && count == 24u) _pass = 3;
         if (_pass >= 0) {
-            /* Track the first frame where the large warning quad's guest colour
-             * is genuinely non-black. rsx_fetch_attrib is also the function that
-             * populates the host VP vertex buffer, so this is the right trigger
-             * for a late fragment-stage readback. */
+            /* Arm two untouched-shader end-of-frame captures: first visible
+             * colour and effectively-white colour. rsx_fetch_attrib is the same
+             * fetch path used to build the host VP vertex buffer. */
             if (_pass == 2) {
                 float _cnow[4];
                 rsx_fetch_attrib(_ws, 3, first, _cnow);
-                if (_cnow[0] > 0.001f || _cnow[1] > 0.001f || _cnow[2] > 0.001f) {
-                    if (!s_warn2_col0_nonzero)
-                        fprintf(stderr,
-                            "[WARN2_COL0_ARM] frame=%llu col=(%.6g %.6g %.6g %.6g)%c",
-                            (unsigned long long)s_d3d.frame_count,
-                            _cnow[0], _cnow[1], _cnow[2], _cnow[3], 10);
-                    s_warn2_col0_nonzero = 1;
+                const float _mx = (_cnow[0] > _cnow[1])
+                    ? ((_cnow[0] > _cnow[2]) ? _cnow[0] : _cnow[2])
+                    : ((_cnow[1] > _cnow[2]) ? _cnow[1] : _cnow[2]);
+                int _stage = (_mx >= 0.99f) ? 2 : ((_mx > 0.001f) ? 1 : 0);
+                if (_stage > s_warn2_native_stage) {
+                    s_warn2_native_stage = _stage;
+                    fprintf(stderr,
+                        "[WARN2_NATIVE_ARM] stage=%d frame=%llu col=(%.6g %.6g %.6g %.6g)%c",
+                        _stage, (unsigned long long)s_d3d.frame_count,
+                        _cnow[0], _cnow[1], _cnow[2], _cnow[3], 10);
                 }
             }
             static unsigned _seen = 0;
