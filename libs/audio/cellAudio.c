@@ -149,8 +149,13 @@ static u64            s_audio_block_counter = 0;
 static u8             s_audio_port_seen_pcm[CELL_AUDIO_PORT_MAX];
 static int            s_audio_mix_seen_pcm = 0;
 static int            s_audio_guest_pcm_seen = 0; /* telemetry: ever observed */
-static u32            s_audio_guest_pcm_hold_blocks = 0;
-#define HLE_PCM_GUEST_HOLD_BLOCKS 8u
+/* HLE-decoded PCM is a fallback for titles whose guest synth/mixer workload is
+ * not yet implemented.  While that fallback has queued audio, it must own the
+ * host mix: mixing the same decoder output again through a partially-emulated
+ * guest mixer produces comb-filter/"radio" distortion.  Keep a short hold
+ * across decoder burst gaps so ownership does not flap block-by-block. */
+static u32            s_hle_pcm_owner_hold_blocks = 0;
+#define HLE_PCM_OWNER_HOLD_BLOCKS 16u
 
 /* Host-native PCM fallback FIFO used by HLE decoders while a title's guest
  * SPU mixer is not yet functional.  Six seconds is intentionally generous:
@@ -243,6 +248,16 @@ static IAudioClient*        s_wasapi_client = NULL;
 static IAudioRenderClient*  s_wasapi_render = NULL;
 static HANDLE               s_wasapi_event  = NULL;
 static UINT32               s_wasapi_buf_frames = 0;
+
+/* The guest mixer produces fixed 256-frame periods, while WASAPI may expose
+ * fewer than 256 writable frames on any individual poll because of scheduler
+ * jitter.  Never truncate a guest period: retain the unwritten tail and flush
+ * it on later calls.  One second is ample jitter/stall headroom without adding
+ * latency during normal operation (the queue normally stays near one block). */
+#define WASAPI_PENDING_FRAMES CELL_AUDIO_SAMPLE_RATE
+static float s_wasapi_pending[WASAPI_PENDING_FRAMES * 2u];
+static u32   s_wasapi_pending_head = 0;
+static u32   s_wasapi_pending_count = 0;
 
 static int audio_backend_init(void)
 {
@@ -339,6 +354,8 @@ static int audio_backend_init(void)
         if (s_wasapi_event) { CloseHandle(s_wasapi_event); s_wasapi_event = NULL; }
         return -1;
     }
+    s_wasapi_pending_head = 0;
+    s_wasapi_pending_count = 0;
     fprintf(stderr, "[cellAudio] WASAPI ready: buffer=%u frames, 48000 Hz stereo float\n",
             (unsigned)s_wasapi_buf_frames);
     return 0;
@@ -361,26 +378,79 @@ static void audio_backend_shutdown(void)
         CloseHandle(s_wasapi_event);
         s_wasapi_event = NULL;
     }
+    s_wasapi_pending_head = 0;
+    s_wasapi_pending_count = 0;
 }
 
 static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
 {
-    if (!s_wasapi_render) return;
+    if (!s_wasapi_render || !stereo_samples || !num_samples) return;
+
+    /* Queue the entire mixed guest period first.  The old code shortened
+     * num_samples to WASAPI's instantaneous availability and silently threw
+     * away the tail.  At a 5.333 ms guest period, ordinary Windows scheduling
+     * jitter made that a recurring discontinuity audible as harsh noise. */
+    if (num_samples > WASAPI_PENDING_FRAMES) {
+        stereo_samples += (num_samples - WASAPI_PENDING_FRAMES) * 2u;
+        num_samples = WASAPI_PENDING_FRAMES;
+    }
+
+    if (s_wasapi_pending_count + num_samples > WASAPI_PENDING_FRAMES) {
+        u32 drop = s_wasapi_pending_count + num_samples - WASAPI_PENDING_FRAMES;
+        if (drop > s_wasapi_pending_count) drop = s_wasapi_pending_count;
+        s_wasapi_pending_head = (s_wasapi_pending_head + drop) % WASAPI_PENDING_FRAMES;
+        s_wasapi_pending_count -= drop;
+        static int overflow_warned = 0;
+        if (overflow_warned++ < 4)
+            fprintf(stderr, "[cellAudio] WASAPI pending FIFO overflow; dropped %u oldest frames\n", drop);
+    }
+
+    {
+        u32 tail = (s_wasapi_pending_head + s_wasapi_pending_count) % WASAPI_PENDING_FRAMES;
+        u32 first = WASAPI_PENDING_FRAMES - tail;
+        if (first > num_samples) first = num_samples;
+        memcpy(&s_wasapi_pending[tail * 2u], stereo_samples,
+               (size_t)first * 2u * sizeof(float));
+        if (first < num_samples) {
+            memcpy(&s_wasapi_pending[0], stereo_samples + first * 2u,
+                   (size_t)(num_samples - first) * 2u * sizeof(float));
+        }
+        s_wasapi_pending_count += num_samples;
+    }
 
     UINT32 padding = 0;
-    s_wasapi_client->lpVtbl->GetCurrentPadding(s_wasapi_client, &padding);
+    HRESULT phr = s_wasapi_client->lpVtbl->GetCurrentPadding(s_wasapi_client, &padding);
+    if (FAILED(phr) || padding > s_wasapi_buf_frames) return;
 
     UINT32 available = s_wasapi_buf_frames - padding;
-    if (num_samples > available)
-        num_samples = available;
-
-    if (num_samples == 0) return;
+    u32 send = s_wasapi_pending_count;
+    if (send > available) send = available;
+    if (!send) return;
 
     BYTE* buf = NULL;
-    HRESULT hr = s_wasapi_render->lpVtbl->GetBuffer(s_wasapi_render, num_samples, &buf);
+    HRESULT hr = s_wasapi_render->lpVtbl->GetBuffer(s_wasapi_render, send, &buf);
     if (SUCCEEDED(hr) && buf) {
-        memcpy(buf, stereo_samples, num_samples * 2 * sizeof(float));
-        s_wasapi_render->lpVtbl->ReleaseBuffer(s_wasapi_render, num_samples, 0);
+        u32 first = WASAPI_PENDING_FRAMES - s_wasapi_pending_head;
+        if (first > send) first = send;
+        memcpy(buf, &s_wasapi_pending[s_wasapi_pending_head * 2u],
+               (size_t)first * 2u * sizeof(float));
+        if (first < send) {
+            memcpy(buf + (size_t)first * 2u * sizeof(float), &s_wasapi_pending[0],
+                   (size_t)(send - first) * 2u * sizeof(float));
+        }
+        hr = s_wasapi_render->lpVtbl->ReleaseBuffer(s_wasapi_render, send, 0);
+        if (SUCCEEDED(hr)) {
+            s_wasapi_pending_head = (s_wasapi_pending_head + send) % WASAPI_PENDING_FRAMES;
+            s_wasapi_pending_count -= send;
+        }
+    }
+
+    if (s_wasapi_pending_count) {
+        static int backlog_logged = 0;
+        if (backlog_logged++ < 8)
+            fprintf(stderr,
+                    "[cellAudio] WASAPI backpressure preserved: pending=%u available=%u padding=%u\n",
+                    s_wasapi_pending_count, (unsigned)available, (unsigned)padding);
     }
 }
 
@@ -420,6 +490,8 @@ static int hle_pcm_enqueue_stereo(const float* stereo, u32 frames)
             s_hle_pcm_fifo[pos * 2u + 1u] = stereo[(done + i) * 2u + 1u];
         }
         s_hle_pcm_count += take;
+        if (take)
+            s_hle_pcm_owner_hold_blocks = HLE_PCM_OWNER_HOLD_BLOCKS;
         mutex_unlock(&s_audio_mutex);
         done += take;
         if (done == frames) break;
@@ -512,9 +584,23 @@ static inline float ld_be_f32(const float* p)
 static void audio_mix_one_block(void)
 {
     memset(s_mix_buffer, 0, sizeof(s_mix_buffer));
-    int guest_pcm_this_block = 0;
-
     mutex_lock(&s_audio_mutex);
+
+    /* A real HLE decoder stream takes ownership of the host output while it
+     * has queued PCM.  Guest ports are still consumed/cleared and their clocks
+     * advance, but their samples are not mixed concurrently with the same
+     * fallback stream. */
+    int hle_owns_output = s_hle_pcm_count || s_hle_pcm_owner_hold_blocks;
+    if (s_hle_pcm_count)
+        s_hle_pcm_owner_hold_blocks = HLE_PCM_OWNER_HOLD_BLOCKS;
+    else if (s_hle_pcm_owner_hold_blocks)
+        s_hle_pcm_owner_hold_blocks--;
+
+    if (hle_owns_output) {
+        static int owner_logged = 0;
+        if (!owner_logged++)
+            fprintf(stderr, "[cellAudio-hle] direct PCM owns host mix; guest ports remain clocked but are not double-mixed\n");
+    }
 
     /* One hardware audio period has elapsed for every started port. */
     s_audio_block_counter++;
@@ -594,13 +680,6 @@ static void audio_mix_one_block(void)
                 right += center + lfe + rr + sr;
             }
 
-            {
-                float al_now = left < 0.0f ? -left : left;
-                float ar_now = right < 0.0f ? -right : right;
-                if (al_now > 0.00001f || ar_now > 0.00001f)
-                    guest_pcm_this_block = 1;
-            }
-
             if (!s_audio_port_seen_pcm[p]) {
                 float al = left < 0.0f ? -left : left;
                 float ar = right < 0.0f ? -right : right;
@@ -608,8 +687,10 @@ static void audio_mix_one_block(void)
                 if (ar > first_pcm_peak) first_pcm_peak = ar;
             }
 
-            s_mix_buffer[s * 2 + 0] += left;
-            s_mix_buffer[s * 2 + 1] += right;
+            if (!hle_owns_output) {
+                s_mix_buffer[s * 2 + 0] += left;
+                s_mix_buffer[s * 2 + 1] += right;
+            }
         }
 
         if (!s_audio_port_seen_pcm[p] && first_pcm_peak > 0.00001f) {
@@ -633,22 +714,17 @@ static void audio_mix_one_block(void)
             vm_write64((u32)port->read_idx_addr, port->read_index % nblock);
     }
 
-    /* Drain the HLE decoder fallback at the same 48 kHz hardware cadence.
-     * Suppress it only while guest PCM is ACTIVE, not forever after the first
-     * non-zero block.  Movie playback can legitimately produce guest PCM and
-     * then hand control back to a still-unimplemented synth2 path; the old
-     * sticky boolean muted all later cellAtrac HLE audio permanently. */
-    if (guest_pcm_this_block)
-        s_audio_guest_pcm_hold_blocks = HLE_PCM_GUEST_HOLD_BLOCKS;
-    else if (s_audio_guest_pcm_hold_blocks)
-        s_audio_guest_pcm_hold_blocks--;
-
+    /* Drain HLE PCM at the hardware cadence.  Ownership was decided at the
+     * start of the block; unlike v23/v24 we do not alternate between guest and
+     * HLE output based on whether a partially-emulated guest mixer happened to
+     * emit a non-zero block.  That alternation spliced two clock domains into
+     * one waveform and was itself an audible corruption source. */
     {
         u32 take = s_hle_pcm_count < CELL_AUDIO_BLOCK_SAMPLES
             ? s_hle_pcm_count : CELL_AUDIO_BLOCK_SAMPLES;
-        for (u32 i = 0; i < take; ++i) {
-            u32 pos = (s_hle_pcm_head + i) % HLE_PCM_FIFO_FRAMES;
-            if (!s_audio_guest_pcm_hold_blocks) {
+        if (hle_owns_output) {
+            for (u32 i = 0; i < take; ++i) {
+                u32 pos = (s_hle_pcm_head + i) % HLE_PCM_FIFO_FRAMES;
                 s_mix_buffer[i * 2u + 0u] += s_hle_pcm_fifo[pos * 2u + 0u];
                 s_mix_buffer[i * 2u + 1u] += s_hle_pcm_fifo[pos * 2u + 1u];
             }
@@ -856,6 +932,7 @@ s32 cellAudioInit(void)
     memset(s_audio_port_seen_pcm, 0, sizeof(s_audio_port_seen_pcm));
     s_audio_mix_seen_pcm = 0;
     s_audio_guest_pcm_seen = 0;
+    s_hle_pcm_owner_hold_blocks = 0;
     s_hle_pcm_head = 0;
     s_hle_pcm_count = 0;
     s_hle_pcm_logged = 0;
@@ -870,7 +947,6 @@ s32 cellAudioInit(void)
     /* Same origin/domain as the guest's sys_time_get_system_time(). */
     s_audio_start_us = ps3_system_time_us();
     s_audio_block_counter = 0;
-    s_audio_guest_pcm_hold_blocks = 0;
     memset(s_audio_port_seen_pcm, 0, sizeof(s_audio_port_seen_pcm));
     s_audio_mix_seen_pcm = 0;
     if (audio_start_mix_thread() < 0) {
