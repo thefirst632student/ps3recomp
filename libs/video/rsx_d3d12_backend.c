@@ -4398,6 +4398,13 @@ static void off_rt_transition(int slot, D3D12_RESOURCE_STATES to)
  * render-to-texture pass) must still run -- it is what fills the texture a
  * later batch samples -- but presenting it would show a half-built frame. */
 static int s_present_this_frame = 1;
+/* Shared by every host-present entry point.  A flip with no newly recorded
+ * draws must keep the last scanned-out image once real content has appeared;
+ * rendering an empty batch would clear a fresh swapchain buffer and present
+ * black.  Keeping this state global also deduplicates the legacy backend
+ * callback against rsx_d3d12_backend_present(), which can observe the same
+ * guest flip from a different host path. */
+static int s_present_seen_content = 0;
 
 /* Resolve a DRAW_*_TEX value: a hex raw offset, or the literal "duck" for the
  * content-identified duck texture. */
@@ -4661,6 +4668,21 @@ static void render_frame(void)
 {
     double _rf0 = perf_on() ? perf_now() : 0.0;
     u32 fi = s_d3d.frame_index;
+
+    /* Publish scanout-content history from the one place every present path
+     * eventually reaches.  This keeps the legacy backend callback, clear-boundary
+     * presenter and ticker presenter coherent even when two of them observe the
+     * same guest flip.  Only an actual draw to the display RT counts; offscreen
+     * work must not make boot-time empty presents disappear prematurely. */
+    if (s_present_this_frame && !s_present_seen_content) {
+        for (u32 _pd = 0; _pd < s_d3d.draw_count && _pd < MAX_DRAWS; _pd++) {
+            const D3D12DrawRecord* _pr = &s_d3d.draws[_pd];
+            if (!_pr->is_clear && _pr->rt_off == 0) {
+                s_present_seen_content = 1;
+                break;
+            }
+        }
+    }
 
     /* WA2 logo stage probe: detect the exact guest batches that bind either
      * boot-logo texture. This is diagnostic only; it does not alter draw state.
@@ -6216,20 +6238,38 @@ static void d3d12_present(void* ud, u32 buffer_id)
                s_d3d.draw_count, s_dbg_clears_since_present);
     s_dbg_clears_since_present = 0;
 
-    /* An accumulated batch with draws but NONE targeting a display buffer is
-     * offscreen pass work only (demosaic flips once per effect pass): showing
-     * it would strobe the bare backbuffer clear. Keep accumulating -- the
-     * composite draw that targets the display presents the whole chain, in
-     * order, in one command list. Empty batches still present (boot/idle). */
-    int flip_has_display = (s_d3d.draw_count == 0);
+    /* This legacy callback and rsx_d3d12_backend_present() can both observe
+     * the same guest flip.  Before real content exists, an empty present is
+     * useful for boot/idle clears.  After content exists, however, an empty
+     * render_frame() clears the next swapchain buffer and presents black over
+     * the frame the other entry point just produced.  Use the shared content
+     * state so either entry point can suppress that duplicate empty present.
+     *
+     * Draw-only offscreen batches still have to execute so later passes can
+     * sample them; just do not Present the swapchain for those batches. */
+    int flip_has_display = (s_d3d.draw_count == 0 && !s_present_seen_content);
     for (u32 _i = 0; _i < s_d3d.draw_count && _i < MAX_DRAWS; _i++)
         if (!s_d3d.draws[_i].is_clear && s_d3d.draws[_i].rt_off == 0) {
             flip_has_display = 1;
             break;
         }
 
-    if (s_d3d.initialized && flip_has_display)
+    if (flip_has_display && s_d3d.draw_count > 0)
+        s_present_seen_content = 1;
+
+    if (s_d3d.initialized && (flip_has_display || s_d3d.draw_count > 0)) {
+        if (!flip_has_display && s_d3d.draw_count == 0) {
+            /* Defensive only: the condition above normally excludes this. */
+            return;
+        }
+        s_present_this_frame = flip_has_display;
         render_frame();
+        s_present_this_frame = 1;
+    } else if (s_d3d.initialized && s_present_seen_content && s_d3d.draw_count == 0) {
+        static int s_empty_skip_log = 0;
+        if (s_empty_skip_log++ < 8)
+            fprintf(stderr, "[PRESENT-DEDUP] legacy callback kept previous frame (empty batch)%c", 10);
+    }
 
     /* FPS tracking */
     ULONGLONG now = GetTickCount64();
@@ -7961,6 +8001,7 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
     InterlockedExchange(&s_movie_has_frame, 0);
     s_movie_submit_seq = 0;
     s_movie_present_seq = 0;
+    s_present_seen_content = 0;
     if (movie_resources_init(width, height) != 0)
         fprintf(stderr, "[movie-d3d12] staging unavailable; movie frames cannot be presented\n");
 
@@ -8104,7 +8145,6 @@ void rsx_d3d12_backend_present(void)
     }
 
     extern unsigned cellGcm_flip_request_count(void);
-    static int s_seen_content = 0;
     unsigned fc = cellGcm_flip_request_count();
     int is_flip_present = (fc != 0 && fc != s_last_present_flip);
     int has_display;
@@ -8130,7 +8170,7 @@ void rsx_d3d12_backend_present(void)
      * Empty batches present only until the first real frame -- after that an
      * empty present is a flip/drain race and wipes the screen for a frame
      * (wave: black flashes and layout flicker between frames). */
-    has_display = (s_d3d.draw_count == 0 && !s_seen_content);
+    has_display = (s_d3d.draw_count == 0 && !s_present_seen_content);
     for (di = 0; di < s_d3d.draw_count && di < MAX_DRAWS; di++) {
         if (!s_d3d.draws[di].is_clear && s_d3d.draws[di].rt_off == 0) {
             has_display = 1;
@@ -8145,7 +8185,7 @@ void rsx_d3d12_backend_present(void)
       if (gfb < 0) { const char* e = getenv("GCM_GUEST_FB"); gfb = e ? 1 : 0; }
       if (gfb) has_display = 1; }
     if (s_composite_src) has_display = 1;
-    if (has_display && s_d3d.draw_count > 0) s_seen_content = 1;
+    if (has_display && s_d3d.draw_count > 0) s_present_seen_content = 1;
 
     /* VP_SUBMIT=<N>: has_display gates render_frame() entirely, so a batch whose
      * records all target an OFFSCREEN rt (rt_off != 0) presents without ever
@@ -8184,13 +8224,19 @@ void rsx_d3d12_backend_present(void)
         fprintf(stderr, "[PRESENTGATE] records=%u onscreen=%u offscreen=%u clears=%u"
                         " has_display=%d seen_content=%d -> render_frame=%s\n",
                 s_d3d.draw_count, onscreen, offscreen, clears, has_display,
-                s_seen_content, (s_d3d.initialized && has_display) ? "YES" : "SKIPPED"); } }
+                s_present_seen_content, (s_d3d.initialized && has_display) ? "YES" : "SKIPPED"); } }
 
     /* Execute the batch whenever it has draws. Gating the whole call on
      * has_display meant a render-to-texture pass -- every draw targeting an
      * offscreen surface -- was DISCARDED rather than deferred, so the texture
      * it produces was never written and whatever sampled it later read an
      * empty resource. Only the Present needs onscreen content. */
+    if (s_d3d.initialized && !has_display && s_d3d.draw_count == 0 && s_present_seen_content) {
+        static int s_ticker_empty_skip_log = 0;
+        if (s_ticker_empty_skip_log++ < 8)
+            fprintf(stderr, "[PRESENT-DEDUP] ticker kept previous frame (empty batch)%c", 10);
+    }
+
     if (s_d3d.initialized && (has_display || s_d3d.draw_count > 0)) {
         { extern void rsx_reset_upload_claims(void);
           static int remap = -1;
