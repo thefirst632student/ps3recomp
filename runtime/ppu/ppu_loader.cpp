@@ -107,6 +107,9 @@ static inline int ps3_is_guest_ptr_fault(uintptr_t at)
     return at >= 0x10000u && at < 0x100000000ull;
 }
 
+#ifdef NDEBUG
+extern "C" void ps3_install_guest_ptr_trap(void) {}
+#else
 #ifdef _WIN32
 
 static LONG WINAPI ps3_guest_ptr_veh(EXCEPTION_POINTERS* ep)
@@ -264,6 +267,7 @@ extern "C" void ps3_install_guest_ptr_trap(void)
 }
 
 #endif /* _WIN32 */
+#endif /* !NDEBUG: guest-pointer diagnostic trap */
 
 /* PS3_SCTRACE=1: every lv2 syscall with its arguments and RETURN VALUE.
  * An unimplemented syscall is loud (it logs "(stub)") but an IMPLEMENTED one
@@ -376,7 +380,7 @@ static void sc_trace(uint64_t num, ppu_context* ctx, uint64_t a3, uint64_t a4,
  * Sampling is the honest tool for "where does the time go"; inferring it from
  * counts and log orderings is what produced a string of wrong answers.
  * -----------------------------------------------------------------------*/
-#ifdef _WIN32
+#ifndef NDEBUG
 struct SampHG { uintptr_t h; uint32_t g; int spu; };
 extern "C" uint32_t spu_registry_size(void);
 extern "C" int      spu_registry_entry(uint32_t i, void** host, uint32_t* ls_addr);
@@ -813,7 +817,7 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
  * armed via ppu_guard_page(guest_ea), the 4 KB host page is set read-only and a
  * VEH logs the faulting RIP of any write into it, then single-steps past it and
  * re-arms. Env-gated by the caller; only active during diagnosis. */
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(NDEBUG)
 static volatile uintptr_t s_guard_page = 0;   /* host base of the guarded 4KB page */
 static volatile uint32_t  s_guard_ea   = 0;   /* guest ea being watched */
 /* Defined later in this file with C linkage; the guard handler needs it, and a
@@ -1326,11 +1330,15 @@ extern "C" uint32_t g_ww_lo = 0, g_ww_hi = 0;
 
 extern "C" void ps3_ww_report_inline(uint32_t addr, uint64_t val, int width)
 {
+#ifdef NDEBUG
+    (void)addr; (void)val; (void)width;
+#else
     static int n = 0;
     if (n++ >= 64) return;
     fprintf(stderr, "[ww-hle] 0x%08X <- 0x%llX (w%d) from an HLE (libs/)\n",
             addr, (unsigned long long)val, width);
     fflush(stderr);
+#endif
 }
 
 /* Called once PPU_WWATCH has been parsed, so both watches cover the same line. */
@@ -1348,6 +1356,9 @@ static void ww_arm_inline_window(uint32_t ww)
 }
 static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra)
 {
+#ifdef NDEBUG
+    (void)a; (void)v; (void)width; (void)ra;
+#else
     /* PPU_WVAL=<hexvalue>: log every PPU store that WRITES this value, wherever
      * it lands. PPU_WWATCH answers "who writes this address"; when a bad value is
      * copied from node to node down a list, that only ever catches the copy.
@@ -1457,9 +1468,10 @@ static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra
             fprintf(stderr, "[sync-write] +0x%02X <- 0x%X (w%d) guest-fn=0x%08X\n",
                     a - b, v, width, ppu_prof_resolve_host(ra));
     }
+#endif
 }
 void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, __builtin_return_address(0)); if (vm_oob((uint32_t)a,1)) return;
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(NDEBUG)
     /* PT detector: does this byte-write turn its word into the hunted truncated value? */
     { if(g_pt_val==-2){const char*e=getenv("PT"); g_pt_val=e?(int64_t)strtoul(e,0,16):-1;}
       if(g_pt_val>=0){ uint32_t wa=((uint32_t)a)&~3u; uint32_t cur; memcpy(&cur,vm_base+wa,4); cur=__builtin_bswap32(cur);
@@ -1471,7 +1483,7 @@ void vm_write8 (uint64_t a, uint8_t  v) { barrier_watch_hit((uint32_t)a, v, 1, _
 void vm_write16(uint64_t a, uint16_t v) { barrier_watch_hit((uint32_t)a, v, 2, __builtin_return_address(0)); if (vm_oob((uint32_t)a,2)) return;
     v = __builtin_bswap16(v); VM_WRITE_COH(a, &v, 2); }
 void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, __builtin_return_address(0)); if (vm_oob((uint32_t)a,4)) return;
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(NDEBUG)
     /* PT restore: a full-word store of a valid pointer (high byte set) to a
      * previously-truncated slot clears the record (that truncation was transient). */
     if (g_pt_val>=0 && (v>>24)!=0) pt_restore((uint32_t)a);
