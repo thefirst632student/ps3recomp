@@ -304,6 +304,24 @@ if(PS3RECOMP_FAST_DEBUG)
     endif()
 endif()
 
+# Release optimizer bisect for the PPU loader/VM translation unit.  V30 proves
+# the same source is accepted by Defender in Fast Debug while Release is still
+# flagged.  The strongest remaining build-only delta is aggressive Release
+# codegen.  Keep the executable, lifted PPU/SPU code, CRT and linker in their
+# normal Release configuration; only compile ppu_loader.cpp at O1.  This TU owns
+# the VM/VEH/reservation machinery whose source-level cleanup in v28 changed the
+# browser/security heuristic, making it the narrowest evidence-backed bisect.
+# This is not a Debug feature: NDEBUG and all Release link/runtime semantics stay
+# intact.
+set(PS3RECOMP_PPU_LOADER_SOURCE "${PS3RECOMP_DIR}/runtime/ppu/ppu_loader.cpp")
+if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" OR MSVC)
+    set_property(SOURCE "${PS3RECOMP_PPU_LOADER_SOURCE}" APPEND PROPERTY COMPILE_OPTIONS
+        "$<$<CONFIG:Release>:/O1>")
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    set_property(SOURCE "${PS3RECOMP_PPU_LOADER_SOURCE}" APPEND PROPERTY COMPILE_OPTIONS
+        "$<$<CONFIG:Release>:-O1>")
+endif()
+
 # ---------------------------------------------------------------------------
 # Install
 # ---------------------------------------------------------------------------
