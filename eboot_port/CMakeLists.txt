@@ -22,8 +22,8 @@ option(PS3RECOMP_FAST_DEBUG_RUNTIME
     "Also optimize host runtime/HLE in Debug" ON)
 option(PS3RECOMP_RELEASE_RUNTIME_BISECT_O1
     "Bisect Defender false-positive by compiling only ps3recomp_runtime at O1 in Release" OFF)
-option(PS3RECOMP_RELEASE_EXECUTABLE_BISECT_O1
-    "Bisect Defender false-positive by compiling only the game executable target at O1 in Release" ON)
+option(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_O1
+    "Bisect Defender false-positive by compiling only lifted PPU sources at O1 in Release" ON)
 
 # Prefer Ninja if available
 if(NOT CMAKE_GENERATOR MATCHES "Ninja" AND NOT DEFINED ENV{CMAKE_GENERATOR})
@@ -308,17 +308,18 @@ if(PS3RECOMP_FAST_DEBUG)
     endif()
 endif()
 
-# V33 disjoint Release bisect: keep ps3recomp_runtime at normal Release
-# optimization and lower only the game executable target to O1.  This covers
-# main/stubs, the per-game PPU scaffold and lifted PPU translation units.  SPU
-# TUs retain their explicit per-source -O2 where present.  No Debug feature,
-# CRT mode, NDEBUG setting or linker option is changed.
-if(PS3RECOMP_RELEASE_EXECUTABLE_BISECT_O1)
+# V34 disjoint Release bisect: keep the runtime, main/stubs and the per-game
+# PPU scaffold at normal Release optimization and lower only the machine-
+# generated lifted PPU translation units to O1.  This isolates RECOMP_SOURCES
+# from the host/scaffold half of the executable.  Lifted SPU TUs keep their
+# explicit per-source -O2.  No Debug feature, CRT mode, NDEBUG setting or
+# linker option is changed.
+if(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_O1 AND RECOMP_SOURCES)
     if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" OR MSVC)
-        target_compile_options(${PROJECT_NAME} PRIVATE
+        set_property(SOURCE ${RECOMP_SOURCES} APPEND PROPERTY COMPILE_OPTIONS
             "$<$<CONFIG:Release>:/O1>")
     elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        target_compile_options(${PROJECT_NAME} PRIVATE
+        set_property(SOURCE ${RECOMP_SOURCES} APPEND PROPERTY COMPILE_OPTIONS
             "$<$<CONFIG:Release>:-O1>")
     endif()
 endif()
