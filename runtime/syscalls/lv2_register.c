@@ -63,7 +63,6 @@ static int64_t sys_tty_write(ppu_context* ctx)
         /* Write guest string data to host stderr */
         fwrite(vm_base + buf_ea, 1, len, stderr);
         fflush(stderr);
-#ifndef NDEBUG
         /* TTY_BT=<substring>: dump the guest LR back-chain whenever the title
          * prints a line containing it. The two hooks below do exactly this for
          * one hardcoded string each, which only ever helped the title they were
@@ -187,7 +186,6 @@ static int64_t sys_tty_write(ppu_context* ctx)
                 fflush(stderr);
             }
         }
-#endif
     }
 
     /* Write back the number of bytes written */
@@ -1962,7 +1960,6 @@ static int64_t sys_spu_image_import_handler(ppu_context* ctx)
 
     fprintf(stderr, "[SPU] image_import img=0x%08X src=0x%08X -> entry=0x%05X nsegs=%d\n",
             img_ea, src_ea, entry, nsegs);
-#ifndef NDEBUG
     /* SPU_DUMP_IMPORT=<dir>: save each unique imported ELF (FMOD's runtime-
      * materialized SPU overlay plugins) so they can be lifted + registered.
      * Extent = max(p_off+p_fsz) over PT_LOADs, re-walked here cheaply. */
@@ -2013,7 +2010,6 @@ static int64_t sys_spu_image_import_handler(ppu_context* ctx)
           }
           fprintf(stderr, "%s\n", ln);
       } }
-#endif
 #endif
     fflush(stderr);
     ctx->gpr[3] = 0;
