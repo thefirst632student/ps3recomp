@@ -27,6 +27,8 @@ option(PS3RECOMP_FAST_DEBUG "Keep Debug symbols/asserts while using optimized De
 # host-side stepping without changing the guest-code setting.
 option(PS3RECOMP_FAST_DEBUG_RUNTIME
     "Also optimize the host runtime/HLE in Debug" ON)
+option(PS3RECOMP_RELEASE_RUNTIME_BISECT_O1
+    "Bisect Defender false-positive: compile only ps3recomp_runtime at O1 in Release" OFF)
 
 # ---------------------------------------------------------------------------
 # Collect source files
@@ -342,6 +344,20 @@ if(PS3RECOMP_FAST_DEBUG AND PS3RECOMP_FAST_DEBUG_RUNTIME)
         target_compile_options(ps3recomp_runtime PRIVATE
             "$<$<CONFIG:Debug>:-O1>"
             "$<$<CONFIG:Debug>:-fno-omit-frame-pointer>")
+    endif()
+endif()
+
+# Release-only module bisect.  Keep the game executable/scaffold/lifted code in
+# normal Release optimization and lower only the game-agnostic runtime/HLE
+# static library to O1.  This cleanly separates ps3recomp_runtime from the
+# executable target without adding any Debug feature or changing NDEBUG/CRT.
+if(PS3RECOMP_RELEASE_RUNTIME_BISECT_O1)
+    if(CMAKE_C_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" OR MSVC)
+        target_compile_options(ps3recomp_runtime PRIVATE
+            "$<$<CONFIG:Release>:/O1>")
+    elseif(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(ps3recomp_runtime PRIVATE
+            "$<$<CONFIG:Release>:-O1>")
     endif()
 endif()
 
