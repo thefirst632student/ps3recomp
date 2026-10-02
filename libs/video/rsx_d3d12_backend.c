@@ -564,6 +564,7 @@ static u32 s_duck_off = 0;   /* as RESOLVED (what the uploader sees)   */
  * spend an afternoon optimising the wrong loop. */
 static double s_perf_tex = 0.0, s_perf_frame = 0.0, s_perf_vtx = 0.0, s_perf_rf = 0.0;
 static double s_perf_gpu = 0.0, s_perf_pre = 0.0, s_perf_srv = 0.0, s_perf_pso = 0.0;
+static double s_perf_sync = 0.0, s_perf_present = 0.0;
 static int s_perf_pso_calls = 0, s_perf_pso_miss = 0, s_perf_pso_hashbytes = 0;
 static u64    s_perf_nverts = 0;
 static u64    s_perf_texbytes = 0;
@@ -578,6 +579,18 @@ static int perf_on(void)
 {
     static int v = -1;
     if (v < 0) { const char* e = getenv("PERF"); v = e ? atoi(e) : 0; }
+    return v;
+}
+
+/* Historical WA2 warning diagnostics are kept opt-in for regression work, but
+ * disabled by default.  They include readbacks, dense texture hashing, DWM
+ * capture and per-draw logging and therefore must never contaminate normal
+ * performance measurements.  Set WA2_WARN_DIAG=1 only when reproducing that
+ * known issue. */
+static int wa2_diag_on(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("WA2_WARN_DIAG"); v = e ? atoi(e) : 0; }
     return v;
 }
 /* DBG_LOCK: running clip-space centroid of the tracked mesh (RSX_DBG_VTX's
@@ -614,6 +627,104 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
     return DefWindowProcA(hwnd, msg, wp, lp);
+}
+
+
+/* WA2 warning post-Present probe.  The D3D12 readback probes characterize the
+ * swapchain resource before Present; this one samples what Win32/DWM exposes
+ * for the actual client rectangle after Present.  It is diagnostic only. */
+static void warn2_probe_composited_window(u32 frame)
+{
+    if (!wa2_diag_on()) return;
+    if (!(frame == 63u || frame == 122u || frame == 340u) || !s_d3d.hwnd)
+        return;
+
+    /* Wait until DWM has processed the Present without taking a static link on
+     * dwmapi.lib (older/minimal toolchains do not always list it). */
+    HMODULE dwm = LoadLibraryA("dwmapi.dll");
+    if (dwm) {
+        typedef HRESULT (WINAPI *PFN_DwmFlush)(void);
+        PFN_DwmFlush fn = (PFN_DwmFlush)GetProcAddress(dwm, "DwmFlush");
+        if (fn) (void)fn();
+        FreeLibrary(dwm);
+    }
+
+    RECT rc;
+    if (!GetClientRect(s_d3d.hwnd, &rc))
+        return;
+    const int w = rc.right - rc.left;
+    const int h = rc.bottom - rc.top;
+    if (w <= 0 || h <= 0)
+        return;
+
+    POINT pt = { 0, 0 };
+    ClientToScreen(s_d3d.hwnd, &pt);
+
+    BITMAPINFO bi;
+    memset(&bi, 0, sizeof(bi));
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h; /* top-down */
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    HDC screen = GetDC(NULL);
+    HDC mem = screen ? CreateCompatibleDC(screen) : NULL;
+    void* bits = NULL;
+    HBITMAP bmp = (screen && mem) ? CreateDIBSection(screen, &bi, DIB_RGB_COLORS,
+                                                     &bits, NULL, 0) : NULL;
+    HGDIOBJ old = (bmp && mem) ? SelectObject(mem, bmp) : NULL;
+
+    if (bmp && bits) {
+        struct ProbeStat { u64 rgb_nz; u8 mr, mg, mb, ma; u8 cr, cg, cb, ca; } st[2];
+        memset(st, 0, sizeof(st));
+        for (int mode = 0; mode < 2; mode++) {
+            BOOL ok = FALSE;
+            if (mode == 0) {
+                ok = BitBlt(mem, 0, 0, w, h, screen, pt.x, pt.y, SRCCOPY | CAPTUREBLT);
+            } else {
+                HDC client = GetDC(s_d3d.hwnd);
+                if (client) {
+                    ok = BitBlt(mem, 0, 0, w, h, client, 0, 0, SRCCOPY | CAPTUREBLT);
+                    ReleaseDC(s_d3d.hwnd, client);
+                }
+            }
+            if (!ok) continue;
+            const u8* px = (const u8*)bits;
+            for (int y = 0; y < h; y++) {
+                for (int x = 0; x < w; x++) {
+                    const u8* q = px + ((u64)y * (u64)w + (u64)x) * 4u;
+                    const u8 b = q[0], g = q[1], r = q[2], a = q[3];
+                    if (r || g || b) st[mode].rgb_nz++;
+                    if (r > st[mode].mr) st[mode].mr = r;
+                    if (g > st[mode].mg) st[mode].mg = g;
+                    if (b > st[mode].mb) st[mode].mb = b;
+                    if (a > st[mode].ma) st[mode].ma = a;
+                }
+            }
+            const u8* c = px + ((u64)(h / 2) * (u64)w + (u64)(w / 2)) * 4u;
+            st[mode].cb = c[0]; st[mode].cg = c[1]; st[mode].cr = c[2]; st[mode].ca = c[3];
+        }
+        fprintf(stderr,
+            "[WARN2_DWM_FB] frame=%u client=%dx%d screen_xy=%ld,%ld visible=%d iconic=%d fg=%d "
+            "desktop_rgb=%llu/%llu desktop_max=(%u,%u,%u,%u) desktop_center=(%u,%u,%u,%u) "
+            "clientdc_rgb=%llu/%llu clientdc_max=(%u,%u,%u,%u) clientdc_center=(%u,%u,%u,%u)%c",
+            frame, w, h, (long)pt.x, (long)pt.y,
+            IsWindowVisible(s_d3d.hwnd) ? 1 : 0, IsIconic(s_d3d.hwnd) ? 1 : 0,
+            GetForegroundWindow() == s_d3d.hwnd ? 1 : 0,
+            (unsigned long long)st[0].rgb_nz, (unsigned long long)((u64)w * h),
+            st[0].mr, st[0].mg, st[0].mb, st[0].ma,
+            st[0].cr, st[0].cg, st[0].cb, st[0].ca,
+            (unsigned long long)st[1].rgb_nz, (unsigned long long)((u64)w * h),
+            st[1].mr, st[1].mg, st[1].mb, st[1].ma,
+            st[1].cr, st[1].cg, st[1].cb, st[1].ca, 10);
+    }
+
+    if (old && mem) SelectObject(mem, old);
+    if (bmp) DeleteObject(bmp);
+    if (mem) DeleteDC(mem);
+    if (screen) ReleaseDC(NULL, screen);
 }
 
 static HWND create_window(u32 width, u32 height, const char* title)
@@ -1575,6 +1686,10 @@ static void movie_present_latest(void)
         }
     }
 
+    /* Sample the post-compositor client only at the three established warning
+     * probe milestones. */
+    warn2_probe_composited_window(s_d3d.frame_count);
+
     move_to_next_frame();
     s_d3d.frame_count++;
     s_dbg_last_draws = 0;
@@ -2141,7 +2256,7 @@ static int vp_get_vs(const rsx_state* st)
     /* WA2 warning-2 probe: dump only the colour data-flow of the VP that is
      * paired with the 704x512 warning texture / FP 0x01BF9101.  Observational
      * only; no shader text or render state is modified. */
-    if (((st->shader_program & ~1u) == 0x01BF9100u) &&
+    if (wa2_diag_on() && ((st->shader_program & ~1u) == 0x01BF9100u) &&
         s_d3d.cur_texs[0].raw == 0x01CA8480u) {
         static int warn2_vp_dumped = 0;
         if (!warn2_vp_dumped) {
@@ -2580,7 +2695,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     /* WA2 warning-2 FP raw probe.  Dump the exact guest microcode for
      * 0x01BF9101 once, using the same resolved address and byte order consumed
      * by rsx_fp_decompiler.  Logging only; shader behavior is unchanged. */
-    if ((fp_addr & ~1u) == 0x01BF9100u) {
+    if (wa2_diag_on() && (fp_addr & ~1u) == 0x01BF9100u) {
         static int warn2_fp_raw_dumped = 0;
         if (!warn2_fp_raw_dumped) {
             warn2_fp_raw_dumped = 1;
@@ -2614,7 +2729,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      * logo draws use this fragment program.  Report which sampler units and
      * interpolants the translated program actually consumes so a black result
      * can be separated from an empty texture or a bad vertex stream. */
-    if ((fp_addr & ~1u) == 0x01BF9100u) {
+    if (wa2_diag_on() && (fp_addr & ~1u) == 0x01BF9100u) {
         static int logo_fp_dumped = 0;
         if (!logo_fp_dumped) {
             u32 units = 0;
@@ -3198,7 +3313,7 @@ static int vp_sampler_table_for_draw(const D3D12DrawRecord* dr)
         s_d3d.device, 1, &dst, &dst_size,
         VP_SMP_TABLE_WIDTH, src, NULL, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
 
-    if (dr->tex[0].raw == 0x01CA8480u) {
+    if (wa2_diag_on() && dr->tex[0].raw == 0x01CA8480u) {
         D3D12_SAMPLER_DESC sd = vp_decode_sampler(dr->tex[0].address,
                                                   dr->tex[0].control0,
                                                   dr->tex[0].filter,
@@ -3286,7 +3401,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, u32 guest_pitch, i
              * every one of them every frame was ~70% of the frame's CPU time. */
             u32 nb = tl.row_bytes * tl.rows;
             u32 cs = TEX_CSUM(vm_base + c->off, nb);
-            if ((key_off & 0x0FFFFFFFu) == 0x01CA8480u) {
+            if (wa2_diag_on() && (key_off & 0x0FFFFFFFu) == 0x01CA8480u) {
                 static u32 _prev_dense = 0;
                 static int _have_dense = 0;
                 static int _late_src_done = 0;
@@ -3535,7 +3650,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, u32 guest_pitch, i
     /* WA2 root-cause probe: inspect the host-visible RGBA image AFTER the RSX
      * format/layout conversion, not just the guest source bytes. If this says
      * RGB and alpha are populated, texture decode/component order is exonerated. */
-    if (_f == 0 && (key_off & 0x0FFFFFFFu) == 0x01CA8480u &&
+    if (wa2_diag_on() && _f == 0 && (key_off & 0x0FFFFFFFu) == 0x01CA8480u &&
         tl.fmt == RSX_TEXFMT_R8G8B8A8) {
         static int _logo_dec_done = 0;
         if (!_logo_dec_done) {
@@ -3875,7 +3990,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, u32 guest_pitch, i
     /* One-shot GPU texture readback for WA2's 704x512 A8R8G8B8 logo.  This is
      * observational only.  The copy is ordered after the upload and the
      * resource is returned to PIXEL_SHADER_RESOURCE before the draw. */
-    if (!s_logo_tex_copy_issued && (key_off & 0x0FFFFFFFu) == 0x01CA8480u &&
+    if (wa2_diag_on() && !s_logo_tex_copy_issued && (key_off & 0x0FFFFFFFu) == 0x01CA8480u &&
         w == 704u && h == 512u && dxfmt == DXGI_FORMAT_R8G8B8A8_UNORM) {
         s_logo_tex_readback_pitch = (w * 4u + 255u) & ~255u;
         if (!s_logo_tex_readback) {
@@ -4040,7 +4155,7 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
      * shaders, draw order or GPU state are modified.  The first texture probe
      * established that texture bytes and pre-VP vertices are valid, so the next
      * split is whether the guest VP maps those vertices into a valid clip volume. */
-    if (dr && (dr->tex[0].raw == 0x01CA8480u || dr->tex[0].raw == 0x01CA3E80u)) {
+    if (wa2_diag_on() && dr && (dr->tex[0].raw == 0x01CA8480u || dr->tex[0].raw == 0x01CA3E80u)) {
         static u32 logged_raw[2] = {0, 0};
         int li = (dr->tex[0].raw == 0x01CA8480u) ? 0 : 1;
         if (logged_raw[li] != dr->tex[0].raw) {
@@ -4752,7 +4867,7 @@ static void render_frame(void)
      * Keep the flag alive until after command submission so we can read back the
      * final swapchain image and answer whether pixels survived rasterization. */
     int logo_probe_batch = 0;
-    for (u32 _lp = 0; _lp < s_d3d.draw_count && _lp < MAX_DRAWS; _lp++) {
+    if (wa2_diag_on()) for (u32 _lp = 0; _lp < s_d3d.draw_count && _lp < MAX_DRAWS; _lp++) {
         const D3D12DrawRecord* _dr = &s_d3d.draws[_lp];
         if (_dr->tex[0].raw == 0x01CA8480u || _dr->tex[0].raw == 0x01CA3E80u) {
             logo_probe_batch = 1;
@@ -4765,7 +4880,7 @@ static void render_frame(void)
      * newly-added fifth draw entirely.  Dump every record around that boundary,
      * including its shader/RT/texture state and the first uploaded VP vertices.
      * This is observational only. */
-    if (s_d3d.frame_count >= 340u && s_d3d.frame_count <= 360u) {
+    if (wa2_diag_on() && s_d3d.frame_count >= 340u && s_d3d.frame_count <= 360u) {
         fprintf(stderr, "[WARN2_PHASE] frame=%u records=%u parity=%d%c",
                 (unsigned)s_d3d.frame_count, (unsigned)s_d3d.draw_count,
                 s_d3d.vp_parity, 10);
@@ -4843,7 +4958,9 @@ static void render_frame(void)
      * (gcm/cube: triangles mixing stale and new vertices -> missing/sliver
      * polygons). These workloads are a few draws/frame, so full serialisation
      * costs little. */
-    wait_for_gpu();
+    { double _sy0 = perf_on() ? perf_now() : 0.0;
+      wait_for_gpu();
+      if (perf_on()) s_perf_sync += perf_now() - _sy0; }
 
     /* Compile the real vertex program once its microcode is captured, and keep
      * the constant bank uploaded for the VS. */
@@ -5269,7 +5386,7 @@ static void render_frame(void)
                     if (s_duck_off && dr->tex[_u].off == s_duck_off)
                         s_duck_raw = dr->tex[_u].raw;
                     if (ts >= 0) {
-                        if (dr->tex[_u].raw == 0x01CA8480u || dr->tex[_u].raw == 0x01CA3E80u)
+                        if (wa2_diag_on() && (dr->tex[_u].raw == 0x01CA8480u || dr->tex[_u].raw == 0x01CA3E80u))
                             fprintf(stderr, "[LOGO_SRV] draw=%u unit=%d heap=%u texslot=%d raw=0x%08X res=%p map=0x%X%c",
                                     _d, _u, wslot, ts, dr->tex[_u].raw,
                                     (void*)s_d3d.vp_tex[ts].res,
@@ -5835,7 +5952,8 @@ static void render_frame(void)
             double fr = s_perf_frame > 0 ? s_perf_frame : 1;
             fprintf(stderr, "[PERF] %.2f fps | tex %.2fs (%.0f%%, %d calls) | vtx %.2fs"
                             " (%.0f%%, %.0fk verts) | render_frame %.2fs (%.0f%%)"
-                            " | prepass %.2fs (%.0f%%) [srv %.2fs %.0f%% | pso %.2fs %.0f%% %d calls %d MISS %dKB hashed] | guest %.2fs (%.0f%%)%c",
+                            " | prepass %.2fs (%.0f%%) [srv %.2fs %.0f%% | pso %.2fs %.0f%% %d calls %d MISS %dKB hashed]"
+                            " | sync %.2fs (%.0f%%) | present %.2fs (%.0f%%) | guest/other %.2fs (%.0f%%)%c",
                     20.0 / fr,
                     s_perf_tex, 100.0 * s_perf_tex / fr, s_perf_ntex,
                     s_perf_vtx, 100.0 * s_perf_vtx / fr,
@@ -5845,9 +5963,13 @@ static void render_frame(void)
                     s_perf_srv, 100.0 * s_perf_srv / fr,
                     s_perf_pso, 100.0 * s_perf_pso / fr,
                     s_perf_pso_calls, s_perf_pso_miss, s_perf_pso_hashbytes / 1024,
-                    fr - s_perf_rf, 100.0 * (fr - s_perf_rf) / fr, 10);
+                    s_perf_sync, 100.0 * s_perf_sync / fr,
+                    s_perf_present, 100.0 * s_perf_present / fr,
+                    fr - s_perf_rf - s_perf_present,
+                    100.0 * (fr - s_perf_rf - s_perf_present) / fr, 10);
             s_perf_frame = 0.0; s_perf_tex = 0.0; s_perf_vtx = 0.0; s_perf_rf = 0.0;
             s_perf_gpu = 0.0; s_perf_pre = 0.0; s_perf_srv = 0.0; s_perf_pso = 0.0;
+            s_perf_sync = 0.0; s_perf_present = 0.0;
             s_perf_pso_calls = 0; s_perf_pso_miss = 0; s_perf_pso_hashbytes = 0;
             s_perf_ntex = 0; s_perf_texbytes = 0; s_perf_nverts = 0;
         }
@@ -6268,9 +6390,10 @@ skip_dump_consider: ;
      * backbuffer characterized above is the one DXGI accepts for scanout.
      * This is deliberately observational: no extra Present and no resource
      * copy are introduced. */
+    double _present0 = perf_on() ? perf_now() : 0.0;
     {
         static int s_scanout_log_n = 0;
-        const int scanout_probe =
+        const int scanout_probe = wa2_diag_on() &&
             (logo_probe_batch || (s_warn2_native_stage > 0 && s_d3d.frame_count < 520u)) &&
             s_scanout_log_n < 900;
         UINT bb_before = s_d3d.swap_chain->lpVtbl->GetCurrentBackBufferIndex(s_d3d.swap_chain);
@@ -6296,6 +6419,7 @@ skip_dump_consider: ;
     }
 
     move_to_next_frame();
+    if (perf_on()) s_perf_present += perf_now() - _present0;
 
     s_d3d.frame_count++;
 
@@ -6411,7 +6535,7 @@ static void d3d12_present(void* ud, u32 buffer_id)
     } else if (s_d3d.initialized && s_present_seen_content && s_d3d.draw_count == 0) {
         static int s_empty_skip_log = 0;
         if (s_empty_skip_log++ < 8)
-            fprintf(stderr, "[PRESENT-DEDUP] legacy callback kept previous frame (empty batch)%c", 10);
+            if (wa2_diag_on()) fprintf(stderr, "[PRESENT-DEDUP] legacy callback kept previous frame (empty batch)%c", 10);
     }
 
     /* FPS tracking */
@@ -7267,7 +7391,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
      * consecutive draws.  Log each pass once, including post-fetch vertex
      * attributes and blend/texture state.  This is diagnostic only and does
      * not modify guest state or shader output. */
-    if (s_d3d.current_rsx_state &&
+    if (wa2_diag_on() && s_d3d.current_rsx_state &&
         ((s_d3d.current_rsx_state->shader_program & ~1u) == 0x01BF9100u)) {
         const rsx_state* _ws = s_d3d.current_rsx_state;
         int _pass = -1;
@@ -7338,7 +7462,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
      * guest bytes feeding ATTR3 over several frames, plus both LOCAL/MAIN
      * views, so a black COLOR0 can be attributed to guest data, location
      * resolution, or VP swizzle rather than guessed from the final image. */
-    if (s_d3d.current_rsx_state &&
+    if (wa2_diag_on() && s_d3d.current_rsx_state &&
         ((s_d3d.current_rsx_state->shader_program & ~1u) == 0x01BF9100u) &&
         primitive == RSX_PRIMITIVE_TRIANGLE_STRIP && first == 10u && count == 4u &&
         s_d3d.cur_texs[0].raw == 0x01CA8480u) {
@@ -7430,7 +7554,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
      * the two characteristic boot-logo draws.  In particular attrib3 is the
      * normalized ubyte4 vertex colour/alpha used by SRC_ALPHA blending, while
      * attrib8 is the texture coordinate.  No rendering state is changed. */
-    if (s_d3d.current_rsx_state &&
+    if (wa2_diag_on() && s_d3d.current_rsx_state &&
         ((s_d3d.current_rsx_state->shader_program & ~1u) == 0x01BF9100u) &&
         ((primitive == RSX_PRIMITIVE_TRIANGLE_STRIP && first == 10u && count == 4u) ||
          (primitive == RSX_PRIMITIVE_QUADS && first == 0u && count == 24u))) {
@@ -7952,8 +8076,8 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
           /* WA2 logo root-cause probe.  This is observational only: compare
            * the selected address with LOCAL and MAIN resolutions and inspect
            * the exact level-0 byte span implied by RSX format/pitch. */
-          if ((width == 704u && height == 512u) ||
-              (width == 224u && height == 80u)) {
+          if (wa2_diag_on() && ((width == 704u && height == 512u) ||
+              (width == 224u && height == 80u))) {
               static u32 logo_seen[8]; static int logo_seen_n = 0;
               int known = 0;
               for (int k = 0; k < logo_seen_n; k++) if (logo_seen[k] == offset) known = 1;
@@ -8390,7 +8514,7 @@ void rsx_d3d12_backend_present(void)
     if (s_d3d.initialized && !has_display && s_d3d.draw_count == 0 && s_present_seen_content) {
         static int s_ticker_empty_skip_log = 0;
         if (s_ticker_empty_skip_log++ < 8)
-            fprintf(stderr, "[PRESENT-DEDUP] ticker kept previous frame (empty batch)%c", 10);
+            if (wa2_diag_on()) fprintf(stderr, "[PRESENT-DEDUP] ticker kept previous frame (empty batch)%c", 10);
     }
 
     if (s_d3d.initialized && (has_display || s_d3d.draw_count > 0)) {
