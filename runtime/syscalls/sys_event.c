@@ -25,6 +25,148 @@ sys_event_flag_info  g_sys_event_flags[SYS_EVENT_FLAG_MAX];
 
 static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt);
 
+/* ---------------------------------------------------------------------------
+ * High-frequency event trace throttling.
+ *
+ * Debug captures used to write one WAIT line plus up to four evt lines for
+ * every synth2 round-trip.  That is useful around a target call site, but it
+ * serializes guest threads on stdio when left enabled for an entire run.
+ *
+ * Default PS3_HOTLOG=throttle: first 8 records/site, then every 1024th.
+ * PS3_HOTLOG=full: old full-rate behaviour.
+ * PS3_HOTLOG=off: suppress sampled hot-path lines entirely.
+ *
+ * A one-shot full-detail burst can be armed without globally enabling the
+ * firehose.  Set any combination of the focus variables below; all specified
+ * fields must match the syscall that arms the burst:
+ *   PS3_LOG_FOCUS_Q=<queue id>
+ *   PS3_LOG_FOCUS_PORT=<port id>
+ *   PS3_LOG_FOCUS_TID=<thread id>
+ *   PS3_LOG_FOCUS_CIA=<guest pc, decimal or 0x...>
+ *   PS3_LOG_FOCUS_LR=<guest lr, decimal or 0x...>
+ *   PS3_LOG_BURST=<hot log records, default 512>
+ * PS3_LOG_FOCUS_REPEAT=1 allows another burst after the previous one drains.
+ */
+#ifdef _WIN32
+typedef volatile LONG evt_hot_counter_t;
+static unsigned long evt_hot_next(evt_hot_counter_t* c) { return (unsigned long)InterlockedIncrement(c); }
+static volatile LONG s_evt_log_burst = 0;
+static long evt_burst_get(void) { return (long)InterlockedCompareExchange(&s_evt_log_burst, 0, 0); }
+static void evt_burst_set(long n) { InterlockedExchange(&s_evt_log_burst, (LONG)n); }
+static int evt_burst_take(void)
+{
+    LONG cur = InterlockedCompareExchange(&s_evt_log_burst, 0, 0);
+    while (cur > 0) {
+        LONG old = InterlockedCompareExchange(&s_evt_log_burst, cur - 1, cur);
+        if (old == cur) return 1;
+        cur = old;
+    }
+    return 0;
+}
+#else
+typedef volatile unsigned long evt_hot_counter_t;
+static unsigned long evt_hot_next(evt_hot_counter_t* c) { return __sync_add_and_fetch(c, 1); }
+static volatile long s_evt_log_burst = 0;
+static long evt_burst_get(void) { return __sync_add_and_fetch(&s_evt_log_burst, 0); }
+static void evt_burst_set(long n) { __sync_lock_test_and_set(&s_evt_log_burst, n); }
+static int evt_burst_take(void)
+{
+    long cur = __sync_add_and_fetch(&s_evt_log_burst, 0);
+    while (cur > 0) {
+        if (__sync_bool_compare_and_swap(&s_evt_log_burst, cur, cur - 1)) return 1;
+        cur = __sync_add_and_fetch(&s_evt_log_burst, 0);
+    }
+    return 0;
+}
+#endif
+
+static int evt_hot_emit(evt_hot_counter_t* counter)
+{
+    int mode = ps3_log_hot_mode();
+    if (mode == 0) return 0;
+    if (mode == 2) return 1;
+    if (evt_burst_take()) return 1;
+    {
+        unsigned long n = evt_hot_next(counter);
+        return n <= 8 || (n % 1024UL) == 0;
+    }
+}
+
+typedef struct evt_log_focus_cfg {
+    int init, any, fired, repeat;
+    int has_q, has_port, has_tid, has_cia, has_lr;
+    uint32_t q, port;
+    uint64_t tid;
+    uint32_t cia, lr;
+    long burst;
+} evt_log_focus_cfg;
+
+static evt_log_focus_cfg s_evt_focus;
+
+static uint64_t evt_parse_u64_env(const char* name, int* present)
+{
+    const char* e = getenv(name);
+    char* end = 0;
+    unsigned long long v;
+    if (!e || !*e) { if (present) *present = 0; return 0; }
+    v = strtoull(e, &end, 0);
+    if (end == e) { if (present) *present = 0; return 0; }
+    if (present) *present = 1;
+    return (uint64_t)v;
+}
+
+static void evt_focus_init(void)
+{
+    if (s_evt_focus.init) return;
+    s_evt_focus.init = 1;
+    s_evt_focus.q    = (uint32_t)evt_parse_u64_env("PS3_LOG_FOCUS_Q",    &s_evt_focus.has_q);
+    s_evt_focus.port = (uint32_t)evt_parse_u64_env("PS3_LOG_FOCUS_PORT", &s_evt_focus.has_port);
+    s_evt_focus.tid  =           evt_parse_u64_env("PS3_LOG_FOCUS_TID",   &s_evt_focus.has_tid);
+    s_evt_focus.cia  = (uint32_t)evt_parse_u64_env("PS3_LOG_FOCUS_CIA",  &s_evt_focus.has_cia);
+    s_evt_focus.lr   = (uint32_t)evt_parse_u64_env("PS3_LOG_FOCUS_LR",   &s_evt_focus.has_lr);
+    s_evt_focus.any = s_evt_focus.has_q || s_evt_focus.has_port || s_evt_focus.has_tid ||
+                      s_evt_focus.has_cia || s_evt_focus.has_lr;
+    {
+        int has_burst = 0;
+        uint64_t b = evt_parse_u64_env("PS3_LOG_BURST", &has_burst);
+        s_evt_focus.burst = has_burst ? (long)b : 512;
+        if (s_evt_focus.burst < 1) s_evt_focus.burst = 1;
+    }
+    {
+        const char* e = getenv("PS3_LOG_FOCUS_REPEAT");
+        s_evt_focus.repeat = e && e[0] && e[0] != '0';
+    }
+}
+
+static void evt_focus_maybe(ppu_context* ctx, int have_q, uint32_t q,
+                            int have_port, uint32_t port)
+{
+    evt_focus_init();
+    if (!s_evt_focus.any) return;
+    if (!s_evt_focus.repeat && s_evt_focus.fired) return;
+    if (evt_burst_get() > 0) return;
+    if (s_evt_focus.has_q    && (!have_q    || q != s_evt_focus.q)) return;
+    if (s_evt_focus.has_port && (!have_port || port != s_evt_focus.port)) return;
+    if (s_evt_focus.has_tid  && ctx->thread_id != s_evt_focus.tid) return;
+    if (s_evt_focus.has_cia  && (uint32_t)ctx->cia != s_evt_focus.cia) return;
+    if (s_evt_focus.has_lr   && (uint32_t)ctx->lr  != s_evt_focus.lr) return;
+
+    s_evt_focus.fired = 1;
+    evt_burst_set(s_evt_focus.burst);
+    fprintf(stderr,
+            "[LOG-BURST] armed=%ld q=%s%u port=%s%u tid=%llu cia=0x%08X lr=0x%08X%c",
+            s_evt_focus.burst,
+            have_q ? "" : "-", have_q ? q : 0,
+            have_port ? "" : "-", have_port ? port : 0,
+            (unsigned long long)ctx->thread_id, (uint32_t)ctx->cia, (uint32_t)ctx->lr, 10);
+}
+
+static evt_hot_counter_t s_hot_wait_recv;
+static evt_hot_counter_t s_hot_q3_inject;
+static evt_hot_counter_t s_hot_port_send;
+static evt_hot_counter_t s_hot_port_route;
+static evt_hot_counter_t s_hot_synth2_complete;
+
 /* Table lock for allocation */
 #ifdef _WIN32
 static CRITICAL_SECTION s_evt_table_lock;
@@ -293,7 +435,8 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     /* PPU_THREADGATE: the creating thread is now blocking -> workers may run
      * (PS3 priority semantics). Their job objects are fully initialized by now. */
     { extern void ydkj_release_pending_threads(void); ydkj_release_pending_threads(); }
-    if (ps3_log_verbose())
+    evt_focus_maybe(ctx, 1, queue_id, 0, 0);
+    if (evt_hot_emit(&s_hot_wait_recv))
         fprintf(stderr, "[WAIT] event_queue_receive(q=%u timeout=%llu) tid=%llu cia=0x%08X lr=0x%08X\n",
                 queue_id, (unsigned long long)timeout_us,
                 (unsigned long long)ctx->thread_id, (uint32_t)ctx->cia, (uint32_t)ctx->lr);
@@ -475,7 +618,8 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         syn_evt.data2  = 0;
         syn_evt.data3  = 0;
         event_queue_push(q, &syn_evt);
-        fprintf(stderr, "[evt] queue_receive(q=3): injected synth2 SPU completion event\n");
+        if (evt_hot_emit(&s_hot_q3_inject))
+            fprintf(stderr, "[evt] queue_receive(q=3): injected synth2 SPU completion event\n");
     }
 
 #ifdef _WIN32
@@ -934,8 +1078,10 @@ int64_t sys_event_port_send(ppu_context* ctx)
     if (getenv("PS3_EVT_SEND_STACK")) { static unsigned char seen[8]={0}; unsigned pk=port_id&7;
         if(!seen[pk]){ seen[pk]=1; extern void ppu_dump_guest_stack(ppu_context*,const char*);
             char tag[40]; snprintf(tag,sizeof tag,"port_send producer port=%u",port_id); ppu_dump_guest_stack(ctx,tag); } }
-    fprintf(stderr, "[evt] port_send(port=%u data=0x%llX/0x%llX/0x%llX)\n",
-            port_id, (unsigned long long)data1, (unsigned long long)data2, (unsigned long long)data3);
+    evt_focus_maybe(ctx, 0, 0, 1, port_id);
+    if (evt_hot_emit(&s_hot_port_send))
+        fprintf(stderr, "[evt] port_send(port=%u data=0x%llX/0x%llX/0x%llX)\n",
+                port_id, (unsigned long long)data1, (unsigned long long)data2, (unsigned long long)data3);
 
     if (port_id == 0 || port_id > SYS_EVENT_PORT_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -967,8 +1113,9 @@ int64_t sys_event_port_send(ppu_context* ctx)
         fprintf(stderr, "[evt] port_send(port=%u): NOT CONNECTED to any queue\n", port_id);
         return (int64_t)(int32_t)CELL_ENOTCONN;
     }
-    fprintf(stderr, "[evt] port_send(port=%u) -> queue id=%d (source=0x%llX)\n",
-            port_id, p->connected_queue, (unsigned long long)p->name);
+    if (evt_hot_emit(&s_hot_port_route))
+        fprintf(stderr, "[evt] port_send(port=%u) -> queue id=%d (source=0x%llX)\n",
+                port_id, p->connected_queue, (unsigned long long)p->name);
 
     int32_t qidx = p->connected_queue;
     if (qidx <= 0 || qidx > SYS_EVENT_QUEUE_MAX)
@@ -993,7 +1140,8 @@ int64_t sys_event_port_send(ppu_context* ctx)
     if (port_id == 1) {
         if (g_sys_event_queues[2].active) {
             sys_event_queue_push_by_id(3, 0xFFFFFFFF53505501ULL, (0x3AULL << 32), 0, 0);
-            fprintf(stderr, "[evt] port_send(port=1): synth2 SPU completion pushed to Queue 3\n");
+            if (evt_hot_emit(&s_hot_synth2_complete))
+                fprintf(stderr, "[evt] port_send(port=1): synth2 SPU completion pushed to Queue 3\n");
         }
         return CELL_OK;
     }
