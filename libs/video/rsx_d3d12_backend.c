@@ -2778,19 +2778,18 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      *             uploaded 704x512 GPU texture.
      * This is diagnostic-only and intentionally limited to FP 0x01BF9101. */
     if ((fp_addr & ~1u) == 0x01BF9100u) {
-        /* rsx_fp_decompile() emits a plain float4 main() and terminates it with
-         * `return r[0];` or `return h[0];`.  Rewrite that final return expression
-         * directly; do not look for the unrelated PSOut form used by some other
-         * shader paths/debug helpers.  This probe is self-verifying: a successful
-         * splice always prints WARN2_DIAG_PS before compilation. */
-        char* rp = strstr(hlsl, "    return r[0];");
-        if (!rp)
-            rp = strstr(hlsl, "    return h[0];");
+        /* Current rsx_fp_decompiler terminates single-target programs as:
+         *     float4 _o = r[0];   (or h[0])
+         *     return (_o == _o) ? _o : (float4)0;
+         * Rewrite the _o assignment, leaving the NaN guard intact.  Matching
+         * the declaration rather than a particular r/h export also survives
+         * the FP32/FP16 export mode. */
+        char* rp = strstr(hlsl, "    float4 _o = ");
         if (rp) {
             char* semi = strchr(rp, ';');
             if (semi) {
                 static const char rep[] =
-                    "    return (input.position.x < 522.0f) ? "
+                    "    float4 _o = (input.position.x < 522.0f) ? "
                     "float4(saturate(input.tc0.xy), 0.0f, 1.0f) : "
                     "((input.position.x < 757.0f) ? "
                     "rsx_tex[0].SampleLevel(rsx_samp[0], input.tc0.xy, 0.0f) : "
@@ -2803,16 +2802,16 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
                     memmove(rp + newlen, semi, tail);
                     memcpy(rp, rep, newlen);
                     fprintf(stderr,
-                            "[WARN2_DIAG_PS] return rewrite active old=%u new=%u%c",
+                            "[WARN2_DIAG_PS] output rewrite active old=%u new=%u%c",
                             (unsigned)oldlen, (unsigned)newlen, 10);
                 } else {
-                    fprintf(stderr, "[WARN2_DIAG_PS] return rewrite too large%c", 10);
+                    fprintf(stderr, "[WARN2_DIAG_PS] output rewrite too large%c", 10);
                 }
             } else {
-                fprintf(stderr, "[WARN2_DIAG_PS] return semicolon not found%c", 10);
+                fprintf(stderr, "[WARN2_DIAG_PS] output semicolon not found%c", 10);
             }
         } else {
-            fprintf(stderr, "[WARN2_DIAG_PS] return anchor not found%c", 10);
+            fprintf(stderr, "[WARN2_DIAG_PS] output anchor not found%c", 10);
         }
     }
 
