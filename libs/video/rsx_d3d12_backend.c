@@ -422,6 +422,10 @@ static u32               s_logo_probe_x = 0;
 static u32               s_logo_probe_y = 0;
 static u8                s_logo_probe_rgba[4] = {0,0,0,0};
 static int               s_logo_probe_ready = 0;
+/* WA2 warning colour-link probe. Set by the draw path once the guest ATTR3
+ * feeding the large warning quad becomes non-black; the frame readback waits
+ * for this so COL0 is tested after the intentional black phase. */
+static int               s_warn2_col0_nonzero = 0;
 
 /* Host movie bridge for eboot_port.  This is the renderer instance that owns
  * the window/swap chain created by eboot_port/main.cpp.  cellVpost workers run
@@ -2766,17 +2770,14 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         }
     }
 
-    /* WA2 warning-2 one-run fragment-link diagnostic.  The ordinary probes
-     * have already proven that the guest texture contains colour, the GPU copy
-     * contains the same colour, the quad covers exactly 704x512 samples, and
-     * COLOR0 reaches white after the guest fade.  Split only this two-op boot
-     * FP into three screen-space bands so one readback distinguishes the last
-     * unresolved stages without relying on visual inspection:
-     *   x < 522: expose interpolated TEXCOORD0 directly;
-     *   522..756: sample normally with TEXCOORD0;
-     *   x >= 757: sample a fixed texel (130,150), already observed white in the
-     *             uploaded 704x512 GPU texture.
-     * This is diagnostic-only and intentionally limited to FP 0x01BF9101. */
+    /* WA2 warning colour-link diagnostic. Earlier probes proved TEXCOORD0,
+     * normal sampling, and fixed-UV sampling all work. The only remaining
+     * operand in the real two-op FP is COLOR0, so split this FP into three
+     * screen-space bands:
+     *   x < 522: interpolated COLOR0 directly;
+     *   522..756: texture sample only;
+     *   x >= 757: texture sample * COLOR0 (the real shader expression).
+     * Frame readback is delayed until the guest ATTR3 is non-black. */
     if ((fp_addr & ~1u) == 0x01BF9100u) {
         /* Current rsx_fp_decompiler terminates single-target programs as:
          *     float4 _o = r[0];   (or h[0])
@@ -2790,11 +2791,11 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             if (semi) {
                 static const char rep[] =
                     "    float4 _o = (input.position.x < 522.0f) ? "
-                    "float4(saturate(input.tc0.xy), 0.0f, 1.0f) : "
+                    "float4(saturate(input.col0.rgb), 1.0f) : "
                     "((input.position.x < 757.0f) ? "
                     "rsx_tex[0].SampleLevel(rsx_samp[0], input.tc0.xy, 0.0f) : "
-                    "rsx_tex[0].SampleLevel(rsx_samp[0], "
-                    "float2(0.1853693182f, 0.2939453125f), 0.0f))";
+                    "(rsx_tex[0].SampleLevel(rsx_samp[0], input.tc0.xy, 0.0f) * "
+                    "saturate(input.col0)))";
                 const size_t oldlen = (size_t)(semi - rp);
                 const size_t newlen = sizeof(rep) - 1u;
                 const size_t tail = strlen(semi) + 1u;
@@ -5868,7 +5869,8 @@ skip_dump_consider: ;
     guest_fb_present(fi);
     composite_present(fi);
     static int s_logo_fb_done = 0;
-    int logo_fb_probe = logo_probe_batch && !s_logo_fb_done && s_d3d.readback_buf;
+    int logo_fb_probe = logo_probe_batch && !s_logo_fb_done &&
+                        s_warn2_col0_nonzero && s_d3d.readback_buf;
     int dumping = (s_d3d.dump_frames_left > 0 && s_d3d.readback_buf
                    && s_d3d.dump_skip_left == 0);
     { static int mind2 = -1;
@@ -6032,7 +6034,7 @@ skip_dump_consider: ;
                 alpha_nz, s_d3d.width*s_d3d.height, nz, bbox_rgb, bbox_n,
                 rmax,gmax,bmax,amax,qc[0],qc[1],qc[2],qc[3],10);
             fprintf(stderr,
-                "[WARN2_DIAG_FB] frame=%u tc0_rgb=%u/%u sample_rgb=%u/%u fixed_rgb=%u/%u%c",
+                "[WARN2_COL_DIAG_FB] frame=%u col0_rgb=%u/%u sample_rgb=%u/%u product_rgb=%u/%u%c",
                 s_d3d.frame_count, diag_rgb[0], diag_n[0],
                 diag_rgb[1], diag_n[1], diag_rgb[2], diag_n[2], 10);
             D3D12_RANGE _wr = {0,0};
@@ -7125,6 +7127,22 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
         else if (primitive == RSX_PRIMITIVE_TRIANGLE_STRIP && first == 10u && count == 4u) _pass = 2;
         else if (first == 0u && count == 24u) _pass = 3;
         if (_pass >= 0) {
+            /* Track the first frame where the large warning quad's guest colour
+             * is genuinely non-black. rsx_fetch_attrib is also the function that
+             * populates the host VP vertex buffer, so this is the right trigger
+             * for a late fragment-stage readback. */
+            if (_pass == 2) {
+                float _cnow[4];
+                rsx_fetch_attrib(_ws, 3, first, _cnow);
+                if (_cnow[0] > 0.001f || _cnow[1] > 0.001f || _cnow[2] > 0.001f) {
+                    if (!s_warn2_col0_nonzero)
+                        fprintf(stderr,
+                            "[WARN2_COL0_ARM] frame=%llu col=(%.6g %.6g %.6g %.6g)%c",
+                            (unsigned long long)s_d3d.frame_count,
+                            _cnow[0], _cnow[1], _cnow[2], _cnow[3], 10);
+                    s_warn2_col0_nonzero = 1;
+                }
+            }
             static unsigned _seen = 0;
             const unsigned _bit = 1u << (unsigned)_pass;
             if (!(_seen & _bit)) {
