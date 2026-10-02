@@ -1,9 +1,9 @@
 /*
  * ps3recomp - cellAdec HLE implementation
  *
- * Stub audio decoder. Accepts AU data and delivers AUDONE callbacks.
- * Actual decoding (AAC, ATRAC3+, etc.) requires integration with
- * an audio codec library (e.g., FFmpeg).
+ * Audio decoder HLE. ATRAC3+ access units are decoded through FFmpeg when
+ * available; callback/guest-buffer semantics remain usable on builds without
+ * FFmpeg through the existing silence fallback.
  */
 
 #include "cellAdec.h"
@@ -21,6 +21,13 @@
 #include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
 #include "ps3emu/guest_call.h" /* g_ps3_guest_caller -- cbFunc is a GUEST OPD */
 #include "../../runtime/memory/vm.h"     /* VM_HLE_INJECT_BASE */
+#include "../audio/cellAudio.h"
+
+#ifdef PS3RECOMP_HAVE_FFMPEG
+#include <libavcodec/avcodec.h>
+#include <libavutil/error.h>
+#include <libavutil/samplefmt.h>
+#endif
 
 /* CellAdecPcmItem as the guest reads it, from RPCS3 Modules/cellAdec.h:339.
  * ps1_netemu copies the whole thing out with six 8-byte loads from offsets
@@ -75,7 +82,19 @@ typedef struct {
     u32 itemEa;         /* guest EA of the 0x30-byte CellAdecPcmItem */
     u32 pcmEa;          /* guest EA of the PCM buffer it points at    */
     int hasPcm;
+    u32 pcmBytes;
+    u32 pcmSamples;
+    u32 pcmChannels;
+    u32 pcmSampleRate;
     u32 auCount;        /* total AUs decoded */
+#ifdef PS3RECOMP_HAVE_FFMPEG
+    const AVCodec* codec;
+    AVCodecContext* ctx;
+    AVFrame* frame;
+    u32 atracPayloadBytes;
+    int atracConfigured;
+    int skipFirstFrame;
+#endif
 #ifdef _WIN32
     CRITICAL_SECTION pcmMutex;
     CONDITION_VARIABLE pcmCond;
@@ -191,6 +210,115 @@ static void adec_notify(CellAdecHandle handle, u32 msg_type, s32 msg_data)
                        (u64)(s64)msg_data, (u64)a->cbArg, 0, 0, 0, 0);
 }
 
+#ifdef PS3RECOMP_HAVE_FFMPEG
+static void adec_ffmpeg_reset(AdecSlot* a)
+{
+    if (a->ctx) avcodec_free_context(&a->ctx);
+    if (a->frame) av_frame_free(&a->frame);
+    a->codec = NULL;
+    a->atracPayloadBytes = 0;
+    a->atracConfigured = 0;
+}
+
+static int adec_configure_atrac_from_ats(AdecSlot* a, const u8* src, u32 size)
+{
+    if (!src || size < 8 || src[0] != 0x0f || src[1] != 0xd0)
+        return AVERROR_INVALIDDATA;
+
+    u16 params = (u16)(((u16)src[2] << 8) | src[3]);
+    u32 sr_idx = params >> 13;
+    u32 ch_cfg = (params >> 10) & 7u;
+    u32 payload = ((params & 0x03ffu) + 1u) * 8u;
+    u32 rate = sr_idx == 1u ? 44100u : (sr_idx == 2u ? 48000u : 0u);
+    u32 channels = ch_cfg <= 4u ? ch_cfg : ch_cfg + 1u;
+    if (!rate || !channels || payload == 0 || size < payload + 8u)
+        return AVERROR_INVALIDDATA;
+
+    a->codec = avcodec_find_decoder(AV_CODEC_ID_ATRAC3P);
+    if (!a->codec) return AVERROR_DECODER_NOT_FOUND;
+    a->ctx = avcodec_alloc_context3(a->codec);
+    a->frame = av_frame_alloc();
+    if (!a->ctx || !a->frame) {
+        adec_ffmpeg_reset(a);
+        return AVERROR(ENOMEM);
+    }
+    a->ctx->block_align = (int)payload;
+    a->ctx->sample_rate = (int)rate;
+    a->ctx->ch_layout.nb_channels = (int)channels;
+    int ret = avcodec_open2(a->ctx, a->codec, NULL);
+    if (ret < 0) {
+        adec_ffmpeg_reset(a);
+        return ret;
+    }
+    a->atracPayloadBytes = payload;
+    a->atracConfigured = 1;
+    a->skipFirstFrame = 1; /* CELL ADEC ATRAC-X replaces first frame with silence. */
+    fprintf(stderr,
+            "[cellAdec] FFmpeg ATRAC3+ configured: %u Hz ch=%u payload=%u bytes\n",
+            rate, channels, payload);
+    return 0;
+}
+
+static int adec_decode_atrac(AdecSlot* a, const u8* src, u32 size,
+                             float* host_pcm, u32 host_capacity_frames,
+                             u32* frames_out, u32* channels_out, u32* rate_out)
+{
+    *frames_out = *channels_out = *rate_out = 0;
+    if (!a->atracConfigured) {
+        int r = adec_configure_atrac_from_ats(a, src, size);
+        if (r < 0) return r;
+    }
+    if (size < 8u + a->atracPayloadBytes) return AVERROR_INVALIDDATA;
+
+    AVPacket* pkt = av_packet_alloc();
+    if (!pkt) return AVERROR(ENOMEM);
+    int ret = av_new_packet(pkt, (int)a->atracPayloadBytes);
+    if (ret < 0) { av_packet_free(&pkt); return ret; }
+    memcpy(pkt->data, src + 8u, a->atracPayloadBytes);
+
+    ret = avcodec_send_packet(a->ctx, pkt);
+    av_packet_free(&pkt);
+    if (ret < 0) return ret;
+
+    av_frame_unref(a->frame);
+    ret = avcodec_receive_frame(a->ctx, a->frame);
+    if (ret < 0) return ret;
+
+    u32 channels = (u32)a->frame->ch_layout.nb_channels;
+    if (!channels) channels = (u32)a->ctx->ch_layout.nb_channels;
+    u32 frames = (u32)a->frame->nb_samples;
+    u32 rate = (u32)(a->frame->sample_rate ? a->frame->sample_rate : a->ctx->sample_rate);
+    if (!channels || !frames || frames > host_capacity_frames)
+        return AVERROR_INVALIDDATA;
+
+    if (a->skipFirstFrame) {
+        memset(host_pcm, 0, (size_t)frames * channels * sizeof(float));
+        a->skipFirstFrame = 0;
+    } else if (a->frame->format == AV_SAMPLE_FMT_FLTP) {
+        for (u32 i = 0; i < frames; ++i)
+            for (u32 ch = 0; ch < channels; ++ch)
+                host_pcm[i * channels + ch] = ((const float*)a->frame->extended_data[ch])[i];
+    } else if (a->frame->format == AV_SAMPLE_FMT_FLT) {
+        memcpy(host_pcm, a->frame->data[0], (size_t)frames * channels * sizeof(float));
+    } else {
+        fprintf(stderr, "[cellAdec] unsupported FFmpeg sample_fmt=%d\n", a->frame->format);
+        return AVERROR_INVALIDDATA;
+    }
+
+    *frames_out = frames;
+    *channels_out = channels;
+    *rate_out = rate;
+    return 0;
+}
+#endif
+
+static void write_guest_float_be(u32 ea, float f)
+{
+    u32 bits;
+    memcpy(&bits, &f, sizeof(bits));
+    vm_write32(ea, bits);
+}
+
 /* ---------------------------------------------------------------------------
  * API implementations
  * -----------------------------------------------------------------------*/
@@ -266,6 +394,9 @@ s32 cellAdecClose(CellAdecHandle handle)
         return (s32)CELL_ADEC_ERROR_ARG;
 
     AdecSlot* a = &s_adec[handle];
+#ifdef PS3RECOMP_HAVE_FFMPEG
+    adec_ffmpeg_reset(a);
+#endif
     if (a->pcmSyncInit) {
         pcm_lock(a);
         a->in_use = 0;
@@ -291,7 +422,15 @@ s32 cellAdecStartSeq(CellAdecHandle handle, void* param)
     pcm_lock(a);
     a->seqStarted = 1;
     a->hasPcm = 0;
+    a->pcmBytes = 0;
+    a->pcmSamples = 0;
+    a->pcmChannels = 0;
+    a->pcmSampleRate = 0;
     a->auCount = 0;
+#ifdef PS3RECOMP_HAVE_FFMPEG
+    if (a->ctx) avcodec_flush_buffers(a->ctx);
+    a->skipFirstFrame = 1;
+#endif
     pcm_wake_all(a);
     pcm_unlock(a);
     return CELL_OK;
@@ -371,26 +510,79 @@ s32 cellAdecDecodeAu(CellAdecHandle handle, const CellAdecAuInfo* auInfo)
      * outstanding AUs by address gets a null back if this is CELL_OK. */
     adec_notify(handle, CELL_ADEC_MSG_TYPE_AUDONE, (s32)GUEST_EA(auInfo));
 
-    /* Step 2: Generate PCMOUT callback with dummy PCM info.
-     * Without FFmpeg, we produce silence. But games that check for
-     * decode completion via callbacks will proceed correctly. */
+    /* Step 2: decode ATRAC3+ into real float PCM when FFmpeg is present. */
     a->auCount++;
     {
         const u32 au = GUEST_EA(auInfo);
         const u32 it = a->itemEa;
-        for (u32 o = 0; o < ADEC_PCM_BYTES; o += 4) vm_write32(a->pcmEa + o, 0);
+        const u32 start_addr = vm_read32(au + (u32)offsetof(CellAdecAuInfo, startAddr));
+        const u32 au_size = vm_read32(au + (u32)offsetof(CellAdecAuInfo, size));
+        u32 pcm_frames = ADEC_PCM_SAMPLES;
+        u32 pcm_channels = 2;
+        u32 pcm_rate = 48000;
+        u32 pcm_bytes = ADEC_PCM_BYTES;
+        int decoded_real = 0;
+
+#ifdef PS3RECOMP_HAVE_FFMPEG
+        if (start_addr && au_size >= 8u) {
+            /* ATRAC3+ is at most 8 channels; 2048 samples => 64 KiB temp. */
+            float host_pcm[ADEC_PCM_SAMPLES * 8u];
+            u32 got_frames = 0, got_channels = 0, got_rate = 0;
+            const u8* src = GUEST_PTR((void*)(uintptr_t)start_addr, const u8*);
+            int dr = adec_decode_atrac(a, src, au_size, host_pcm,
+                                       ADEC_PCM_SAMPLES,
+                                       &got_frames, &got_channels, &got_rate);
+            if (dr >= 0 && got_frames && got_channels) {
+                /* WA2 opens the 2-channel ATRAC-X codec.  Keep the guest-facing
+                 * block stereo even if a future stream advertises more channels;
+                 * the direct host fallback also uses the first stereo pair. */
+                pcm_frames = got_frames;
+                pcm_channels = got_channels >= 2u ? 2u : 1u;
+                pcm_rate = got_rate;
+                pcm_bytes = pcm_frames * pcm_channels * 4u;
+                if (pcm_bytes > ADEC_PCM_BYTES) pcm_bytes = ADEC_PCM_BYTES;
+                u32 samples_to_write = pcm_bytes / 4u;
+                for (u32 i = 0; i < samples_to_write; ++i) {
+                    u32 frame = i / pcm_channels;
+                    u32 ch = i % pcm_channels;
+                    float f = host_pcm[frame * got_channels + ch];
+                    write_guest_float_be(a->pcmEa + i * 4u, f);
+                }
+                for (u32 o = pcm_bytes; o < ADEC_PCM_BYTES; o += 4u)
+                    vm_write32(a->pcmEa + o, 0);
+
+                /* Until the persistent synth2 mixer is faithfully resident,
+                 * cellAudio's HLE fallback is the only path that can reach the
+                 * real host sink.  It auto-disables mixing if guest ports ever
+                 * start carrying real PCM. */
+                cellAudioHlePcmSubmitF32(host_pcm, got_frames, got_channels, got_rate);
+                decoded_real = 1;
+            } else {
+                char err[128] = {0};
+                av_strerror(dr, err, sizeof(err));
+                static int decode_logs = 0;
+                if (decode_logs++ < 12)
+                    fprintf(stderr, "[cellAdec] FFmpeg ATRAC decode failed: %s (%d), AU=%u bytes\n",
+                            err, dr, au_size);
+            }
+        }
+#endif
+        if (!decoded_real) {
+            for (u32 o = 0; o < ADEC_PCM_BYTES; o += 4u) vm_write32(a->pcmEa + o, 0);
+        }
+
+        a->pcmBytes = pcm_bytes;
+        a->pcmSamples = pcm_frames;
+        a->pcmChannels = pcm_channels;
+        a->pcmSampleRate = pcm_rate;
 
         vm_write32(it + PCMITEM_PCM_HANDLE, (u32)handle);
         vm_write32(it + PCMITEM_STATUS,     0);              /* CELL_OK */
         vm_write32(it + PCMITEM_START_ADDR, a->pcmEa);
-        vm_write32(it + PCMITEM_SIZE,       ADEC_PCM_BYTES);
+        vm_write32(it + PCMITEM_SIZE,       pcm_bytes);
         vm_write32(it + PCMITEM_BSI_INFO,   0);
-        /* Echo the AU back, which is what a real decoder does -- the guest
-         * matches returned PCM against the AU it submitted. */
-        vm_write32(it + PCMITEM_AU_START,
-                   vm_read32(au + (u32)offsetof(CellAdecAuInfo, startAddr)));
-        vm_write32(it + PCMITEM_AU_SIZE,
-                   vm_read32(au + (u32)offsetof(CellAdecAuInfo, size)));
+        vm_write32(it + PCMITEM_AU_START,   start_addr);
+        vm_write32(it + PCMITEM_AU_SIZE,    au_size);
         vm_write32(it + PCMITEM_AU_PTS_HI,       vm_read32(au + 0x08));
         vm_write32(it + PCMITEM_AU_PTS_LO,       vm_read32(au + 0x0C));
         vm_write32(it + PCMITEM_AU_USERDATA,     vm_read32(au + 0x10));
@@ -420,11 +612,11 @@ s32 cellAdecGetPcm(CellAdecHandle handle, void* outBuffer)
         return (s32)CELL_ADEC_ERROR_EMPTY;
     }
 
-    /* outBuffer is the GUEST's buffer. ATRAC3+ 2ch float output is 0x4000
-     * bytes per AU (2048 samples), matching the movie player's 0x4000-spaced
-     * apost buffers. */
+    /* Preserve the exact big-endian float bytes generated above. */
     { const u32 out = GUEST_EA(outBuffer);
-      if (out) for (u32 o = 0; o < ADEC_PCM_BYTES; o += 4) vm_write32(out + o, 0); }
+      const u32 bytes = a->pcmBytes ? a->pcmBytes : ADEC_PCM_BYTES;
+      if (out) memcpy(GUEST_PTR((void*)(uintptr_t)out, void*),
+                      GUEST_PTR((void*)(uintptr_t)a->pcmEa, const void*), bytes); }
 
     a->hasPcm = 0;
     pcm_wake_all(a);
@@ -438,7 +630,8 @@ s32 cellAdecGetPcmItem(CellAdecHandle handle, const CellAdecPcmItem** pcmItem)
         const int hp = handle < MAX_ADEC ? s_adec[handle].hasPcm : -1;
         const u64 pts = (handle < MAX_ADEC && hp) ? vm_read64(s_adec[handle].itemEa + PCMITEM_AU_PTS_HI) : 0;
         printf("[cellAdec] GetPcmItem(handle=%u out=0x%08X hasPcm=%d pts=%llu pcmBytes=0x%X)\n",
-               handle, GUEST_EA(pcmItem), hp, (unsigned long long)pts, ADEC_PCM_BYTES);
+               handle, GUEST_EA(pcmItem), hp, (unsigned long long)pts,
+               (handle < MAX_ADEC && s_adec[handle].pcmBytes) ? s_adec[handle].pcmBytes : ADEC_PCM_BYTES);
       } }
     if (handle >= MAX_ADEC || !s_adec[handle].in_use)
         return (s32)CELL_ADEC_ERROR_ARG;

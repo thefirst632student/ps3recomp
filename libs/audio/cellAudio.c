@@ -148,6 +148,17 @@ static u64            s_audio_start_us = 0;
 static u64            s_audio_block_counter = 0;
 static u8             s_audio_port_seen_pcm[CELL_AUDIO_PORT_MAX];
 static int            s_audio_mix_seen_pcm = 0;
+static int            s_audio_guest_pcm_seen = 0;
+
+/* Host-native PCM fallback FIFO used by HLE decoders while a title's guest
+ * SPU mixer is not yet functional.  Six seconds is intentionally generous:
+ * decoder threads often run ahead of realtime, and producer-side backpressure
+ * below paces them once the FIFO fills instead of dropping audible data. */
+#define HLE_PCM_FIFO_FRAMES (CELL_AUDIO_SAMPLE_RATE * 6u)
+static float s_hle_pcm_fifo[HLE_PCM_FIFO_FRAMES * 2u];
+static u32   s_hle_pcm_head = 0;
+static u32   s_hle_pcm_count = 0;
+static int   s_hle_pcm_logged = 0;
 
 /* Mixing thread */
 static volatile int  s_mix_thread_running = 0;
@@ -381,6 +392,102 @@ static u32 audio_backend_queued_samples(void)
 
 #endif /* AUDIO_BACKEND_WASAPI */
 
+static void hle_pcm_sleep_1ms(void)
+{
+#ifdef _WIN32
+    Sleep(1);
+#else
+    struct timespec ts = {0, 1000000L};
+    nanosleep(&ts, NULL);
+#endif
+}
+
+static int hle_pcm_enqueue_stereo(const float* stereo, u32 frames)
+{
+    u32 done = 0;
+    int stalled_ms = 0;
+
+    while (done < frames && s_audio_initialized) {
+        mutex_lock(&s_audio_mutex);
+        u32 free_frames = HLE_PCM_FIFO_FRAMES - s_hle_pcm_count;
+        u32 take = frames - done;
+        if (take > free_frames) take = free_frames;
+        for (u32 i = 0; i < take; ++i) {
+            u32 pos = (s_hle_pcm_head + s_hle_pcm_count + i) % HLE_PCM_FIFO_FRAMES;
+            s_hle_pcm_fifo[pos * 2u + 0u] = stereo[(done + i) * 2u + 0u];
+            s_hle_pcm_fifo[pos * 2u + 1u] = stereo[(done + i) * 2u + 1u];
+        }
+        s_hle_pcm_count += take;
+        mutex_unlock(&s_audio_mutex);
+        done += take;
+        if (done == frames) break;
+
+        /* Do not let a dead host audio thread deadlock the guest forever. */
+        if (++stalled_ms >= 1000) {
+            static int warned = 0;
+            if (warned++ < 4)
+                fprintf(stderr, "[cellAudio-hle] PCM FIFO stalled for 1s; dropping %u frames\n",
+                        frames - done);
+            break;
+        }
+        hle_pcm_sleep_1ms();
+    }
+    return (int)done;
+}
+
+int cellAudioHlePcmSubmitF32(const float* interleaved, u32 frames,
+                             u32 channels, u32 sample_rate)
+{
+    if (!interleaved || !frames || !channels || !s_audio_initialized)
+        return 0;
+    if (sample_rate != 48000u && sample_rate != 44100u) {
+        static int warned_rate = 0;
+        if (warned_rate++ < 4)
+            fprintf(stderr, "[cellAudio-hle] unsupported sample rate %u Hz\n", sample_rate);
+        return 0;
+    }
+
+    /* Convert to stereo and, for the one other rate used by ATRAC3+, perform a
+     * light-weight linear resample to the PS3 cellAudio fixed 48 kHz clock. */
+    u32 out_frames = sample_rate == CELL_AUDIO_SAMPLE_RATE
+        ? frames
+        : (u32)(((u64)frames * CELL_AUDIO_SAMPLE_RATE + sample_rate - 1u) / sample_rate);
+    float* tmp = (float*)malloc((size_t)out_frames * 2u * sizeof(float));
+    if (!tmp) return 0;
+
+    for (u32 o = 0; o < out_frames; ++o) {
+        double src_pos = (double)o * (double)sample_rate / (double)CELL_AUDIO_SAMPLE_RATE;
+        u32 i0 = (u32)src_pos;
+        if (i0 >= frames) i0 = frames - 1u;
+        u32 i1 = i0 + 1u < frames ? i0 + 1u : i0;
+        float t = (float)(src_pos - (double)i0);
+        float l0 = interleaved[i0 * channels + 0u];
+        float l1 = interleaved[i1 * channels + 0u];
+        float r0 = channels > 1u ? interleaved[i0 * channels + 1u] : l0;
+        float r1 = channels > 1u ? interleaved[i1 * channels + 1u] : l1;
+        tmp[o * 2u + 0u] = l0 + (l1 - l0) * t;
+        tmp[o * 2u + 1u] = r0 + (r1 - r0) * t;
+    }
+
+    if (!s_hle_pcm_logged) {
+        float peak = 0.0f;
+        for (u32 i = 0; i < out_frames * 2u; ++i) {
+            float a = tmp[i] < 0.0f ? -tmp[i] : tmp[i];
+            if (a > peak) peak = a;
+        }
+        if (peak > 0.00001f) {
+            s_hle_pcm_logged = 1;
+            fprintf(stderr,
+                    "[cellAudio-hle] first decoded PCM: in=%u Hz ch=%u frames=%u peak=%.6f\n",
+                    sample_rate, channels, frames, peak);
+        }
+    }
+
+    int queued = hle_pcm_enqueue_stereo(tmp, out_frames);
+    free(tmp);
+    return queued;
+}
+
 /* ---------------------------------------------------------------------------
  * Mixing
  * -----------------------------------------------------------------------*/
@@ -497,6 +604,7 @@ static void audio_mix_one_block(void)
 
         if (!s_audio_port_seen_pcm[p] && first_pcm_peak > 0.00001f) {
             s_audio_port_seen_pcm[p] = 1;
+            s_audio_guest_pcm_seen = 1;
             fprintf(stderr,
                     "[cellAudio] port %d first PCM: ridx=%llu block=%u peak=%.6f\n",
                     p, (unsigned long long)port->read_index, block_idx, first_pcm_peak);
@@ -513,6 +621,23 @@ static void audio_mix_one_block(void)
         port->read_index++;
         if (port->read_idx_addr)
             vm_write64((u32)port->read_idx_addr, port->read_index % nblock);
+    }
+
+    /* Drain the HLE decoder fallback at the same 48 kHz hardware cadence.
+     * Once a real guest port has produced PCM we still drain (discard) this
+     * FIFO, but stop mixing it so the guest mixer owns audio exactly once. */
+    {
+        u32 take = s_hle_pcm_count < CELL_AUDIO_BLOCK_SAMPLES
+            ? s_hle_pcm_count : CELL_AUDIO_BLOCK_SAMPLES;
+        for (u32 i = 0; i < take; ++i) {
+            u32 pos = (s_hle_pcm_head + i) % HLE_PCM_FIFO_FRAMES;
+            if (!s_audio_guest_pcm_seen) {
+                s_mix_buffer[i * 2u + 0u] += s_hle_pcm_fifo[pos * 2u + 0u];
+                s_mix_buffer[i * 2u + 1u] += s_hle_pcm_fifo[pos * 2u + 1u];
+            }
+        }
+        s_hle_pcm_head = (s_hle_pcm_head + take) % HLE_PCM_FIFO_FRAMES;
+        s_hle_pcm_count -= take;
     }
 
     mutex_unlock(&s_audio_mutex);
@@ -711,6 +836,12 @@ s32 cellAudioInit(void)
 
     memset(s_ports, 0, sizeof(s_ports));
     memset(s_notify_queues, 0, sizeof(s_notify_queues));
+    memset(s_audio_port_seen_pcm, 0, sizeof(s_audio_port_seen_pcm));
+    s_audio_mix_seen_pcm = 0;
+    s_audio_guest_pcm_seen = 0;
+    s_hle_pcm_head = 0;
+    s_hle_pcm_count = 0;
+    s_hle_pcm_logged = 0;
     mutex_init(&s_audio_mutex);
 
     if (audio_backend_init() < 0) {

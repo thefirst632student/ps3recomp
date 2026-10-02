@@ -116,6 +116,15 @@ s32 cellAudioSetPersonalDevice(s32 iPersonalStream, s32 iDevice);
 s32 cellAudioUnsetPersonalDevice(s32 iPersonalStream);
 s32 cellAudioSetPortLevel(u32 portNum, float level);
 
+/* Generic HLE-decoder fallback path.  Real PS3 titles normally route decoded
+ * PCM through guest mixers/SPU code before it reaches a cellAudio port.  Some
+ * recompilation ports do not yet have those persistent SPU mixers resident.
+ * HLE codecs may enqueue host-native float PCM here; cellAudio mixes it only
+ * while no real guest port has ever produced non-zero PCM, so a working guest
+ * mixer automatically takes precedence and avoids double audio. */
+int cellAudioHlePcmSubmitF32(const float* interleaved, u32 frames,
+                             u32 channels, u32 sample_rate);
+
 #ifdef __cplusplus
 }
 #endif

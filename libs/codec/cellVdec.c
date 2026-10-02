@@ -39,6 +39,8 @@ extern ps3_guest_caller_fn g_ps3_guest_caller;
 
 #define MAX_VDEC 4
 #define VDEC_QUEUE_CAP 64
+#define VDEC_QUEUE_HIGH_WATER 24
+#define VDEC_STALL_TICKS 100 /* 100 x 10 ms = 1 s without consumer progress */
 /* cmdDepth=4 describes decode commands in flight.  DecodeAu in this HLE is
  * synchronous, so a command is complete before DecodeAu returns and cmdDepth
  * must not be modelled by the number of decoded pictures waiting for the
@@ -81,6 +83,7 @@ typedef struct {
     VdecFrame queue[VDEC_QUEUE_CAP];
     int qHead;
     int qCount;
+    int outputDropMode;
 #ifdef _WIN32
     CRITICAL_SECTION qMutex;
     CONDITION_VARIABLE qCond;
@@ -185,17 +188,46 @@ static void clear_queue(VdecSlot* v)
     if (v->qSyncInit) { qwake_all(v); qunlock(v); }
 }
 
-static int queue_synthetic(VdecSlot* v, const CellVdecAuInfo* au, u32 width, u32 height)
+static int wait_for_output_room(VdecSlot* v)
 {
+    int stalled = 0;
+    int last_count;
+
     qlock(v);
     if (!v->seqStarted) { qunlock(v); return -1; }
-    if (v->qCount >= VDEC_QUEUE_CAP) {
-        /* No picture consumer is making progress.  Do not turn a synchronous
-         * HLE call into an uninterruptible wait; the guest must be able to
-         * reach its stop/EndSeq path. */
-        qunlock(v);
-        return 1; /* decoded successfully, picture intentionally discarded */
+
+    /* Once a consumer has been judged abandoned, keep dropping for the rest
+     * of this sequence.  Resuming after skipped frames would make the synthetic
+     * PTS extrapolator jump backwards; StartSeq resets the mode cleanly. */
+    if (v->outputDropMode) { qunlock(v); return 1; }
+
+    last_count = v->qCount;
+    while (v->seqStarted && v->qCount >= VDEC_QUEUE_HIGH_WATER) {
+        qwait_10ms(v);
+        if (!v->seqStarted) { qunlock(v); return -1; }
+        if (v->qCount < last_count) {
+            last_count = v->qCount;
+            stalled = 0;
+        } else if (++stalled >= VDEC_STALL_TICKS) {
+            v->outputDropMode = 1;
+            fprintf(stderr,
+                    "[cellVdec] output consumer stalled for ~1s at qCount=%d; "
+                    "entering teardown-safe drop mode\n", v->qCount);
+            qunlock(v);
+            return 1;
+        }
     }
+    qunlock(v);
+    return 0;
+}
+
+static int queue_synthetic(VdecSlot* v, const CellVdecAuInfo* au, u32 width, u32 height)
+{
+    int room = wait_for_output_room(v);
+    if (room) return room;
+    qlock(v);
+    if (!v->seqStarted) { qunlock(v); return -1; }
+    if (v->qCount >= VDEC_QUEUE_CAP) { qunlock(v); return 1; }
     int pos = (v->qHead + v->qCount) % VDEC_QUEUE_CAP;
     VdecFrame* q = &v->queue[pos];
     memset(q, 0, sizeof(*q));
@@ -321,16 +353,15 @@ static int queue_frame(VdecSlot* v, AVFrame* f, const CellVdecAuInfo* au)
     const u64 fdts = f->pkt_dts != AV_NOPTS_VALUE ? (u64)f->pkt_dts : invalid;
     const u64 step = frame_step_90k(v);
 
+    {
+        int room = wait_for_output_room(v);
+        if (room < 0) return AVERROR(EPIPE);
+        if (room > 0) return 1;
+    }
+
     qlock(v);
     if (!v->seqStarted) { qunlock(v); return AVERROR(EPIPE); }
-    if (v->qCount >= VDEC_QUEUE_CAP) {
-        /* Output-queue overflow is not command-depth BUSY.  The DecodeAu
-         * command itself has completed synchronously.  Drop this picture so
-         * the guest decoder thread can continue to EOS/stop even if the movie
-         * display consumer has already stopped. */
-        qunlock(v);
-        return 1;
-    }
+    if (v->qCount >= VDEC_QUEUE_CAP) { qunlock(v); return 1; }
 
     if (fpts != invalid) {
         v->nextPts = fpts;
@@ -487,6 +518,7 @@ s32 cellVdecStartSeq(CellVdecHandle handle)
     if (handle >= MAX_VDEC || !s_vdec[handle].in_use) return (s32)CELL_VDEC_ERROR_ARG;
     VdecSlot* v = &s_vdec[handle];
     v->seqStarted = 1; v->auCount = 0;
+    v->outputDropMode = 0;
     v->nextPts = v->nextDts = 0;
     v->nextPtsValid = v->nextDtsValid = 0;
     clear_queue(v);
