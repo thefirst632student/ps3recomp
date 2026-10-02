@@ -3951,9 +3951,9 @@ def main() -> None:
                                  "A2A1A", "A2A1B", "A2A1B1", "A2A1B2", "B"],
                         help="Preserve the historical Release TU-bisect tree and "
                              "split the selected logical chunk(s) at function boundaries")
-    parser.add_argument("--release-codegen-bisect-function-path", default="AAA",
+    parser.add_argument("--release-codegen-bisect-function-path", default="AAAA",
                         help="Recursive A/B function half to emit as *_avbisect_o1.cpp "
-                             "inside the selected logical chunk slice (default: AAA)")
+                             "inside the selected logical chunk slice (default: AAAA)")
     parser.add_argument("--single-file", action="store_true",
                         help="Emit one ppu_recomp.c instead of split chunks (for "
                              "single-file post-processing, e.g. flOw's vmx_splice)")
