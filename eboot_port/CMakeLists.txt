@@ -13,6 +13,11 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Debug should remain diagnosable without forcing the entire static recompile
+# through -O0.  This keeps symbols/assertions and only changes optimization.
+option(PS3RECOMP_FAST_DEBUG
+    "Keep Debug symbols/asserts but optimize lifted guest/scaffold code" ON)
+
 # Prefer Ninja if available
 if(NOT CMAKE_GENERATOR MATCHES "Ninja" AND NOT DEFINED ENV{CMAKE_GENERATOR})
     message(STATUS "Tip: use -G Ninja for faster builds")
@@ -208,6 +213,24 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 # The runtime is C++, and on Apple also Objective-C. Letting CMake infer the
 # link language from the generated C would leave the C++ standard library out.
 set_target_properties(${PROJECT_NAME} PROPERTIES LINKER_LANGUAGE CXX)
+
+# CMake's Debug configuration normally emits -O0 (or /Od).  That is especially
+# expensive for statically recompiled guest code because the generated TUs are
+# the emulated CPU itself.  Append a modest optimization level while retaining
+# Debug's symbols, assertions and frame pointers.  Disable with
+# -DPS3RECOMP_FAST_DEBUG=OFF when instruction-by-instruction host debugging is
+# more important than runtime speed.
+if(PS3RECOMP_FAST_DEBUG)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(${PROJECT_NAME} PRIVATE
+            "$<$<CONFIG:Debug>:-O1>"
+            "$<$<CONFIG:Debug>:-fno-omit-frame-pointer>")
+    elseif(MSVC)
+        target_compile_options(${PROJECT_NAME} PRIVATE
+            "$<$<CONFIG:Debug>:/O1>"
+            "$<$<CONFIG:Debug>:/Oy->")
+    endif()
+endif()
 
 # Windows system import libraries. dbghelp symbolizes crash-handler addresses
 # against the PDB, user32 and gdi32 are what the backend's window and its GDI

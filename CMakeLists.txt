@@ -20,6 +20,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Options
 # ---------------------------------------------------------------------------
 option(PS3RECOMP_BUILD_TESTS "Build unit tests" OFF)
+option(PS3RECOMP_FAST_DEBUG "Keep Debug symbols/asserts but optimize hot runtime code" ON)
 
 # ---------------------------------------------------------------------------
 # Collect source files
@@ -321,6 +322,23 @@ elseif(MSVC)
     target_compile_definitions(ps3recomp_runtime PRIVATE
         _CRT_SECURE_NO_WARNINGS
     )
+endif()
+
+# Debug builds of a static recompiler are pathologically slow at -O0: every
+# guest instruction helper, syscall shim and RSX state update is host code.
+# Keep Debug's symbols and assertions, but let the hot runtime receive modest
+# optimization.  Target options are appended after CMake's configuration flags,
+# so -O1 overrides Debug's earlier -O0 while -g / CodeView information remains.
+if(PS3RECOMP_FAST_DEBUG)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(ps3recomp_runtime PRIVATE
+            "$<$<CONFIG:Debug>:-O1>"
+            "$<$<CONFIG:Debug>:-fno-omit-frame-pointer>")
+    elseif(MSVC)
+        target_compile_options(ps3recomp_runtime PRIVATE
+            "$<$<CONFIG:Debug>:/O1>"
+            "$<$<CONFIG:Debug>:/Oy->")
+    endif()
 endif()
 
 if(NOT MSVC AND NOT WIN32)
