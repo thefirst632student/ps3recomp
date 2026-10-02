@@ -40,7 +40,7 @@ extern ps3_guest_caller_fn g_ps3_guest_caller;
 #define MAX_VDEC 4
 #define VDEC_QUEUE_CAP 64
 #define VDEC_QUEUE_HIGH_WATER 24
-#define VDEC_STALL_TICKS 100 /* 100 x 10 ms = 1 s without consumer progress */
+#define VDEC_STALL_TICKS 300 /* 300 x 10 ms = 3 s without any consumed picture */
 /* cmdDepth=4 describes decode commands in flight.  DecodeAu in this HLE is
  * synchronous, so a command is complete before DecodeAu returns and cmdDepth
  * must not be modelled by the number of decoded pictures waiting for the
@@ -84,6 +84,7 @@ typedef struct {
     int qHead;
     int qCount;
     int outputDropMode;
+    u64 outputConsumeSerial; /* increments whenever GetPicture pops a frame */
 #ifdef _WIN32
     CRITICAL_SECTION qMutex;
     CONDITION_VARIABLE qCond;
@@ -191,7 +192,7 @@ static void clear_queue(VdecSlot* v)
 static int wait_for_output_room(VdecSlot* v)
 {
     int stalled = 0;
-    int last_count;
+    u64 last_consume_serial;
 
     qlock(v);
     if (!v->seqStarted) { qunlock(v); return -1; }
@@ -201,18 +202,22 @@ static int wait_for_output_room(VdecSlot* v)
      * PTS extrapolator jump backwards; StartSeq resets the mode cleanly. */
     if (v->outputDropMode) { qunlock(v); return 1; }
 
-    last_count = v->qCount;
+    /* Do not use qCount itself as a liveness signal.  During healthy playback
+     * the decoder can refill a slot immediately after GetPicture consumes one,
+     * so the queue can remain pinned at the high-water mark indefinitely even
+     * though the consumer is progressing every frame.  Track actual pops. */
+    last_consume_serial = v->outputConsumeSerial;
     while (v->seqStarted && v->qCount >= VDEC_QUEUE_HIGH_WATER) {
         qwait_10ms(v);
         if (!v->seqStarted) { qunlock(v); return -1; }
-        if (v->qCount < last_count) {
-            last_count = v->qCount;
+        if (v->outputConsumeSerial != last_consume_serial) {
+            last_consume_serial = v->outputConsumeSerial;
             stalled = 0;
         } else if (++stalled >= VDEC_STALL_TICKS) {
             v->outputDropMode = 1;
             fprintf(stderr,
-                    "[cellVdec] output consumer stalled for ~1s at qCount=%d; "
-                    "entering teardown-safe drop mode\n", v->qCount);
+                    "[cellVdec] output consumer made no GetPicture progress for ~3s "
+                    "at qCount=%d; entering teardown-safe drop mode\n", v->qCount);
             qunlock(v);
             return 1;
         }
@@ -519,6 +524,7 @@ s32 cellVdecStartSeq(CellVdecHandle handle)
     VdecSlot* v = &s_vdec[handle];
     v->seqStarted = 1; v->auCount = 0;
     v->outputDropMode = 0;
+    v->outputConsumeSerial = 0;
     v->nextPts = v->nextDts = 0;
     v->nextPtsValid = v->nextDtsValid = 0;
     clear_queue(v);
@@ -757,6 +763,7 @@ s32 cellVdecGetPicture(CellVdecHandle handle, const CellVdecPicFormat* format, v
     memset(q, 0, sizeof(*q));
     v->qHead = (v->qHead + 1) % VDEC_QUEUE_CAP;
     v->qCount--;
+    v->outputConsumeSerial++;
     qwake_all(v);
     qunlock(v);
     return CELL_OK;
