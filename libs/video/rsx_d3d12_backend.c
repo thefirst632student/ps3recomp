@@ -4405,6 +4405,10 @@ static int s_present_this_frame = 1;
  * callback against rsx_d3d12_backend_present(), which can observe the same
  * guest flip from a different host path. */
 static int s_present_seen_content = 0;
+/* Diagnostic provenance for render_frame().  Multiple host paths can drive a
+ * frame; keeping the origin lets scanout probes distinguish an authoritative
+ * flip-boundary present from a clear-boundary or legacy callback. */
+static int s_present_origin = 0; /* 1=legacy callback, 2=clear boundary, 3=ticker */
 
 /* Resolve a DRAW_*_TEX value: a hex raw offset, or the literal "duck" for the
  * content-identified duck texture. */
@@ -6150,9 +6154,36 @@ skip_dump_consider: ;
         }
       } }
 
-    /* Present */
-    if (s_present_this_frame)
-        s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 1, 0); /* vsync */   /* skipped for an offscreen-only batch */
+    /* Present.  During the WA2 warning sequence, prove that the exact
+     * backbuffer characterized above is the one DXGI accepts for scanout.
+     * This is deliberately observational: no extra Present and no resource
+     * copy are introduced. */
+    {
+        static int s_scanout_log_n = 0;
+        const int scanout_probe =
+            (logo_probe_batch || (s_warn2_native_stage > 0 && s_d3d.frame_count < 520u)) &&
+            s_scanout_log_n < 900;
+        UINT bb_before = s_d3d.swap_chain->lpVtbl->GetCurrentBackBufferIndex(s_d3d.swap_chain);
+        HRESULT phr = S_OK;
+        if (scanout_probe) {
+            fprintf(stderr,
+                "[WARN2_SCANOUT_PRE] n=%d origin=%d frame=%u fi=%u current=%u draws=%u will_present=%d seen=%d%c",
+                s_scanout_log_n, s_present_origin, s_d3d.frame_count, fi, bb_before,
+                s_dbg_last_draws, s_present_this_frame, s_present_seen_content, 10);
+        }
+        if (s_present_this_frame)
+            phr = s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 1, 0); /* vsync */
+        if (scanout_probe) {
+            UINT bb_after = s_d3d.swap_chain->lpVtbl->GetCurrentBackBufferIndex(s_d3d.swap_chain);
+            UINT pc = 0;
+            HRESULT pchr = s_d3d.swap_chain->lpVtbl->GetLastPresentCount(s_d3d.swap_chain, &pc);
+            fprintf(stderr,
+                "[WARN2_SCANOUT_POST] n=%d origin=%d frame=%u hr=0x%08lX before=%u after=%u last_count_hr=0x%08lX last_count=%u%c",
+                s_scanout_log_n, s_present_origin, s_d3d.frame_count,
+                (unsigned long)phr, bb_before, bb_after, (unsigned long)pchr, pc, 10);
+            s_scanout_log_n++;
+        }
+    }
 
     move_to_next_frame();
 
@@ -6263,7 +6294,9 @@ static void d3d12_present(void* ud, u32 buffer_id)
             return;
         }
         s_present_this_frame = flip_has_display;
-        render_frame();
+        { int _po = s_present_origin; s_present_origin = 1;
+          render_frame();
+          s_present_origin = _po; }
         s_present_this_frame = 1;
     } else if (s_d3d.initialized && s_present_seen_content && s_d3d.draw_count == 0) {
         static int s_empty_skip_log = 0;
@@ -6386,7 +6419,9 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
         if (blink_dbg())
             printf("[CLEAR] presenting %u accumulated draws at frame boundary\n",
                    s_d3d.draw_count);
-        render_frame();
+        { int _po = s_present_origin; s_present_origin = 2;
+          render_frame();
+          s_present_origin = _po; }
         s_clear_presents++;
     }
     s_dbg_clears_since_present++;
@@ -8253,7 +8288,9 @@ void rsx_d3d12_backend_present(void)
                 }
             }
         }
-        render_frame();
+        { int _po = s_present_origin; s_present_origin = 3;
+          render_frame();
+          s_present_origin = _po; }
         s_present_this_frame = 1;
         if (is_flip_present) {
             s_last_present_flip = fc;
