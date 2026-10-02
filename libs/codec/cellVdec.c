@@ -39,15 +39,14 @@ extern ps3_guest_caller_fn g_ps3_guest_caller;
 
 #define MAX_VDEC 4
 #define VDEC_QUEUE_CAP 64
-/* cellVdec advertises cmdDepth=4.  That limit applies to decode commands in
- * flight, not to the number of pictures the application has not consumed yet.
- * Our DecodeAu path is synchronous, so blocking inside queue_frame() when four
- * pictures are outstanding is incorrect: the guest decoder thread can no
- * longer return to its loop to observe EOS/stop state.  Keep four pictures as
- * a soft admission limit for DecodeAu, but report CELL_VDEC_ERROR_BUSY instead
- * of sleeping indefinitely.  This mirrors the API-level backpressure used by
- * RPCS3 while preserving WA2's one-bit PICOUT wake semantics. */
-#define VDEC_BACKPRESSURE_CAP 4
+/* cmdDepth=4 describes decode commands in flight.  DecodeAu in this HLE is
+ * synchronous, so a command is complete before DecodeAu returns and cmdDepth
+ * must not be modelled by the number of decoded pictures waiting for the
+ * application.  A fast producer can legitimately get ahead of the picture
+ * consumer during scene transitions.  Keep a separate bounded output queue;
+ * if the consumer has stopped (for example while skipping a movie), discard
+ * excess decoded pictures instead of blocking the guest decoder thread or
+ * returning a spurious command-depth BUSY error. */
 #define PICITEM_SIZE 0x80u
 #define PICINFO_OFFSET 0x80u
 
@@ -189,8 +188,14 @@ static void clear_queue(VdecSlot* v)
 static int queue_synthetic(VdecSlot* v, const CellVdecAuInfo* au, u32 width, u32 height)
 {
     qlock(v);
-    while (v->qCount >= VDEC_BACKPRESSURE_CAP && v->seqStarted) qwait_10ms(v);
     if (!v->seqStarted) { qunlock(v); return -1; }
+    if (v->qCount >= VDEC_QUEUE_CAP) {
+        /* No picture consumer is making progress.  Do not turn a synchronous
+         * HLE call into an uninterruptible wait; the guest must be able to
+         * reach its stop/EndSeq path. */
+        qunlock(v);
+        return 1; /* decoded successfully, picture intentionally discarded */
+    }
     int pos = (v->qHead + v->qCount) % VDEC_QUEUE_CAP;
     VdecFrame* q = &v->queue[pos];
     memset(q, 0, sizeof(*q));
@@ -318,14 +323,13 @@ static int queue_frame(VdecSlot* v, AVFrame* f, const CellVdecAuInfo* au)
 
     qlock(v);
     if (!v->seqStarted) { qunlock(v); return AVERROR(EPIPE); }
-    if (v->qCount >= VDEC_BACKPRESSURE_CAP) {
-        /* Do not block the guest decoder thread here.  A stopped display/vpost
-         * consumer cannot make progress, so waiting turns normal movie teardown
-         * into a permanent join deadlock.  DecodeAu performs the same admission
-         * check before submitting the packet; this is only the race/multi-frame
-         * safety net. */
+    if (v->qCount >= VDEC_QUEUE_CAP) {
+        /* Output-queue overflow is not command-depth BUSY.  The DecodeAu
+         * command itself has completed synchronously.  Drop this picture so
+         * the guest decoder thread can continue to EOS/stop even if the movie
+         * display consumer has already stopped. */
         qunlock(v);
-        return AVERROR(EAGAIN);
+        return 1;
     }
 
     if (fpts != invalid) {
@@ -404,6 +408,10 @@ static int decode_packet(VdecSlot* v, const u8* data, size_t size,
         if (ret < 0) { av_frame_free(&f); return ret; }
         ret = queue_frame(v, f, au);
         if (ret < 0) { av_frame_free(&f); return ret; }
+        if (ret > 0) {
+            av_frame_free(&f);
+            continue;
+        }
         if (framesQueued) (*framesQueued)++;
     }
 }
@@ -503,15 +511,12 @@ s32 cellVdecEndSeq(CellVdecHandle handle)
             int r = avcodec_receive_frame(v->ctx, f);
             if (r < 0) { av_frame_free(&f); break; }
             int qr = queue_frame(v, f, &dummy);
-            if (qr == AVERROR(EAGAIN)) {
-                /* EndSeq must always be able to complete even when the title
-                 * has already stopped its picture consumer.  Delayed decoder
-                 * frames that no longer fit are discarded during drain rather
-                 * than holding the guest in EndSeq forever. */
+            if (qr < 0) { av_frame_free(&f); break; }
+            if (qr > 0) {
+                /* Consumer stopped before decoder drain completed. */
                 av_frame_free(&f);
                 continue;
             }
-            if (qr < 0) { av_frame_free(&f); break; }
             callback(v, handle, CELL_VDEC_MSG_TYPE_PICOUT, CELL_OK);
         }
     }
@@ -540,22 +545,6 @@ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auIn
     au.userData = vm_read64(ea + offsetof(CellVdecAuInfo, userData));
     if (!au.startAddr || !au.size) return (s32)CELL_VDEC_ERROR_ARG;
 
-    /* Admission control must be non-blocking.  On real cellVdec/RPCS3 a full
-     * command depth is reported as CELL_VDEC_ERROR_BUSY so the caller can poll
-     * again or notice that the sequence is being stopped.  Using qCount as a
-     * synchronous wait condition deadlocks movie teardown once the display
-     * consumer exits with four decoded pictures still queued. */
-    qlock(v);
-    const int output_full = (v->qCount >= VDEC_BACKPRESSURE_CAP);
-    qunlock(v);
-    if (output_full) {
-        static unsigned busyLog;
-        if ((busyLog++ & 0x3fu) == 0u)
-            printf("[cellVdec] DecodeAu BUSY: %d pictures pending (soft cap=%d)\n",
-                   v->qCount, VDEC_BACKPRESSURE_CAP);
-        return (s32)CELL_VDEC_ERROR_BUSY;
-    }
-
     v->auCount++;
 
 #ifdef PS3RECOMP_HAVE_FFMPEG
@@ -581,9 +570,14 @@ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auIn
      * movie display thread waited forever for PICOUT.  A neutral black frame
      * is preferable to deadlocking the title; the log makes this fallback
      * explicit so it cannot be mistaken for real decoding. */
-    if (queue_synthetic(v, &au, 1280, 720) < 0) {
-        callback(v, handle, CELL_VDEC_MSG_TYPE_AUDONE, CELL_VDEC_ERROR_BUSY);
-        return (s32)CELL_VDEC_ERROR_BUSY;
+    int sq = queue_synthetic(v, &au, 1280, 720);
+    if (sq < 0) {
+        callback(v, handle, CELL_VDEC_MSG_TYPE_AUDONE, CELL_VDEC_ERROR_SEQ);
+        return (s32)CELL_VDEC_ERROR_SEQ;
+    }
+    if (sq > 0) {
+        callback(v, handle, CELL_VDEC_MSG_TYPE_AUDONE, CELL_OK);
+        return CELL_OK;
     }
     printf("[cellVdec] DecodeAu #%u: FFmpeg=no, synthetic PICOUT 1280x720 (addr=0x%08X size=%u)\n",
            v->auCount, au.startAddr, au.size);
