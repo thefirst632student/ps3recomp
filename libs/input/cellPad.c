@@ -82,6 +82,24 @@ static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
 /* Per-port "a report has arrived since your last read" flag; see cellPadGetData. */
 static int s_data_fresh[PAD_MAX_HOST_PORTS];
 
+#if PAD_BACKEND_XINPUT
+/* Keyboard state is owned by the Win32 window thread and published atomically
+ * to the guest pad polling thread.  This mirrors the Yakuza WIP sample's
+ * input architecture: WM_KEYDOWN/WM_KEYUP provide stable process-local state
+ * instead of making guest polling depend solely on GetAsyncKeyState(). */
+static volatile LONG s_window_key_state[256];
+#endif
+
+/* Narrow, edge-triggered diagnostics.  PAD_TRACE=1 logs only host button
+ * transitions plus a short burst of GetData packets around each transition. */
+static int s_pad_trace_burst = 0;
+static int pad_trace_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("PAD_TRACE") ? 1 : 0;
+    return on;
+}
+
 #if PAD_BACKEND_SDL2
 static SDL_GameController* s_sdl_controllers[PAD_MAX_HOST_PORTS];
 static int s_sdl_inited = 0;
@@ -140,22 +158,65 @@ static int pad_host_window_focused(void)
     return pid == GetCurrentProcessId();
 }
 
-static void pad_poll_keyboard(void)
+static int pad_window_key_down(int virtual_key)
+{
+    return virtual_key >= 0 && virtual_key < 256 &&
+           InterlockedCompareExchange(&s_window_key_state[virtual_key], 0, 0) != 0;
+}
+
+static int pad_window_key_any_down(void)
+{
+    for (unsigned i = 0; i < 256; ++i)
+        if (InterlockedCompareExchange(&s_window_key_state[i], 0, 0) != 0)
+            return 1;
+    return 0;
+}
+
+static int pad_key_down(int virtual_key, int allow_async)
+{
+    const int message_down = pad_window_key_down(virtual_key);
+    return message_down ||
+           (allow_async && (GetAsyncKeyState(virtual_key) & 0x8000) != 0);
+}
+
+void cellPad_host_key_event(u32 virtual_key, int down)
+{
+    if (virtual_key < 256)
+        InterlockedExchange(&s_window_key_state[virtual_key], down ? 1 : 0);
+}
+
+void cellPad_host_key_reset(void)
+{
+    for (unsigned i = 0; i < 256; ++i)
+        InterlockedExchange(&s_window_key_state[i], 0);
+}
+
+/* Merge the process-window keyboard into port 0 after polling the physical
+ * backend.  A real controller therefore still works, while the keyboard can
+ * coexist with it.  When no physical controller exists, initialise a clean
+ * neutral virtual pad rather than inheriting stale state from a disconnected
+ * XInput slot. */
+static void pad_merge_keyboard(void)
 {
     static int off = -1;
     if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
     if (off) return;
 
+    const int focused = pad_host_window_focused();
     PadHostState* hs = &s_host_state[0];
-    if (!pad_host_window_focused()) {
-        /* Release everything on focus loss, or a key held while alt-tabbing
-         * would stay down forever. */
-        hs->buttons = 0;
+
+    if (!hs->connected) {
+        memset(hs, 0, sizeof(*hs));
         hs->analog_lx = hs->analog_ly = 128;
         hs->analog_rx = hs->analog_ry = 128;
-        hs->connected = 1;
-        return;
     }
+    hs->connected = 1;
+
+    /* GetAsyncKeyState is only a fallback while one of our windows owns the
+     * foreground.  Window-message state remains valid between host polls and
+     * is cleared on WM_KILLFOCUS. */
+    if (!focused && !pad_window_key_any_down())
+        return;
 
     static const struct { int vk; u16 btn; } map[] = {
         { VK_UP,     CELL_PAD_CTRL_UP },      { VK_DOWN,  CELL_PAD_CTRL_DOWN },
@@ -167,25 +228,35 @@ static void pad_poll_keyboard(void)
         { VK_RETURN, CELL_PAD_CTRL_START },   { VK_TAB,   CELL_PAD_CTRL_SELECT },
     };
 
-    u16 btns = 0;
+    u16 keyboard_buttons = 0;
     for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
-        if (GetAsyncKeyState(map[i].vk) & 0x8000) btns |= map[i].btn;
+        if (pad_key_down(map[i].vk, focused)) keyboard_buttons |= map[i].btn;
 
-    hs->buttons   = btns;
-    hs->connected = 1;
-    hs->analog_lx = (u8)((btns & CELL_PAD_CTRL_LEFT) ? 0 :
-                         (btns & CELL_PAD_CTRL_RIGHT) ? 255 : 128);
-    hs->analog_ly = (u8)((btns & CELL_PAD_CTRL_UP) ? 0 :
-                         (btns & CELL_PAD_CTRL_DOWN) ? 255 : 128);
-    hs->analog_rx = hs->analog_ry = 128;
-    hs->trigger_l2 = (u8)((btns & CELL_PAD_CTRL_L2) ? 255 : 0);
-    hs->trigger_r2 = (u8)((btns & CELL_PAD_CTRL_R2) ? 255 : 0);
+    hs->buttons |= keyboard_buttons;
 
-    { static int said = 0;
-      if (!said && btns) { said = 1;
-          printf("[cellPad] keyboard fallback active on port 0 (no XInput device)\n");
-          fflush(stdout); } }
+    /* Preserve the existing base mapping where the D-pad also drives the left
+     * stick for titles that consume analog input instead of DIGITAL1. */
+    if (keyboard_buttons & CELL_PAD_CTRL_LEFT)       hs->analog_lx = 0;
+    else if (keyboard_buttons & CELL_PAD_CTRL_RIGHT) hs->analog_lx = 255;
+    if (keyboard_buttons & CELL_PAD_CTRL_UP)         hs->analog_ly = 0;
+    else if (keyboard_buttons & CELL_PAD_CTRL_DOWN)  hs->analog_ly = 255;
+
+    if (keyboard_buttons & CELL_PAD_CTRL_L2) hs->trigger_l2 = 255;
+    if (keyboard_buttons & CELL_PAD_CTRL_R2) hs->trigger_r2 = 255;
+
+    const u16 btns = hs->buttons;
+    hs->press_up       = (btns & CELL_PAD_CTRL_UP)       ? 255 : 0;
+    hs->press_down     = (btns & CELL_PAD_CTRL_DOWN)     ? 255 : 0;
+    hs->press_left     = (btns & CELL_PAD_CTRL_LEFT)     ? 255 : 0;
+    hs->press_right    = (btns & CELL_PAD_CTRL_RIGHT)    ? 255 : 0;
+    hs->press_triangle = (btns & CELL_PAD_CTRL_TRIANGLE) ? 255 : 0;
+    hs->press_circle   = (btns & CELL_PAD_CTRL_CIRCLE)   ? 255 : 0;
+    hs->press_cross    = (btns & CELL_PAD_CTRL_CROSS)    ? 255 : 0;
+    hs->press_square   = (btns & CELL_PAD_CTRL_SQUARE)   ? 255 : 0;
+    hs->press_l1       = (btns & CELL_PAD_CTRL_L1)       ? 255 : 0;
+    hs->press_r1       = (btns & CELL_PAD_CTRL_R1)       ? 255 : 0;
 }
+
 #endif
 
 static void pad_poll_xinput(void)
@@ -262,6 +333,20 @@ static void pad_shutdown_backend(void)
 }
 
 #endif /* PAD_BACKEND_XINPUT */
+
+#if defined(_WIN32) && !PAD_BACKEND_XINPUT
+/* Forced-SDL2 Windows builds do not use the XInput keyboard fallback, but the
+ * window backends still forward key messages through this stable API. */
+void cellPad_host_key_event(u32 virtual_key, int down)
+{
+    (void)virtual_key;
+    (void)down;
+}
+
+void cellPad_host_key_reset(void)
+{
+}
+#endif
 
 /* ---------------------------------------------------------------------------
  * SDL2 backend
@@ -439,9 +524,25 @@ static void pad_poll_backend(void)
 #elif PAD_BACKEND_SDL2
     pad_poll_sdl2();
 #endif
-#ifdef _WIN32
-    if (!s_host_state[0].connected) pad_poll_keyboard();
+#if PAD_BACKEND_XINPUT
+    pad_merge_keyboard();
 #endif
+
+    if (pad_trace_on()) {
+        static int last_connected = -1;
+        static u16 last_buttons = 0xFFFFu;
+        PadHostState* hs = &s_host_state[0];
+        if (last_connected != hs->connected || last_buttons != hs->buttons) {
+            fprintf(stderr,
+                    "[PAD-EDGE] t=%llums connected=%d buttons=0x%04X "
+                    "l=(%u,%u) r=(%u,%u)\n",
+                    pad_now_ms(), hs->connected, (unsigned)hs->buttons,
+                    hs->analog_lx, hs->analog_ly, hs->analog_rx, hs->analog_ry);
+            last_connected = hs->connected;
+            last_buttons = hs->buttons;
+            s_pad_trace_burst = 8;
+        }
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -791,6 +892,17 @@ emit:
             if (!s_data_fresh[port_no]) data->len = 0;   /* nothing new: end the drain */
             else                        s_data_fresh[port_no] = 0;
         }
+    }
+    if (pad_trace_on() && port_no == 0 && s_pad_trace_burst > 0) {
+        const u16 guest_mask =
+            (u16)((data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] << 8) |
+                  (data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] & 0xFF));
+        fprintf(stderr,
+                "[PAD-GUEST] t=%llums len=%d mask=0x%04X fresh=%d ea=0x%08X\n",
+                pad_now_ms(), (int)data->len, (unsigned)guest_mask,
+                (port_no < PAD_MAX_HOST_PORTS) ? s_data_fresh[port_no] : -1,
+                (unsigned)(uintptr_t)data_guest);
+        --s_pad_trace_burst;
     }
     {
         unsigned int ea = (unsigned int)(uintptr_t)data_guest;

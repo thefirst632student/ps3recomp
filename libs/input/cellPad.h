@@ -198,6 +198,11 @@ s32 cellPadClearBuf(u32 port_no);
 /* Internal: call once per frame to update pad state from host input */
 void cellPad_poll(void);
 
+/* Win32 window-thread keyboard bridge.  GPU/window backends feed key edges
+ * here; cellPadGetData consumes the atomically published state. */
+void cellPad_host_key_event(u32 virtual_key, int down);
+void cellPad_host_key_reset(void);
+
 #ifdef __cplusplus
 }
 #endif
