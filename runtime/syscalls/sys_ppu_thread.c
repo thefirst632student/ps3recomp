@@ -22,6 +22,7 @@ static PPU_TLS int     s_exit_armed = 0;
 #include "sys_cond.h"
 #include "../../libs/video/rsx_d3d12_backend.h"
 #include "../../libs/codec/cellVpost.h"
+#include "../../libs/codec/cellVdec.h"
 #include "../platform/win32_compat.h"   /* GetCurrentThreadId on POSIX */
 #include <string.h>
 #include <stdio.h>
@@ -517,9 +518,11 @@ int64_t sys_ppu_thread_exit(ppu_context* ctx)
     fprintf(stderr, "[SYS] sys_ppu_thread_exit(tid=%llu status=%llu)\n",
             (unsigned long long)tid, (unsigned long long)status);
 
+    int vpost_consumer_stopped = 0;
     table_lock();
     ppu_thread_info* t = find_thread(tid);
     if (t) {
+        vpost_consumer_stopped = strcmp(t->name, "vpostStart") == 0;
         t->exit_status = (int64_t)status;
         if (t->state == PPU_THREAD_STATE_DETACHED) {
             t->state = PPU_THREAD_STATE_FREE;
@@ -537,6 +540,14 @@ int64_t sys_ppu_thread_exit(ppu_context* ctx)
 #endif
     }
     table_unlock();
+
+    /* vpostStart is the only consumer of cellVdec pictures in this movie
+     * pipeline.  Signal VDEC at the actual guest-thread exit edge rather than
+     * making its producer infer teardown from a multi-second no-progress
+     * timeout.  The callback only enables discard mode; it never terminates a
+     * thread or changes the guest worker's state. */
+    if (vpost_consumer_stopped)
+        cellVdec_notify_output_consumer_stopped();
 
     /* Hardware never returns from this. Unwind to the thread proc so the guest
      * cannot keep running past its own exit. */

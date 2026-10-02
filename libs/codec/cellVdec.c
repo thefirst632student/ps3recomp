@@ -210,6 +210,7 @@ static int wait_for_output_room(VdecSlot* v)
     while (v->seqStarted && v->qCount >= VDEC_QUEUE_HIGH_WATER) {
         qwait_10ms(v);
         if (!v->seqStarted) { qunlock(v); return -1; }
+        if (v->outputDropMode) { qunlock(v); return 1; }
         if (v->outputConsumeSerial != last_consume_serial) {
             last_consume_serial = v->outputConsumeSerial;
             stalled = 0;
@@ -224,6 +225,32 @@ static int wait_for_output_room(VdecSlot* v)
     }
     qunlock(v);
     return 0;
+}
+
+
+void cellVdec_notify_output_consumer_stopped(void)
+{
+    for (u32 i = 0; i < MAX_VDEC; ++i) {
+        VdecSlot* v = &s_vdec[i];
+        if (!v->in_use || !v->qSyncInit) continue;
+
+        int notify = 0;
+        int qcount = 0;
+        qlock(v);
+        if (v->seqStarted && !v->outputDropMode) {
+            v->outputDropMode = 1;
+            qcount = v->qCount;
+            notify = 1;
+            qwake_all(v);
+        }
+        qunlock(v);
+
+        if (notify)
+            fprintf(stderr,
+                    "[cellVdec] output consumer stopped; releasing decoder immediately "
+                    "(handle=%u qCount=%d)\n",
+                    i, qcount);
+    }
 }
 
 static int queue_synthetic(VdecSlot* v, const CellVdecAuInfo* au, u32 width, u32 height)

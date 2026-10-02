@@ -122,6 +122,11 @@ s32 cellVdecSetFrameRate(CellVdecHandle handle, u32 frameRateCode);
 
 int cellVdec_is_seq_active(void);
 
+/* Host lifecycle hint used by the title-specific movie worker bridge.  Once
+ * vpostStart exits there is no picture consumer left, so a decoder blocked at
+ * the output high-water mark must switch to teardown drop mode immediately. */
+void cellVdec_notify_output_consumer_stopped(void);
+
 #ifdef __cplusplus
 }
 #endif
