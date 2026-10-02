@@ -3042,6 +3042,19 @@ static u32 tex_csum(const u8* base, u32 nbytes)
     return h;
 }
 
+/* WA2 warning texture probe: denser than tex_csum() but still cheap enough for
+ * one 704x512 texture per frame. Diagnostic only; cache policy still uses the
+ * existing sparse checksum above. */
+static u32 tex_csum_dense64(const u8* base, u32 nbytes)
+{
+    u32 h = 2166136261u;
+    for (u32 i = 0; i + 3 < nbytes; i += 64u) {
+        u32 w32; memcpy(&w32, base + i, sizeof w32);
+        h ^= w32; h *= 16777619u;
+    }
+    return h;
+}
+
 static D3D12_TEXTURE_ADDRESS_MODE vp_sampler_wrap(u32 w)
 {
     switch (w & 0xFu) {
@@ -3273,6 +3286,52 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, u32 guest_pitch, i
              * every one of them every frame was ~70% of the frame's CPU time. */
             u32 nb = tl.row_bytes * tl.rows;
             u32 cs = TEX_CSUM(vm_base + c->off, nb);
+            if ((key_off & 0x0FFFFFFFu) == 0x01CA8480u) {
+                static u32 _prev_dense = 0;
+                static int _have_dense = 0;
+                static int _late_src_done = 0;
+                u32 _dense = tex_csum_dense64(vm_base + c->off, nb);
+                if (!_have_dense || _dense != _prev_dense) {
+                    fprintf(stderr,
+                        "[WARN2_TEX_CONTENT] frame=%llu src=0x%08X bytes=%u sparse_now=%08X sparse_cached=%08X dense=%08X prev_dense=%08X cache=%s%c",
+                        (unsigned long long)s_d3d.frame_count, c->off, nb, cs, c->csum,
+                        _dense, _have_dense ? _prev_dense : 0u,
+                        (cs == c->csum) ? "REUSE" : "REUPLOAD", 10);
+                    _prev_dense = _dense; _have_dense = 1;
+                }
+                /* Characterize the actual guest image once in the late warning
+                 * phase, before the fullscreen fade overlay appears. This uses
+                 * the same shared RSX decoder as the real upload path. */
+                if (!_late_src_done && s_d3d.frame_count >= 340u &&
+                    s_d3d.frame_count <= 344u && tl.fmt == RSX_TEXFMT_R8G8B8A8) {
+                    u32 _dp = (tl.dst_row_bytes + 255u) & ~255u;
+                    u8* _tmp = (u8*)malloc((size_t)_dp * h);
+                    if (_tmp) {
+                        rsx_texture_decode(_tmp, _dp, vm_base + c->off, w, h, &tl,
+                                           rsx_texture_argb_is_rgba());
+                        u32 _rgb = 0, _an = 0;
+                        u8 _rm=0,_gm=0,_bm=0,_am=0;
+                        for (u32 _y=0; _y<h; _y++) {
+                            const u8* _row = _tmp + (u64)_y * _dp;
+                            for (u32 _x=0; _x<w; _x++) {
+                                const u8* _q = _row + (u64)_x * 4u;
+                                if (_q[0] || _q[1] || _q[2]) _rgb++;
+                                if (_q[3]) _an++;
+                                if (_q[0]>_rm) _rm=_q[0]; if (_q[1]>_gm) _gm=_q[1];
+                                if (_q[2]>_bm) _bm=_q[2]; if (_q[3]>_am) _am=_q[3];
+                            }
+                        }
+                        fprintf(stderr,
+                            "[WARN2_LATE_SRC] frame=%llu rgb_nz=%u/%u a_nz=%u/%u max=(%u,%u,%u,%u) sparse=%08X dense=%08X%c",
+                            (unsigned long long)s_d3d.frame_count, _rgb, w*h, _an, w*h,
+                            _rm,_gm,_bm,_am, cs,_dense,10);
+                        free(_tmp);
+                    } else {
+                        fprintf(stderr, "[WARN2_LATE_SRC] malloc failed%c", 10);
+                    }
+                    _late_src_done = 1;
+                }
+            }
             if (cs == c->csum) { c->used = 1; return i; }
             slot = i; break;                      /* stale: fall through and redo */
         }
@@ -7232,6 +7291,17 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                     fprintf(stderr,
                         "[WARN2_NATIVE_ARM] stage=%d frame=%llu col=(%.6g %.6g %.6g %.6g)%c",
                         _stage, (unsigned long long)s_d3d.frame_count,
+                        _cnow[0], _cnow[1], _cnow[2], _cnow[3], 10);
+                }
+                /* Late native capture: by v9, frames 340-344 still have
+                 * four draws and no fullscreen fade overlay. This is the stable
+                 * warning-2 phase the user reports as black. */
+                if (s_d3d.frame_count >= 340u && s_d3d.frame_count <= 344u &&
+                    s_warn2_native_stage < 3) {
+                    s_warn2_native_stage = 3;
+                    fprintf(stderr,
+                        "[WARN2_NATIVE_ARM] stage=3 frame=%llu late-warning capture col=(%.6g %.6g %.6g %.6g)%c",
+                        (unsigned long long)s_d3d.frame_count,
                         _cnow[0], _cnow[1], _cnow[2], _cnow[3], 10);
                 }
             }
