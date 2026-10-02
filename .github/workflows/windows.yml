@@ -147,6 +147,9 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Install Python tool dependencies
+        run: python -m pip install -r tools/requirements.txt
+
       # The same eight suites the macOS job runs. The conformance one compiles
       # and EXECUTES 1300+ lifted instruction cases; CI=1 makes it fail rather
       # than skip if no compiler is reachable, because a green tick meaning
@@ -216,62 +219,102 @@ jobs:
           cmake --build build-sync --target test_cond_semantics
           ctest --test-dir build-sync -R "^cond_" --output-on-failure
 
-      # V52 AV false-positive control. V51 became clean merely by splitting one
-      # lifted TU into two objects, so function bisection cannot use multi-TU
-      # shards. Instead make a BYTE-IDENTICAL temporary copy of the original
-      # ppu_recomp_000.cpp and compile it as ONE TU / ONE object. CMake replaces
-      # the original source at the same source-list slot to preserve object/link
-      # ordering as closely as possible. recompiled/ remains read-only.
-      - name: Prepare Release PPU single-TU copy control
-        if: matrix.build_type == 'Release'
+      # The generated PPU sources are intentionally not stored in Git.  A private
+      # second repository supplies the decrypted game ELF, and this job recreates
+      # eboot_port/recompiled from that input immediately before the port build.
+      # Keeping this optional preserves the generic runtime/test CI for forks and
+      # PRs where repository secrets are intentionally unavailable.
+      - name: Detect private game asset configuration
+        id: game_assets
         shell: pwsh
+        env:
+          WA2_ASSETS_REPO: ${{ vars.WA2_ASSETS_REPO }}
+          WA2_ASSETS_PAT: ${{ secrets.WA2_ASSETS_PAT }}
         run: |
-          $outDir = Join-Path $env:GITHUB_WORKSPACE "eboot_port\build\av_bisect_generated"
-          Remove-Item -Recurse -Force $outDir -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
-
-          $input = (Resolve-Path "eboot_port/recompiled/ppu_recomp_000.cpp").Path
-          $copy = Join-Path $outDir "ppu_recomp_000_av_single.cpp"
-          Copy-Item -LiteralPath $input -Destination $copy -Force
-
-          $inputHash = (Get-FileHash -Algorithm SHA256 $input).Hash.ToLowerInvariant()
-          $copyHash = (Get-FileHash -Algorithm SHA256 $copy).Hash.ToLowerInvariant()
-          if ($inputHash -ne $copyHash) {
-            throw "V52 control copy is not byte-identical: $inputHash != $copyHash"
+          $enabled = -not [string]::IsNullOrWhiteSpace($env:WA2_ASSETS_REPO) -and `
+                     -not [string]::IsNullOrWhiteSpace($env:WA2_ASSETS_PAT)
+          "enabled=$($enabled.ToString().ToLowerInvariant())" |
+            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          if ($enabled) {
+            Write-Host "Private game asset input is configured; eboot_port will be re-lifted in CI."
+          } else {
+            Write-Host "Private game asset input is not configured; skipping the game-port build."
           }
-          $functionCount = (Select-String -Path $input -Pattern '^void\s+func_[0-9A-Fa-f]+\(ppu_context\*\s+ctx\)\s*\{' -AllMatches).Count
 
-          $manifestText = @(
-            "PS3Recomp V52 single-TU copy control",
-            "input: $input",
-            "input sha256: $inputHash",
-            "copy: $copy",
-            "copy sha256: $copyHash",
-            "byte identical: yes",
-            "functions: $functionCount",
-            "translation units replacing original: 1",
-            "selected optimization: release"
-          ) -join "`n"
-          $manifestText | Set-Content -Path (Join-Path $outDir "bisect_manifest.txt") -Encoding utf8
-          @{
-            schema = 2
-            mode = "single-tu-copy-control"
-            input = $input
-            input_sha256 = $inputHash
-            copy = $copy
-            copy_sha256 = $copyHash
-            byte_identical = $true
-            function_count = $functionCount
-            translation_units = 1
-            selected_optimization = "release"
-          } | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $outDir "bisect_manifest.json") -Encoding utf8
+      - name: Checkout private game assets
+        if: steps.game_assets.outputs.enabled == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.WA2_ASSETS_REPO }}
+          token: ${{ secrets.WA2_ASSETS_PAT }}
+          path: _private/wa2-assets
+          fetch-depth: 1
+          lfs: true
+          persist-credentials: false
 
-          "PS3RECOMP_AV_BISECT_DIR=$outDir" |
-            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          Write-Host "--- V52 AV control manifest ---"
-          Get-Content (Join-Path $outDir "bisect_manifest.txt")
+      - name: Re-lift game PPU from private EBOOT
+        if: steps.game_assets.outputs.enabled == 'true'
+        shell: pwsh
+        env:
+          WA2_EBOOT_PATH: ${{ vars.WA2_EBOOT_PATH }}
+        run: |
+          $relativeEboot = $env:WA2_EBOOT_PATH
+          if ([string]::IsNullOrWhiteSpace($relativeEboot)) {
+            $relativeEboot = "EBOOT.ELF"
+          }
+
+          $assetRoot = Join-Path $env:GITHUB_WORKSPACE "_private\wa2-assets"
+          $eboot = Join-Path $assetRoot $relativeEboot
+          if (-not (Test-Path -LiteralPath $eboot -PathType Leaf)) {
+            throw "Private EBOOT not found at '$relativeEboot' inside the asset repository. Set repository variable WA2_EBOOT_PATH if it is not EBOOT.ELF at repo root."
+          }
+
+          $analysisDir = Join-Path $env:RUNNER_TEMP "ps3recomp-wa2-analysis"
+          $recompDir = Join-Path $env:GITHUB_WORKSPACE "eboot_port\recompiled"
+          Remove-Item -Recurse -Force $analysisDir -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force $recompDir -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $analysisDir | Out-Null
+          New-Item -ItemType Directory -Force -Path $recompDir | Out-Null
+
+          Write-Host "Generating PPU metadata from private EBOOT..."
+          python tools/ppu_loader.py "$eboot" -o "$analysisDir"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $functionFiles = @(Get-ChildItem -LiteralPath $analysisDir -Filter "*.functions.json" -File)
+          $importFiles = @(Get-ChildItem -LiteralPath $analysisDir -Filter "*.imports.json" -File)
+          if ($functionFiles.Count -ne 1) {
+            throw "Expected exactly one *.functions.json from ppu_loader.py, found $($functionFiles.Count)."
+          }
+          if ($importFiles.Count -ne 1) {
+            throw "Expected exactly one *.imports.json from ppu_loader.py, found $($importFiles.Count)."
+          }
+
+          Write-Host "Lifting PPU functions into eboot_port/recompiled..."
+          python tools/ppu_lifter.py "$eboot" `
+            --functions "$($functionFiles[0].FullName)" `
+            --hle-stubs "$($importFiles[0].FullName)" `
+            --output "$recompDir" `
+            -j 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          python tools/gen_hle_nids.py --all --out "$recompDir\ppu_hle_nids.cpp"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          if (-not (Test-Path -LiteralPath "$recompDir\ppu_recomp.h" -PathType Leaf)) {
+            throw "ppu_lifter.py did not produce ppu_recomp.h"
+          }
+          $lifted = @(Get-ChildItem -LiteralPath $recompDir -Filter "ppu_recomp_*.cpp" -File |
+            Where-Object { $_.Name -ne "ppu_hle_nids.cpp" })
+          if ($lifted.Count -eq 0) {
+            throw "ppu_lifter.py produced no ppu_recomp_*.cpp sources"
+          }
+          Write-Host "Generated $($lifted.Count) lifted PPU translation unit(s)."
+          $lifted | Sort-Object Name | ForEach-Object {
+            Write-Host "  $($_.Name) ($($_.Length) bytes)"
+          }
 
       - name: Build eboot_port (Game Port)
+        if: steps.game_assets.outputs.enabled == 'true'
         run: |
           cmake -S eboot_port -B eboot_port/build -G Ninja `
             -DCMAKE_C_COMPILER=clang-cl `
@@ -279,18 +322,19 @@ jobs:
             -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} `
             -DPS3RECOMP_REQUIRE_FFMPEG=ON `
             -DPS3RECOMP_FFMPEG_ROOT="$env:PS3RECOMP_FFMPEG_ROOT" `
-            -DPS3RECOMP_AV_BISECT_DIR="$env:PS3RECOMP_AV_BISECT_DIR"
+            -DPS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE=OFF `
+            -DPS3RECOMP_LLVM_OPT_BISECT_LIMIT=-1
           if ($LASTEXITCODE -ne 0) { exit 1 }
           cmake --build eboot_port/build
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          echo Copy-Item "$env:PS3RECOMP_FFMPEG_ROOT\bin\*.dll" "eboot_port\build\" -Force
+          Copy-Item "$env:PS3RECOMP_FFMPEG_ROOT\bin\*.dll" "eboot_port\build\" -Force
 
       - name: Upload eboot_port Artifact
+        if: steps.game_assets.outputs.enabled == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: MyGameRecomp-Windows-${{ matrix.build_type }}
           path: |
             eboot_port/build/MyGameRecomp.exe
             eboot_port/build/*.dll
-            eboot_port/build/av_bisect_generated/bisect_manifest.txt
-            eboot_port/build/av_bisect_generated/bisect_manifest.json
+            eboot_port/build/llvm_opt_bisect_summary.json
