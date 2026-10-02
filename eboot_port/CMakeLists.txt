@@ -21,7 +21,9 @@ option(PS3RECOMP_FAST_DEBUG
 option(PS3RECOMP_FAST_DEBUG_RUNTIME
     "Also optimize host runtime/HLE in Debug" ON)
 option(PS3RECOMP_RELEASE_RUNTIME_BISECT_O1
-    "Bisect Defender false-positive by compiling only ps3recomp_runtime at O1 in Release" ON)
+    "Bisect Defender false-positive by compiling only ps3recomp_runtime at O1 in Release" OFF)
+option(PS3RECOMP_RELEASE_EXECUTABLE_BISECT_O1
+    "Bisect Defender false-positive by compiling only the game executable target at O1 in Release" ON)
 
 # Prefer Ninja if available
 if(NOT CMAKE_GENERATOR MATCHES "Ninja" AND NOT DEFINED ENV{CMAKE_GENERATOR})
@@ -306,9 +308,20 @@ if(PS3RECOMP_FAST_DEBUG)
     endif()
 endif()
 
-# V32 module-level Release bisect is applied inside ps3recomp_runtime via
-# PS3RECOMP_RELEASE_RUNTIME_BISECT_O1.  The executable target, including the
-# PPU scaffold and lifted PPU/SPU code, remains at normal Release optimization.
+# V33 disjoint Release bisect: keep ps3recomp_runtime at normal Release
+# optimization and lower only the game executable target to O1.  This covers
+# main/stubs, the per-game PPU scaffold and lifted PPU translation units.  SPU
+# TUs retain their explicit per-source -O2 where present.  No Debug feature,
+# CRT mode, NDEBUG setting or linker option is changed.
+if(PS3RECOMP_RELEASE_EXECUTABLE_BISECT_O1)
+    if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" OR MSVC)
+        target_compile_options(${PROJECT_NAME} PRIVATE
+            "$<$<CONFIG:Release>:/O1>")
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(${PROJECT_NAME} PRIVATE
+            "$<$<CONFIG:Release>:-O1>")
+    endif()
+endif()
 
 # ---------------------------------------------------------------------------
 # Install
