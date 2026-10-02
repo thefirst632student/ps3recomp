@@ -90,12 +90,11 @@ if(NOT RECOMP_SOURCES)
         "there is nothing to run.")
 endif()
 
-# V51 function-level control. tools/ppu_build_bisect.py may split an existing
-# numbered ppu_recomp_NNN.cpp into temporary shards OUTSIDE recompiled/. When
-# that directory is supplied, compile those shards instead of the corresponding
-# numbered generated TU. Helper sources such as ppu_hle_nids.cpp stay in their
-# original location. This lets CI test function-level codegen without needing
-# EBOOT.ELF and without editing/committing generated lift output.
+# V52 single-TU control. Build-time AV experiments live OUTSIDE recompiled/.
+# Replace the original numbered ppu_recomp_NNN source at the SAME list position
+# rather than removing it and re-sorting the whole source list. That preserves
+# link/object ordering as closely as possible while allowing a byte-identical
+# temporary source copy (v52) and later single-TU function-codegen experiments.
 set(PS3RECOMP_AV_BISECT_SOURCES "")
 set(PS3RECOMP_AV_BISECT_O1_SOURCES "")
 if(PS3RECOMP_AV_BISECT_DIR)
@@ -105,24 +104,53 @@ if(PS3RECOMP_AV_BISECT_DIR)
     list(SORT PS3RECOMP_AV_BISECT_SOURCES)
     if(NOT PS3RECOMP_AV_BISECT_SOURCES)
         message(FATAL_ERROR
-            "PS3RECOMP_AV_BISECT_DIR=${PS3RECOMP_AV_BISECT_DIR} has no ppu_recomp_*_av_* source shards. "
-            "Run tools/ppu_build_bisect.py before configuring this port.")
+            "PS3RECOMP_AV_BISECT_DIR=${PS3RECOMP_AV_BISECT_DIR} has no ppu_recomp_*_av_* sources.")
     endif()
 
-    # Remove only numbered lifted TUs. Keep helper/generated tables beside them.
-    list(FILTER RECOMP_SOURCES EXCLUDE REGEX "ppu_recomp_[0-9]+\.(c|cpp)$")
-    list(APPEND RECOMP_SOURCES ${PS3RECOMP_AV_BISECT_SOURCES})
-    list(SORT RECOMP_SOURCES)
-
+    # All AV sources in one experiment must replace exactly one numbered lifted
+    # TU. Derive that original basename from ppu_recomp_NNN_av_*.cpp and splice
+    # the replacement(s) into the original list slot. Do not sort afterwards.
+    set(_av_original_base "")
     foreach(_av_src IN LISTS PS3RECOMP_AV_BISECT_SOURCES)
+        get_filename_component(_av_name "${_av_src}" NAME_WE)
+        string(REGEX REPLACE "_av_.*$" "" _av_base "${_av_name}")
+        if(NOT _av_original_base)
+            set(_av_original_base "${_av_base}")
+        elseif(NOT _av_original_base STREQUAL _av_base)
+            message(FATAL_ERROR
+                "PS3RECOMP_AV_BISECT_DIR must replace one numbered TU at a time; "
+                "found ${_av_original_base} and ${_av_base}")
+        endif()
         if(_av_src MATCHES "_av_01_o1\.(c|cpp)$")
             list(APPEND PS3RECOMP_AV_BISECT_O1_SOURCES "${_av_src}")
         endif()
     endforeach()
+
+    set(_av_original_source "")
+    set(_av_original_index -1)
+    set(_av_scan_index 0)
+    foreach(_recomp_src IN LISTS RECOMP_SOURCES)
+        get_filename_component(_recomp_name "${_recomp_src}" NAME_WE)
+        if(_recomp_name STREQUAL _av_original_base)
+            set(_av_original_source "${_recomp_src}")
+            set(_av_original_index ${_av_scan_index})
+            break()
+        endif()
+        math(EXPR _av_scan_index "${_av_scan_index} + 1")
+    endforeach()
+    if(_av_original_index LESS 0)
+        message(FATAL_ERROR
+            "Could not find original lifted source ${_av_original_base}.c/.cpp in ${RECOMP_DIR}")
+    endif()
+
+    list(REMOVE_AT RECOMP_SOURCES ${_av_original_index})
+    list(INSERT RECOMP_SOURCES ${_av_original_index} ${PS3RECOMP_AV_BISECT_SOURCES})
+
     list(LENGTH PS3RECOMP_AV_BISECT_SOURCES _av_source_count)
     list(LENGTH PS3RECOMP_AV_BISECT_O1_SOURCES _av_o1_count)
     message(STATUS
-        "Release build-time PPU function bisect: ${_av_source_count} shard(s), ${_av_o1_count} shard(s) at O1")
+        "Release build-time PPU AV control: replacing ${_av_original_source} in-place with "
+        "${_av_source_count} temporary source(s), ${_av_o1_count} at O1")
 endif()
 
 list(LENGTH RECOMP_SOURCES RECOMP_SOURCE_COUNT)
