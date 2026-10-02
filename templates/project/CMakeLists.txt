@@ -24,10 +24,10 @@ option(PS3RECOMP_RELEASE_RUNTIME_BISECT_O1
     "Bisect Defender false-positive by compiling only ps3recomp_runtime at O1 in Release" OFF)
 option(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_O1
     "Legacy whole-lifted-PPU Defender bisect at O1 in Release" OFF)
-set(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE "A2A" CACHE STRING
-    "Defender bisect for lifted PPU Release codegen: OFF, A1, A2, A2A, A2B, or B")
+set(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE "A2A1" CACHE STRING
+    "Defender bisect for lifted PPU Release codegen: OFF, A1, A2, A2A, A2A1, A2A2, A2B, or B")
 set_property(CACHE PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE PROPERTY STRINGS
-    OFF A1 A2 A2A A2B B)
+    OFF A1 A2 A2A A2A1 A2A2 A2B B)
 
 # Prefer Ninja if available
 if(NOT CMAKE_GENERATOR MATCHES "Ninja" AND NOT DEFINED ENV{CMAKE_GENERATOR})
@@ -314,15 +314,15 @@ if(PS3RECOMP_FAST_DEBUG)
     endif()
 endif()
 
-# V37 lifted-PPU binary search.  V35 located the Defender-triggering Release
-# codegen in half A, and v36 showed that A1 is clean while A2 still triggers.
-# Split only A2 once more.  A2A is the first half of A2 and A2B the second;
-# the older A1/A2/B selectors remain available for reproducibility.
-# Only selected numbered ppu_recomp_NNN TU(s) are lowered to O1; helper sources,
-# scaffold, runtime, CRT, NDEBUG and linker settings remain normal Release.
+# V38 lifted-PPU binary search.  V35 located the Defender-triggering Release
+# codegen in half A; v36 narrowed that to A2; v37 showed A2A is the culprit.
+# Split A2A once more.  A2A1 is the first half of A2A and A2A2 the second;
+# all older selectors remain available for reproducibility.  Only selected
+# numbered ppu_recomp_NNN TU(s) are lowered to O1; helper sources, scaffold,
+# runtime, CRT, NDEBUG and linker settings remain normal Release.
 set(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES ${RECOMP_SOURCES})
 list(FILTER PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES INCLUDE
-    REGEX "ppu_recomp_[0-9]+\.(c|cpp)$")
+    REGEX "ppu_recomp_[0-9]+\\.(c|cpp)$")
 list(SORT PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES)
 
 set(PS3RECOMP_RELEASE_LIFTED_PPU_O1_SOURCES "")
@@ -334,28 +334,34 @@ if(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_O1 AND
 elseif(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES AND
        NOT PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE STREQUAL "OFF")
     set(_recomp_valid_slice FALSE)
-    foreach(_slice IN ITEMS A1 A2 A2A A2B B)
+    foreach(_slice IN ITEMS A1 A2 A2A A2A1 A2A2 A2B B)
         if(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE STREQUAL "${_slice}")
             set(_recomp_valid_slice TRUE)
         endif()
     endforeach()
     if(NOT _recomp_valid_slice)
         message(FATAL_ERROR
-            "PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE must be OFF, A1, A2, A2A, A2B, or B")
+            "PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE must be OFF, A1, A2, A2A, A2A1, A2A2, A2B, or B")
     endif()
 
     list(LENGTH PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES _recomp_bisect_count)
-    # Preserve all earlier boundaries exactly.
+    # Preserve every earlier boundary exactly.
     # A = ceil(N/2), A1 = ceil(A/2), A2 = A - A1.
     math(EXPR _recomp_bisect_half "(${_recomp_bisect_count} + 1) / 2")
     math(EXPR _recomp_bisect_a1_count "(${_recomp_bisect_half} + 1) / 2")
     math(EXPR _recomp_bisect_a2_count
         "${_recomp_bisect_half} - ${_recomp_bisect_a1_count}")
-    # V37 split: A2A gets ceil(A2/2), A2B gets the remainder.
+    # V37 boundary: A2A = ceil(A2/2), A2B = remainder.
     math(EXPR _recomp_bisect_a2a_count "(${_recomp_bisect_a2_count} + 1) / 2")
     math(EXPR _recomp_bisect_a2b_count
         "${_recomp_bisect_a2_count} - ${_recomp_bisect_a2a_count}")
+    # V38 boundary: A2A1 = ceil(A2A/2), A2A2 = remainder.
+    math(EXPR _recomp_bisect_a2a1_count "(${_recomp_bisect_a2a_count} + 1) / 2")
+    math(EXPR _recomp_bisect_a2a2_count
+        "${_recomp_bisect_a2a_count} - ${_recomp_bisect_a2a1_count}")
     math(EXPR _recomp_bisect_a2_start "${_recomp_bisect_a1_count}")
+    math(EXPR _recomp_bisect_a2a2_start
+        "${_recomp_bisect_a2_start} + ${_recomp_bisect_a2a1_count}")
     math(EXPR _recomp_bisect_a2b_start
         "${_recomp_bisect_a2_start} + ${_recomp_bisect_a2a_count}")
 
@@ -373,6 +379,18 @@ elseif(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES AND
         if(_recomp_bisect_a2a_count GREATER 0)
             list(SUBLIST PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES
                 ${_recomp_bisect_a2_start} ${_recomp_bisect_a2a_count}
+                PS3RECOMP_RELEASE_LIFTED_PPU_O1_SOURCES)
+        endif()
+    elseif(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE STREQUAL "A2A1")
+        if(_recomp_bisect_a2a1_count GREATER 0)
+            list(SUBLIST PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES
+                ${_recomp_bisect_a2_start} ${_recomp_bisect_a2a1_count}
+                PS3RECOMP_RELEASE_LIFTED_PPU_O1_SOURCES)
+        endif()
+    elseif(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE STREQUAL "A2A2")
+        if(_recomp_bisect_a2a2_count GREATER 0)
+            list(SUBLIST PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES
+                ${_recomp_bisect_a2a2_start} ${_recomp_bisect_a2a2_count}
                 PS3RECOMP_RELEASE_LIFTED_PPU_O1_SOURCES)
         endif()
     elseif(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE STREQUAL "A2B")

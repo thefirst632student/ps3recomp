@@ -32,9 +32,9 @@ option(PS3RECOMP_RELEASE_RUNTIME_BISECT_O1
 option(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_O1
     "Legacy whole-lifted-PPU Defender bisect at O1 in Release" OFF)
 set(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE "OFF" CACHE STRING
-    "Defender bisect for lifted PPU Release codegen: OFF, A1, A2, A2A, A2B, or B")
+    "Defender bisect for lifted PPU Release codegen: OFF, A1, A2, A2A, A2A1, A2A2, A2B, or B")
 set_property(CACHE PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE PROPERTY STRINGS
-    OFF A1 A2 A2A A2B B)
+    OFF A1 A2 A2A A2A1 A2A2 A2B B)
 
 # ---------------------------------------------------------------------------
 # Collect source files
