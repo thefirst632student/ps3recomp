@@ -39,10 +39,14 @@ extern ps3_guest_caller_fn g_ps3_guest_caller;
 
 #define MAX_VDEC 4
 #define VDEC_QUEUE_CAP 64
-/* cellVdec advertises cmdDepth=4 and RPCS3 limits decode AUs to four in flight.
- * Our decoder is synchronous, so emulate that backpressure with the number of
- * unconsumed pictures.  Letting FFmpeg run 64 frames ahead collapses WA2's
- * PICOUT notifications into its single boolean wake flag and deadlocks VPOST. */
+/* cellVdec advertises cmdDepth=4.  That limit applies to decode commands in
+ * flight, not to the number of pictures the application has not consumed yet.
+ * Our DecodeAu path is synchronous, so blocking inside queue_frame() when four
+ * pictures are outstanding is incorrect: the guest decoder thread can no
+ * longer return to its loop to observe EOS/stop state.  Keep four pictures as
+ * a soft admission limit for DecodeAu, but report CELL_VDEC_ERROR_BUSY instead
+ * of sleeping indefinitely.  This mirrors the API-level backpressure used by
+ * RPCS3 while preserving WA2's one-bit PICOUT wake semantics. */
 #define VDEC_BACKPRESSURE_CAP 4
 #define PICITEM_SIZE 0x80u
 #define PICINFO_OFFSET 0x80u
@@ -313,14 +317,16 @@ static int queue_frame(VdecSlot* v, AVFrame* f, const CellVdecAuInfo* au)
     const u64 step = frame_step_90k(v);
 
     qlock(v);
-    while (v->qCount >= VDEC_BACKPRESSURE_CAP && v->seqStarted) {
-        static unsigned waitLog;
-        if ((waitLog++ % 500u) == 0u)
-            printf("[cellVdec] backpressure at %d pictures (cmdDepth=%d); waiting for consumer\n",
-                   v->qCount, VDEC_BACKPRESSURE_CAP);
-        qwait_10ms(v);
-    }
     if (!v->seqStarted) { qunlock(v); return AVERROR(EPIPE); }
+    if (v->qCount >= VDEC_BACKPRESSURE_CAP) {
+        /* Do not block the guest decoder thread here.  A stopped display/vpost
+         * consumer cannot make progress, so waiting turns normal movie teardown
+         * into a permanent join deadlock.  DecodeAu performs the same admission
+         * check before submitting the packet; this is only the race/multi-frame
+         * safety net. */
+        qunlock(v);
+        return AVERROR(EAGAIN);
+    }
 
     if (fpts != invalid) {
         v->nextPts = fpts;
@@ -496,7 +502,16 @@ s32 cellVdecEndSeq(CellVdecHandle handle)
             if (!f) break;
             int r = avcodec_receive_frame(v->ctx, f);
             if (r < 0) { av_frame_free(&f); break; }
-            if (queue_frame(v, f, &dummy) < 0) { av_frame_free(&f); break; }
+            int qr = queue_frame(v, f, &dummy);
+            if (qr == AVERROR(EAGAIN)) {
+                /* EndSeq must always be able to complete even when the title
+                 * has already stopped its picture consumer.  Delayed decoder
+                 * frames that no longer fit are discarded during drain rather
+                 * than holding the guest in EndSeq forever. */
+                av_frame_free(&f);
+                continue;
+            }
+            if (qr < 0) { av_frame_free(&f); break; }
             callback(v, handle, CELL_VDEC_MSG_TYPE_PICOUT, CELL_OK);
         }
     }
@@ -524,6 +539,23 @@ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auIn
     au.dts = vm_read64(ea + offsetof(CellVdecAuInfo, dts));
     au.userData = vm_read64(ea + offsetof(CellVdecAuInfo, userData));
     if (!au.startAddr || !au.size) return (s32)CELL_VDEC_ERROR_ARG;
+
+    /* Admission control must be non-blocking.  On real cellVdec/RPCS3 a full
+     * command depth is reported as CELL_VDEC_ERROR_BUSY so the caller can poll
+     * again or notice that the sequence is being stopped.  Using qCount as a
+     * synchronous wait condition deadlocks movie teardown once the display
+     * consumer exits with four decoded pictures still queued. */
+    qlock(v);
+    const int output_full = (v->qCount >= VDEC_BACKPRESSURE_CAP);
+    qunlock(v);
+    if (output_full) {
+        static unsigned busyLog;
+        if ((busyLog++ & 0x3fu) == 0u)
+            printf("[cellVdec] DecodeAu BUSY: %d pictures pending (soft cap=%d)\n",
+                   v->qCount, VDEC_BACKPRESSURE_CAP);
+        return (s32)CELL_VDEC_ERROR_BUSY;
+    }
+
     v->auCount++;
 
 #ifdef PS3RECOMP_HAVE_FFMPEG
