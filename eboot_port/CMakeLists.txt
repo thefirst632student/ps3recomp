@@ -24,7 +24,7 @@ option(PS3RECOMP_RELEASE_RUNTIME_BISECT_O1
     "Bisect Defender false-positive by compiling only ps3recomp_runtime at O1 in Release" OFF)
 option(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_O1
     "Legacy whole-lifted-PPU Defender bisect at O1 in Release" OFF)
-set(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE "A2A1A" CACHE STRING
+set(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE "A2A1B" CACHE STRING
     "Defender bisect for lifted PPU Release codegen: OFF, A1, A2, A2A, A2A1, A2A1A, A2A1B, A2A2, A2B, or B")
 set_property(CACHE PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE PROPERTY STRINGS
     OFF A1 A2 A2A A2A1 A2A1A A2A1B A2A2 A2B B)
@@ -314,9 +314,9 @@ if(PS3RECOMP_FAST_DEBUG)
     endif()
 endif()
 
-# V39 lifted-PPU binary search.  V35 located the Defender-triggering Release
+# V40 lifted-PPU binary search.  V35 located the Defender-triggering Release
 # codegen in half A; v36 narrowed that to A2; v37 showed A2A is the culprit;
-# v38 showed A2A1 is the culprit.  Split A2A1 into A2A1A/A2A1B while
+# v39 showed A2A1B is the culprit.  Select A2A1B by default while
 # retaining all older selectors for reproducibility.  Only selected
 # numbered ppu_recomp_NNN TU(s) are lowered to O1; helper sources, scaffold,
 # runtime, CRT, NDEBUG and linker settings remain normal Release.
