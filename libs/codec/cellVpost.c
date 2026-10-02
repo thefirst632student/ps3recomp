@@ -13,6 +13,9 @@
 #include "../video/rsx_d3d12_backend.h"
 #include "../../runtime/memory/vm.h"
 #include "../../runtime/ppu/ppu_memory.h"
+#include "../../runtime/syscalls/sys_ppu_thread.h"
+#include "../../runtime/syscalls/sys_mutex.h"
+#include "../../runtime/syscalls/sys_cond.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -27,6 +30,147 @@ typedef struct VpostHandleState {
 
 static VpostHandleState s_handles[CELL_VPOST_HANDLE_MAX];
 static int s_movie_users;
+
+/* The host movie path consumes the RGBA output immediately, but the title's
+ * middleware also queues the same output buffer for its guest vdisp worker.
+ * If that worker falls behind, its bounded queue can fill and vpostStart then
+ * blocks inside the guest enqueue helper even though the host has already
+ * presented every frame.  Relieve only near saturation and recycle the exact
+ * output-buffer token back into the guest free pool.  All queue mutations are
+ * made under the guest's own LV2 mutexes, so a live vdisp consumer can race
+ * normally without corrupting indices or duplicating a token. */
+extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+
+static int movie_guest_mutex_call(ppu_context* ctx, u32 id, int unlock)
+{
+    if (!ctx || !id) return -1;
+    const u64 save3 = ctx->gpr[3], save4 = ctx->gpr[4];
+    ctx->gpr[3] = id;
+    ctx->gpr[4] = 0;
+    const int64_t rc = unlock ? sys_mutex_unlock(ctx) : sys_mutex_lock(ctx);
+    ctx->gpr[3] = save3;
+    ctx->gpr[4] = save4;
+    return (int)(s32)rc;
+}
+
+static int movie_guest_pool_can_accept(u32 pool, u32 expected_cap)
+{
+    if (!pool || !vm_is_valid_addr(pool + 0x18)) return 0;
+    const u32 base = vm_read32(pool + 0x00);
+    const u32 count = vm_read32(pool + 0x04);
+    const u32 cap = vm_read32(pool + 0x10);
+    const u32 mutex_id = vm_read32(pool + 0x14);
+    const u32 cond_id = vm_read32(pool + 0x18);
+    return base && cap == expected_cap && cap > 0 && cap <= 256 && count < cap &&
+           mutex_id && cond_id && vm_is_valid_addr(base + (cap - 1u) * 4u);
+}
+
+static int movie_guest_pool_push(ppu_context* ctx, u32 pool, u32 token)
+{
+    if (!pool || !vm_is_valid_addr(pool + 0x18)) return 0;
+    const u32 base = vm_read32(pool + 0x00);
+    const u32 count0 = vm_read32(pool + 0x04);
+    const u32 cap = vm_read32(pool + 0x10);
+    const u32 mutex_id = vm_read32(pool + 0x14);
+    const u32 cond_id = vm_read32(pool + 0x18);
+    if (!base || cap == 0 || cap > 256 || count0 > cap || !mutex_id || !cond_id ||
+        !vm_is_valid_addr(base + (cap - 1u) * 4u)) return 0;
+
+    if (movie_guest_mutex_call(ctx, mutex_id, 0) != 0) return 0;
+    u32 count = vm_read32(pool + 0x04);
+    int ok = 0;
+    if (count < cap) {
+        vm_write32(base + count * 4u, token);
+        vm_write32(pool + 0x04, count + 1u);
+        sys_cond_signal_all_id(cond_id);
+        ok = 1;
+    }
+    movie_guest_mutex_call(ctx, mutex_id, 1);
+    return ok;
+}
+
+static int movie_guest_queue_pop(ppu_context* ctx, u32 q, u32* token_out)
+{
+    if (!q || !token_out || !vm_is_valid_addr(q + 0x38)) return 0;
+    const u32 base = vm_read32(q + 0x00);
+    const u32 cap = vm_read32(q + 0x10);
+    const u32 elem = vm_read32(q + 0x14);
+    const u32 mutex_id = vm_read32(q + 0x18);
+    const u32 cond_id = vm_read32(q + 0x1c);
+    if (!base || cap == 0 || cap > 256 || elem != 0x14u || !mutex_id || !cond_id ||
+        !vm_is_valid_addr(base + (cap - 1u) * elem + elem - 1u)) return 0;
+
+    if (movie_guest_mutex_call(ctx, mutex_id, 0) != 0) return 0;
+    u32 count = vm_read32(q + 0x04);
+    u32 read = vm_read32(q + 0x08);
+    int ok = 0;
+    if (count && read < cap) {
+        *token_out = vm_read32(base + read * elem);
+        read = (read + 1u) % cap;
+        vm_write32(q + 0x08, read);
+        vm_write32(q + 0x04, count - 1u);
+        sys_cond_signal_all_id(cond_id);
+        ok = 1;
+    }
+    movie_guest_mutex_call(ctx, mutex_id, 1);
+    return ok;
+}
+
+int cellVpostHostMovieRelieveWorker(u32 vpost_obj, int drain_all)
+{
+    ppu_context* ctx = g_active_ctx;
+    if (!ctx || !vpost_obj || !rsx_d3d12_backend_movie_mode() ||
+        !vm_is_valid_addr(vpost_obj + 0x8b)) return 0;
+
+    const u32 q = vm_read32(vpost_obj + 0x88);
+    if (!q || !vm_is_valid_addr(q + 0x38)) return 0;
+    const u32 cap = vm_read32(q + 0x10);
+    const u32 elem = vm_read32(q + 0x14);
+    if (cap < 4u || cap > 256u || elem != 0x14u) return 0;
+
+    int relieved = 0;
+    for (;;) {
+        const u32 count = vm_read32(q + 0x04);
+        /* Normal playback leaves the guest display path untouched.  Intervene
+         * only in the final four slots, where another vpost enqueue would soon
+         * block.  Teardown drains every queued token. */
+        if (!count || (!drain_all && count < cap - 4u)) break;
+        if (!movie_guest_pool_can_accept(q + 0x20, cap)) break;
+        u32 token = 0;
+        if (!movie_guest_queue_pop(ctx, q, &token)) break;
+        if (!movie_guest_pool_push(ctx, q + 0x20, token)) {
+            fprintf(stderr,
+                    "[movie-hle] WARNING: retired display token 0x%08X but free-pool push failed (q=0x%08X)\n",
+                    token, q);
+            break;
+        }
+        ++relieved;
+        if (!drain_all) break;
+    }
+
+    if (relieved) {
+        static unsigned long long n;
+        n += (unsigned)relieved;
+        if (n <= 8 || drain_all || (n % 120u) == 0) {
+            fprintf(stderr,
+                    "[movie-hle] display queue relief: vpost=0x%08X q=0x%08X retired=%d remain=%u cap=%u total=%llu%s\n",
+                    vpost_obj, q, relieved, vm_read32(q + 0x04), cap,
+                    n, drain_all ? " teardown" : "");
+        }
+    }
+    return relieved;
+}
+
+static u32 movie_current_vpost_object(void)
+{
+    ppu_context* ctx = g_active_ctx;
+    if (!ctx || !ctx->thread_id || ctx->thread_id > PPU_THREAD_MAX) return 0;
+    ppu_thread_info* t = &g_ppu_threads[ctx->thread_id - 1u];
+    if (t->state == PPU_THREAD_STATE_FREE || strcmp(t->name, "vpostStart") != 0)
+        return 0;
+    const u32 obj = (u32)t->entry_arg;
+    return (obj && vm_is_valid_addr(obj + 0x8b)) ? obj : 0;
+}
 
 static inline u8 clamp8(int v)
 {
@@ -258,6 +402,8 @@ s32 cellVpostExec(CellVpostHandle handle,
      * drops movie mode when vdispStart drains.  Making this idempotent avoids
      * a stale per-handle flag suppressing the next movie. */
     rsx_d3d12_backend_set_movie_mode(1);
+    { const u32 _vpost = movie_current_vpost_object();
+      if (_vpost) cellVpostHostMovieRelieveWorker(_vpost, 0); }
     if (!s_handles[handle].movie_mode) {
         s_handles[handle].movie_mode = 1;
         ++s_movie_users;

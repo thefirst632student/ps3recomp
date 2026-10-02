@@ -21,6 +21,7 @@ static PPU_TLS int     s_exit_armed = 0;
 #include "sys_ppu_thread.h"
 #include "sys_cond.h"
 #include "../../libs/video/rsx_d3d12_backend.h"
+#include "../../libs/codec/cellVpost.h"
 #include "../platform/win32_compat.h"   /* GetCurrentThreadId on POSIX */
 #include <string.h>
 #include <stdio.h>
@@ -586,6 +587,11 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
      * lets the guest worker follow its normal drain/return path. */
     if (strcmp(t->name, "vpostStart") == 0) {
         const uint32_t vpost = (uint32_t)t->entry_arg;
+        /* If the guest display consumer parked, vpostStart can be sleeping in
+         * its bounded output-queue enqueue rather than on its own EOS cond.
+         * Drain already-host-presented entries first; this also signals the
+         * queue cond, allowing the guest producer to leave that enqueue. */
+        if (vpost) cellVpostHostMovieRelieveWorker(vpost, 1);
         if (vpost && vm_is_valid_addr(vpost + 0x8D)) {
             uint8_t* obj = (uint8_t*)vm_to_host(vpost);
             const uint32_t old_state = ((uint32_t)obj[0x10] << 24) |

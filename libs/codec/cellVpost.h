@@ -148,6 +148,10 @@ s32 cellVpostExec(CellVpostHandle handle,
                   void* outPicBuf,
                   CellVpostPictureInfo* picInfo);
 
+/* Host-movie integration: retire already-presented middleware display entries
+ * under the guest queue's own locks. drain_all is used only at worker teardown. */
+int cellVpostHostMovieRelieveWorker(u32 vpost_obj, int drain_all);
+
 #ifdef __cplusplus
 }
 #endif
