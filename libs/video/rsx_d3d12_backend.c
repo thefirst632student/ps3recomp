@@ -4700,6 +4700,57 @@ static void render_frame(void)
             break;
         }
     }
+    /* WA2 phase-boundary probe.  The warning sequence changes from four to
+     * five recorded display draws around host frame 347.  Earlier probes were
+     * intentionally tied to the two known logo textures, so they could miss a
+     * newly-added fifth draw entirely.  Dump every record around that boundary,
+     * including its shader/RT/texture state and the first uploaded VP vertices.
+     * This is observational only. */
+    if (s_d3d.frame_count >= 340u && s_d3d.frame_count <= 360u) {
+        fprintf(stderr, "[WARN2_PHASE] frame=%u records=%u parity=%d%c",
+                (unsigned)s_d3d.frame_count, (unsigned)s_d3d.draw_count,
+                s_d3d.vp_parity, 10);
+        for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; ++_d) {
+            const D3D12DrawRecord* _r = &s_d3d.draws[_d];
+            fprintf(stderr,
+                "[WARN2_PHASE_DRAW] frame=%u d=%u vp=%d clear=%d rt=0x%08X "
+                "fp=0x%08X vs=%d topo=%u vc=%u vb=0x%X blend=%d key=0x%08X "
+                "cmask=0x%X vprect=%u,%u %ux%u%c",
+                (unsigned)s_d3d.frame_count, (unsigned)_d, _r->is_vp, _r->is_clear,
+                _r->rt_off, _r->fp_addr, _r->vs_idx, _r->topology,
+                _r->vertex_count, _r->vb_byte_offset, _r->blend, _r->blend_key,
+                _r->cmask, _r->vp_x, _r->vp_y, _r->vp_w, _r->vp_h, 10);
+            for (int _u = 0; _u < 4; ++_u) {
+                if (_r->tex[_u].set || _r->tex[_u].raw || _r->tex[_u].off) {
+                    fprintf(stderr,
+                        "[WARN2_PHASE_TEX] frame=%u d=%u u=%d raw=0x%08X off=0x%08X "
+                        "%ux%u fmt=0x%X pitch=%u ctrl1=0x%08X addr=0x%08X filt=0x%08X%c",
+                        (unsigned)s_d3d.frame_count, (unsigned)_d, _u,
+                        _r->tex[_u].raw, _r->tex[_u].off, _r->tex[_u].w, _r->tex[_u].h,
+                        _r->tex[_u].fmt, _r->tex[_u].pitch, _r->tex[_u].ctrl1,
+                        _r->tex[_u].address, _r->tex[_u].filter, 10);
+                }
+            }
+            if (_r->is_vp && !_r->is_clear && s_d3d.vp_vb_mapped && _r->vertex_count) {
+                const u8* _base = (const u8*)s_d3d.vp_vb_mapped
+                    + (u64)s_d3d.vp_parity * MAX_VERTICES * 256u
+                    + _r->vb_byte_offset;
+                u32 _nv = _r->vertex_count < 4u ? _r->vertex_count : 4u;
+                for (u32 _v = 0; _v < _nv; ++_v) {
+                    const float* _f = (const float*)(_base + (u64)_v * 256u);
+                    fprintf(stderr,
+                        "[WARN2_PHASE_VTX] frame=%u d=%u v=%u "
+                        "a0=(%.6g %.6g %.6g %.6g) a3=(%.6g %.6g %.6g %.6g) "
+                        "a8=(%.6g %.6g %.6g %.6g)%c",
+                        (unsigned)s_d3d.frame_count, (unsigned)_d, (unsigned)_v,
+                        _f[0],_f[1],_f[2],_f[3],
+                        _f[12],_f[13],_f[14],_f[15],
+                        _f[32],_f[33],_f[34],_f[35], 10);
+                }
+            }
+        }
+    }
+
     int logo_occ_issued[2] = {0, 0};
     if (logo_probe_batch && s_d3d.device && (!s_logo_occ_heap || !s_logo_occ_readback)) {
         if (!s_logo_occ_heap) {
