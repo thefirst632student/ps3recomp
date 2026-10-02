@@ -216,6 +216,28 @@ jobs:
           cmake --build build-sync --target test_cond_semantics
           ctest --test-dir build-sync -R "^cond_" --output-on-failure
 
+      # V51 AV false-positive root-cause control. The repository already
+      # contains the lifted PPU source, so CI does NOT need EBOOT.ELF. Split
+      # ppu_recomp_000.cpp into temporary build shards and keep every shard at
+      # normal Release optimization. This establishes whether source/object
+      # splitting alone changes the Edge/Defender result before we vary O1 at
+      # function granularity. recompiled/ remains read-only.
+      - name: Prepare Release PPU function-bisect split control
+        if: matrix.build_type == 'Release'
+        shell: pwsh
+        run: |
+          $outDir = Join-Path $env:GITHUB_WORKSPACE "eboot_port\build\av_bisect_generated"
+          python tools/ppu_build_bisect.py `
+            --input "eboot_port/recompiled/ppu_recomp_000.cpp" `
+            --output-dir "$outDir" `
+            --function-path A `
+            --selected-optimization release
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          "PS3RECOMP_AV_BISECT_DIR=$outDir" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "--- bisect manifest ---"
+          Get-Content (Join-Path $outDir "bisect_manifest.txt")
+
       - name: Build eboot_port (Game Port)
         run: |
           cmake -S eboot_port -B eboot_port/build -G Ninja `
@@ -223,7 +245,8 @@ jobs:
             -DCMAKE_CXX_COMPILER=clang-cl `
             -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} `
             -DPS3RECOMP_REQUIRE_FFMPEG=ON `
-            -DPS3RECOMP_FFMPEG_ROOT="$env:PS3RECOMP_FFMPEG_ROOT"
+            -DPS3RECOMP_FFMPEG_ROOT="$env:PS3RECOMP_FFMPEG_ROOT" `
+            -DPS3RECOMP_AV_BISECT_DIR="$env:PS3RECOMP_AV_BISECT_DIR"
           if ($LASTEXITCODE -ne 0) { exit 1 }
           cmake --build eboot_port/build
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -236,3 +259,5 @@ jobs:
           path: |
             eboot_port/build/MyGameRecomp.exe
             eboot_port/build/*.dll
+            eboot_port/build/av_bisect_generated/bisect_manifest.txt
+            eboot_port/build/av_bisect_generated/bisect_manifest.json
