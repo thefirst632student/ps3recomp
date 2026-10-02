@@ -45,6 +45,17 @@ typedef struct {
     u32 cursor;
     u32 frame_bytes;       /* payload bytes for RIFF, total bytes for ATS */
     int ats_mode;
+    /* Streaming RIFF support.  cellAtrac commonly receives only the first
+     * ~50KB of a much larger WAVE file, then reuses the guest buffer as a
+     * refill window.  Keep a host-side copy so the guest window can be
+     * overwritten immediately after AddStreamData without invalidating
+     * compressed frames that the decoder has not reached yet. */
+    u32 file_size;         /* declared RIFF size including 8-byte header */
+    u32 loaded_bytes;      /* absolute file bytes copied into stream_copy */
+    u32 offered_bytes;     /* writable bytes returned by GetStreamDataInfo */
+    u8* stream_copy;
+    u32 stream_capacity;
+    int riff_atrac3p;
 #ifdef PS3RECOMP_HAVE_FFMPEG
     const AVCodec* codec;
     AVCodecContext* ctx;
@@ -63,6 +74,33 @@ static void write_guest_float(u32 ea, float f)
     u32 bits;
     memcpy(&bits, &f, 4);
     vm_write32(ea, bits);
+}
+
+static void atrac_stream_free(AtracSlot* s)
+{
+    if (!s) return;
+    free(s->stream_copy);
+    s->stream_copy = NULL;
+    s->stream_capacity = 0;
+    s->loaded_bytes = 0;
+    s->offered_bytes = 0;
+}
+
+static int atrac_stream_reserve(AtracSlot* s, u32 need)
+{
+    if (!s) return -1;
+    if (need <= s->stream_capacity) return 0;
+    u32 cap = s->stream_capacity ? s->stream_capacity : 0x10000u;
+    while (cap < need) {
+        u32 next = cap < 0x4000000u ? cap * 2u : need;
+        if (next < cap) { cap = need; break; }
+        cap = next;
+    }
+    u8* n = (u8*)realloc(s->stream_copy, cap);
+    if (!n) return -1;
+    s->stream_copy = n;
+    s->stream_capacity = cap;
+    return 0;
 }
 
 static AtracSlot* atrac_find_or_alloc(CellAtracHandle* handle)
@@ -135,31 +173,65 @@ static int atrac_parse_ats(AtracSlot* s, const u8* p, u32 bytes, u32* payload_ou
 
 static int atrac_parse_riff(AtracSlot* s, const u8* p, u32 bytes)
 {
+    static const u8 atrac3p_guid[16] = {
+        0xBF, 0xAA, 0x23, 0xE9, 0x58, 0xCB, 0x71, 0x44,
+        0xA1, 0x19, 0xFF, 0xFA, 0x01, 0xE4, 0xCE, 0x62
+    };
     if (!p || bytes < 12 || memcmp(p, "RIFF", 4) || memcmp(p + 8, "WAVE", 4)) return -1;
+
+    u32 declared_file = rd_le32(p + 4) + 8u;
     u32 off = 12;
     u32 block_align = 0, data_off = 0, data_size = 0;
+    u16 format_tag = 0;
+    u32 avg_bytes = 0;
+    int codec_ok = 0;
+
     while (off + 8u <= bytes) {
         const u8* h = p + off;
         u32 n = rd_le32(h + 4);
         u32 body = off + 8u;
-        if (body > bytes || n > bytes - body) break;
-        if (!memcmp(h, "fmt ", 4) && n >= 16u) {
-            s->channels = rd_le16(p + body + 2u);
-            s->sample_rate = rd_le32(p + body + 4u);
-            block_align = rd_le16(p + body + 12u);
-        } else if (!memcmp(h, "data", 4)) {
+        if (body > bytes) break;
+
+        /* The data chunk normally declares the size of the entire track, much
+         * larger than uiReadByte.  Record its header even when only the first
+         * streaming window is currently resident. */
+        if (!memcmp(h, "data", 4)) {
             data_off = body;
             data_size = n;
             break;
         }
+
+        if (n > bytes - body) break;
+        if (!memcmp(h, "fmt ", 4) && n >= 16u) {
+            format_tag = rd_le16(p + body + 0u);
+            s->channels = rd_le16(p + body + 2u);
+            s->sample_rate = rd_le32(p + body + 4u);
+            avg_bytes = rd_le32(p + body + 8u);
+            block_align = rd_le16(p + body + 12u);
+
+            if (format_tag == 0xfffeu && n >= 40u) {
+                /* WAVEFORMATEXTENSIBLE: GUID starts after validBits + mask. */
+                const u8* guid = p + body + 24u;
+                if (!memcmp(guid, atrac3p_guid, sizeof(atrac3p_guid)))
+                    codec_ok = 1;
+            }
+        }
         off = body + ((n + 1u) & ~1u);
     }
-    if (!block_align || !data_off || !data_size || !s->channels || !s->sample_rate) return -1;
-    if (data_off + data_size > bytes) data_size = bytes - data_off;
+
+    if (!codec_ok || !block_align || !data_off || !data_size ||
+        !s->channels || !s->sample_rate)
+        return -1;
+
     s->ats_mode = 0;
+    s->riff_atrac3p = 1;
     s->frame_bytes = block_align;
     s->data_offset = data_off;
-    s->data_size = data_size;
+    s->data_size = data_size; /* declared size, not just the first window */
+    s->file_size = declared_file >= data_off ? declared_file : data_off + data_size;
+    if (s->file_size < data_off + data_size)
+        s->file_size = data_off + data_size;
+    if (avg_bytes) s->bitrate = avg_bytes * 8u;
     return 0;
 }
 
@@ -167,7 +239,7 @@ static void atrac_log_head_once(const u8* p, u32 n)
 {
     static int once = 0;
     if (once++ || !p) return;
-    u32 lim = n < 32u ? n : 32u;
+    u32 lim = n < 80u ? n : 80u;
     fprintf(stderr, "[cellAtrac] input head (%u bytes):", lim);
     for (u32 i = 0; i < lim; ++i) fprintf(stderr, " %02X", p[i]);
     fprintf(stderr, "\n");
@@ -184,6 +256,7 @@ s32 cellAtracSetDataAndGetMemSize(CellAtracHandle* handle, void* pucBufferAddr,
 #ifdef PS3RECOMP_HAVE_FFMPEG
     atrac_ffmpeg_close(slot);
 #endif
+    atrac_stream_free(slot);
     slot->buffer_ea = (u32)(uintptr_t)pucBufferAddr;
     slot->buffer_size = uiBufferByte;
     slot->read_bytes = uiReadByte;
@@ -193,6 +266,10 @@ s32 cellAtracSetDataAndGetMemSize(CellAtracHandle* handle, void* pucBufferAddr,
     slot->current_sample = 0;
     slot->frame_bytes = 0;
     slot->ats_mode = 0;
+    slot->riff_atrac3p = 0;
+    slot->file_size = uiReadByte;
+    slot->loaded_bytes = 0;
+    slot->offered_bytes = 0;
 
     if (slot->buffer_ea && uiReadByte) {
         const u8* p = GUEST_PTR((void*)(uintptr_t)slot->buffer_ea, const u8*);
@@ -209,6 +286,18 @@ s32 cellAtracSetDataAndGetMemSize(CellAtracHandle* handle, void* pucBufferAddr,
                     slot->frame_bytes, payload, slot->sample_rate, slot->channels);
         } else {
             fprintf(stderr, "[cellAtrac] format not yet recognized; decode will remain silent for this stream\n");
+        }
+
+        /* Preserve the initial window before the title reuses the guest buffer
+         * for streaming refills.  For RIFF, reserve the declared file size so
+         * AddStreamData can append contiguously. */
+        u32 reserve = slot->file_size > uiReadByte ? slot->file_size : uiReadByte;
+        if (reserve > 0x10000000u) reserve = uiReadByte; /* malformed header guard */
+        if (atrac_stream_reserve(slot, reserve) == 0) {
+            memcpy(slot->stream_copy, p, uiReadByte);
+            slot->loaded_bytes = uiReadByte;
+        } else {
+            fprintf(stderr, "[cellAtrac] host stream staging allocation failed (%u bytes)\n", reserve);
         }
     }
 
@@ -264,6 +353,7 @@ s32 cellAtracDeleteDecoder(CellAtracHandle* handle)
 #ifdef PS3RECOMP_HAVE_FFMPEG
         atrac_ffmpeg_close(slot);
 #endif
+        atrac_stream_free(slot);
         memset(slot, 0, sizeof(*slot));
     }
     return CELL_OK;
@@ -317,7 +407,17 @@ s32 cellAtracDecode(CellAtracHandle* handle, float* pOutPcm, u32* puiSamples,
     AtracSlot* slot = atrac_find_or_alloc(handle);
     if (!slot || !slot->is_decoder_created) return (s32)CELL_ATRAC_ERROR_NO_DECODER;
 
-    if (!slot->frame_bytes || !slot->buffer_ea) {
+    {
+        static u32 decode_log = 0;
+        if (decode_log < 12u) {
+            fprintf(stderr, "[cellAtrac] Decode #%u cursor=%u/%u loaded=%u file=%u frame=%u\n",
+                    decode_log + 1u, slot->cursor, slot->data_size,
+                    slot->loaded_bytes, slot->file_size, slot->frame_bytes);
+            decode_log++;
+        }
+    }
+
+    if (!slot->frame_bytes || (!slot->buffer_ea && !slot->stream_copy)) {
         if (pOutPcm) memset(GUEST_PTR(pOutPcm, void*), 0, ATRAC_SAMPLES_PER_FRAME * 2u * sizeof(float));
         if (puiSamples) vm_write32((u32)(uintptr_t)puiSamples, ATRAC_SAMPLES_PER_FRAME);
         if (puiFinishFlag) vm_write32((u32)(uintptr_t)puiFinishFlag, 0);
@@ -341,6 +441,16 @@ s32 cellAtracDecode(CellAtracHandle* handle, float* pOutPcm, u32* puiSamples,
         }
     }
 
+    /* data_size is the declared RIFF data length; loaded_bytes is how much of
+     * the stream the title has actually supplied so far. */
+    u32 need_abs = slot->data_offset + slot->cursor + slot->frame_bytes;
+    if (slot->stream_copy && need_abs > slot->loaded_bytes) {
+        if (puiSamples) vm_write32((u32)(uintptr_t)puiSamples, 0);
+        if (puiFinishFlag) vm_write32((u32)(uintptr_t)puiFinishFlag, 0);
+        if (piRemainFrame) vm_write32((u32)(uintptr_t)piRemainFrame, 0);
+        return (s32)CELL_ATRAC_ERROR_NODATA_IN_BUFFER;
+    }
+
     u32 out_frames = ATRAC_SAMPLES_PER_FRAME;
     u32 out_channels = slot->channels ? slot->channels : 2u;
     float pcm[ATRAC_SAMPLES_PER_FRAME * ATRAC_MAX_CHANNELS];
@@ -349,13 +459,18 @@ s32 cellAtracDecode(CellAtracHandle* handle, float* pOutPcm, u32* puiSamples,
 
 #ifdef PS3RECOMP_HAVE_FFMPEG
     if (slot->ctx && slot->frame) {
-        const u8* base = GUEST_PTR((void*)(uintptr_t)slot->buffer_ea, const u8*);
+        const u8* base = slot->stream_copy
+            ? slot->stream_copy
+            : GUEST_PTR((void*)(uintptr_t)slot->buffer_ea, const u8*);
         const u8* framep = base + slot->data_offset + slot->cursor;
         const u8* payload = framep;
         u32 payload_bytes = slot->frame_bytes;
         if (slot->ats_mode) {
             u32 parsed_payload = 0;
-            if (atrac_parse_ats(slot, framep, slot->data_size - slot->cursor, &parsed_payload) == 0) {
+            u32 avail = slot->stream_copy && slot->loaded_bytes > slot->data_offset + slot->cursor
+                ? slot->loaded_bytes - (slot->data_offset + slot->cursor)
+                : slot->data_size - slot->cursor;
+            if (atrac_parse_ats(slot, framep, avail, &parsed_payload) == 0) {
                 payload = framep + 8u;
                 payload_bytes = parsed_payload;
             }
@@ -419,11 +534,30 @@ s32 cellAtracDecode(CellAtracHandle* handle, float* pOutPcm, u32* puiSamples,
 s32 cellAtracAddStreamData(CellAtracHandle* handle, u32 uiAddByte)
 {
     AtracSlot* slot = atrac_find_or_alloc(handle);
-    if (slot) {
-        u64 n = (u64)slot->read_bytes + uiAddByte;
-        slot->read_bytes = (u32)(n > slot->buffer_size ? slot->buffer_size : n);
-        if (slot->data_offset + slot->data_size < slot->read_bytes)
-            slot->data_size = slot->read_bytes - slot->data_offset;
+    if (!slot || !slot->buffer_ea) return (s32)CELL_ATRAC_ERROR_UNSET_DATA;
+    if (!uiAddByte) return CELL_OK;
+
+    u32 remain = slot->file_size > slot->loaded_bytes
+        ? slot->file_size - slot->loaded_bytes : 0u;
+    u32 allowed = slot->offered_bytes ? slot->offered_bytes : slot->buffer_size;
+    if (remain && allowed > remain) allowed = remain;
+    if (uiAddByte > allowed)
+        return (s32)CELL_ATRAC_ERROR_ADD_DATA_IS_TOO_BIG;
+
+    u32 need = slot->loaded_bytes + uiAddByte;
+    if (atrac_stream_reserve(slot, need) < 0)
+        return (s32)CELL_ATRAC_ERROR_API_FAIL;
+    const u8* src = GUEST_PTR((void*)(uintptr_t)slot->buffer_ea, const u8*);
+    memcpy(slot->stream_copy + slot->loaded_bytes, src, uiAddByte);
+    slot->loaded_bytes += uiAddByte;
+    slot->read_bytes = slot->loaded_bytes;
+    slot->offered_bytes = 0;
+
+    static u32 add_log = 0;
+    if (add_log < 16u || (slot->file_size && slot->loaded_bytes >= slot->file_size)) {
+        fprintf(stderr, "[cellAtrac] AddStreamData #%u +%u -> loaded=%u/%u\n",
+                add_log + 1u, uiAddByte, slot->loaded_bytes, slot->file_size);
+        add_log++;
     }
     return CELL_OK;
 }
@@ -445,8 +579,15 @@ s32 cellAtracSetSecondBuffer(CellAtracHandle* handle, void* pucSecondBufferAddr,
 s32 cellAtracGetVacantSize(CellAtracHandle* handle, u32* puiVacantSize)
 {
     AtracSlot* slot = atrac_find_or_alloc(handle);
-    if (puiVacantSize) vm_write32((u32)(uintptr_t)puiVacantSize,
-        slot && slot->buffer_size > slot->read_bytes ? slot->buffer_size - slot->read_bytes : 0);
+    u32 writable = 0;
+    if (slot && slot->buffer_ea && (!slot->file_size || slot->loaded_bytes < slot->file_size)) {
+        writable = slot->buffer_size;
+        if (slot->file_size) {
+            u32 remain = slot->file_size - slot->loaded_bytes;
+            if (writable > remain) writable = remain;
+        }
+    }
+    if (puiVacantSize) vm_write32((u32)(uintptr_t)puiVacantSize, writable);
     return CELL_OK;
 }
 
@@ -454,10 +595,31 @@ s32 cellAtracGetStreamDataInfo(CellAtracHandle* handle, void** ppucWriteAddr,
                                u32* puiWritableByte, u32* puiReadPosition)
 {
     AtracSlot* slot = atrac_find_or_alloc(handle);
-    if (ppucWriteAddr && slot) vm_write32((u32)(uintptr_t)ppucWriteAddr, slot->buffer_ea + slot->read_bytes);
-    if (puiWritableByte) vm_write32((u32)(uintptr_t)puiWritableByte,
-        slot && slot->buffer_size > slot->read_bytes ? slot->buffer_size - slot->read_bytes : 0);
-    if (puiReadPosition) vm_write32((u32)(uintptr_t)puiReadPosition, slot ? slot->read_bytes : 0);
+    u32 writable = 0;
+    u32 read_pos = 0;
+    u32 write_ea = 0;
+    if (slot) {
+        read_pos = slot->loaded_bytes;
+        write_ea = slot->buffer_ea;
+        if (slot->buffer_ea && (!slot->file_size || slot->loaded_bytes < slot->file_size)) {
+            writable = slot->buffer_size;
+            if (slot->file_size) {
+                u32 remain = slot->file_size - slot->loaded_bytes;
+                if (writable > remain) writable = remain;
+            }
+        }
+        slot->offered_bytes = writable;
+    }
+    if (ppucWriteAddr) vm_write32((u32)(uintptr_t)ppucWriteAddr, write_ea);
+    if (puiWritableByte) vm_write32((u32)(uintptr_t)puiWritableByte, writable);
+    if (puiReadPosition) vm_write32((u32)(uintptr_t)puiReadPosition, read_pos);
+
+    static u32 info_log = 0;
+    if (slot && info_log < 16u) {
+        fprintf(stderr, "[cellAtrac] GetStreamDataInfo #%u write=0x%08X writable=%u readPos=%u/%u\n",
+                info_log + 1u, write_ea, writable, read_pos, slot->file_size);
+        info_log++;
+    }
     return CELL_OK;
 }
 
@@ -515,10 +677,10 @@ s32 cellAtracGetBufferInfoForResetting(CellAtracHandle* handle, u32 uiSample, Ce
     u32 ea = (u32)(uintptr_t)pBufferInfo;
     if (ea && slot) {
         u32 frame = uiSample / ATRAC_SAMPLES_PER_FRAME;
-        u32 read_pos = frame * slot->frame_bytes;
-        vm_write32(ea + 0, slot->buffer_ea + slot->data_offset + read_pos);
-        vm_write32(ea + 4, slot->buffer_size > read_pos ? slot->buffer_size - read_pos : 0);
-        vm_write32(ea + 8, 0);
+        u32 read_pos = slot->data_offset + frame * slot->frame_bytes;
+        vm_write32(ea + 0, slot->buffer_ea);
+        vm_write32(ea + 4, slot->buffer_size);
+        vm_write32(ea + 8, slot->frame_bytes);
         vm_write32(ea + 12, read_pos);
     }
     return CELL_OK;

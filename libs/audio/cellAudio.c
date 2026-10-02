@@ -148,7 +148,9 @@ static u64            s_audio_start_us = 0;
 static u64            s_audio_block_counter = 0;
 static u8             s_audio_port_seen_pcm[CELL_AUDIO_PORT_MAX];
 static int            s_audio_mix_seen_pcm = 0;
-static int            s_audio_guest_pcm_seen = 0;
+static int            s_audio_guest_pcm_seen = 0; /* telemetry: ever observed */
+static u32            s_audio_guest_pcm_hold_blocks = 0;
+#define HLE_PCM_GUEST_HOLD_BLOCKS 8u
 
 /* Host-native PCM fallback FIFO used by HLE decoders while a title's guest
  * SPU mixer is not yet functional.  Six seconds is intentionally generous:
@@ -510,6 +512,7 @@ static inline float ld_be_f32(const float* p)
 static void audio_mix_one_block(void)
 {
     memset(s_mix_buffer, 0, sizeof(s_mix_buffer));
+    int guest_pcm_this_block = 0;
 
     mutex_lock(&s_audio_mutex);
 
@@ -591,6 +594,13 @@ static void audio_mix_one_block(void)
                 right += center + lfe + rr + sr;
             }
 
+            {
+                float al_now = left < 0.0f ? -left : left;
+                float ar_now = right < 0.0f ? -right : right;
+                if (al_now > 0.00001f || ar_now > 0.00001f)
+                    guest_pcm_this_block = 1;
+            }
+
             if (!s_audio_port_seen_pcm[p]) {
                 float al = left < 0.0f ? -left : left;
                 float ar = right < 0.0f ? -right : right;
@@ -624,14 +634,21 @@ static void audio_mix_one_block(void)
     }
 
     /* Drain the HLE decoder fallback at the same 48 kHz hardware cadence.
-     * Once a real guest port has produced PCM we still drain (discard) this
-     * FIFO, but stop mixing it so the guest mixer owns audio exactly once. */
+     * Suppress it only while guest PCM is ACTIVE, not forever after the first
+     * non-zero block.  Movie playback can legitimately produce guest PCM and
+     * then hand control back to a still-unimplemented synth2 path; the old
+     * sticky boolean muted all later cellAtrac HLE audio permanently. */
+    if (guest_pcm_this_block)
+        s_audio_guest_pcm_hold_blocks = HLE_PCM_GUEST_HOLD_BLOCKS;
+    else if (s_audio_guest_pcm_hold_blocks)
+        s_audio_guest_pcm_hold_blocks--;
+
     {
         u32 take = s_hle_pcm_count < CELL_AUDIO_BLOCK_SAMPLES
             ? s_hle_pcm_count : CELL_AUDIO_BLOCK_SAMPLES;
         for (u32 i = 0; i < take; ++i) {
             u32 pos = (s_hle_pcm_head + i) % HLE_PCM_FIFO_FRAMES;
-            if (!s_audio_guest_pcm_seen) {
+            if (!s_audio_guest_pcm_hold_blocks) {
                 s_mix_buffer[i * 2u + 0u] += s_hle_pcm_fifo[pos * 2u + 0u];
                 s_mix_buffer[i * 2u + 1u] += s_hle_pcm_fifo[pos * 2u + 1u];
             }
@@ -853,6 +870,7 @@ s32 cellAudioInit(void)
     /* Same origin/domain as the guest's sys_time_get_system_time(). */
     s_audio_start_us = ps3_system_time_us();
     s_audio_block_counter = 0;
+    s_audio_guest_pcm_hold_blocks = 0;
     memset(s_audio_port_seen_pcm, 0, sizeof(s_audio_port_seen_pcm));
     s_audio_mix_seen_pcm = 0;
     if (audio_start_mix_thread() < 0) {
