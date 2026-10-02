@@ -2383,6 +2383,7 @@ void spu_indirect_branch(spu_context* ctx)
       if (_bt0[img]++ < BT0_PER_IMG)
         fprintf(stderr, "[SPU] BRANCH-TO-0 unresolved pc=0x%05X image=%d lr=0x%05X\n",
                 ctx->pc, ctx->image_id, ctx->gpr[0]._u32[0] & SPU_LS_MASK); }
+#ifndef NDEBUG
     /* One-shot: the FMOD null-handler DSP node carries a PPU descriptor EA at
      * node+0x14 (observed 0x93C3C0). Dump it to identify which plugin/unit
      * type never got its SPU code streamed (env SPU_DSPDESC=<hex ea>). */
@@ -2440,6 +2441,7 @@ void spu_indirect_branch(spu_context* ctx)
             ctx->ls[0x2d4e8],ctx->ls[0x2d4e9],ctx->ls[0x2d4ea],ctx->ls[0x2d4eb],
             ctx->ls[0x2d4ec],ctx->ls[0x2d4ed],ctx->ls[0x2d4ee],ctx->ls[0x2d4ef]); }
     } }
+#endif
     ctx->status = SPU_STATUS_STOPPED_BY_HALT;
 }
 
@@ -2458,6 +2460,11 @@ void spu_indirect_branch(spu_context* ctx)
  * to redirect to a file. The format is intentionally minimal and stable
  * so a small converter can line it up against an RPCS3.log SPU trace.
  * ===========================================================================*/
+#ifdef NDEBUG
+void spu_trace_init(const char* path) { (void)path; }
+void spu_trace_pc(spu_context* ctx, uint32_t pc) { (void)ctx; (void)pc; }
+void spu_trace_rt(spu_context* ctx, uint32_t rt) { (void)ctx; (void)rt; }
+#else
 static FILE* s_trace_fp = NULL;
 
 void spu_trace_init(const char* path)
@@ -2539,6 +2546,8 @@ void spu_trace_rt(spu_context* ctx, uint32_t rt)
             (unsigned long long)v._u64[0],
             (unsigned long long)v._u64[1]);
 }
+
+#endif
 
 #ifdef __cplusplus
 }

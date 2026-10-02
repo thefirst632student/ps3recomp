@@ -372,6 +372,7 @@ int64_t sys_fs_open(ppu_context* ctx)
     char host_path[1024];
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
 
+#ifndef NDEBUG
     { extern char* getenv(const char*); if (getenv("FLOW_TITLEOPEN") && ps3_path && strstr(ps3_path, "Titles")) {
         size_t _l = strlen(ps3_path);
         fprintf(stderr, "[TITLEOPEN] path='%s' (len=%zu, ends_slash=%d) guest_lr=0x%08X\n",
@@ -395,6 +396,7 @@ int64_t sys_fs_open(ppu_context* ctx)
         }
     } }
 
+#endif
     /* NPDRM: a file that begins "NPD\0" is an EDAT, and on hardware the guest never
      * sees its ciphertext -- sceNpDrmIsAvailable primes the kernel and cellFsOpen
      * returns plaintext. Decrypt once into a cache file and open that instead, so

@@ -240,6 +240,7 @@ static void cellFsOpen(ppu_context* ctx)
             if (want && *want && strstr(gpath, want)) ydkj_host_bt("fs-open");
           } }
       else fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd); }
+#ifndef NDEBUG
     if (getenv("PS3_FSLOG_BT") && strstr(gpath, ".usm")) {
         /* Resolve to GUEST functions (raw host RVAs are useless here): this tells us
          * which criMv/criFs function opened the movie, so the reader-attach path
@@ -247,6 +248,7 @@ static void cellFsOpen(ppu_context* ctx)
         fprintf(stderr,"[USMBT] open '%s' -> fd %d\n", gpath, fd); fflush(stderr);
         ydkj_host_bt("usm-open");
     }
+#endif
     ctx->gpr[3] = CELL_OK;
 }
 
@@ -407,7 +409,7 @@ static void cellFsRead(ppu_context* ctx)
           fprintf(stderr, "[fsread] fd=%d want=%llu got=%zu pos=%ld\n",
                   fd, (unsigned long long)nbytes, n, fpos_before); }
     if (getenv("PS3_FSLOG")) { static int _fd=0; if(_fd++<20) fprintf(stderr,"[FSDBG] fd=%d raw_nbytes=0x%llX clamped=0x%llX buf=0x%08X fpos_before=%ld n=%zu eof=%d err=%d\n", fd,(unsigned long long)raw_nbytes,(unsigned long long)nbytes,buf,fpos_before,n,feof(g_files[fd]),ferror(g_files[fd])); }
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(NDEBUG)
     if (getenv("PS3_FSLOG") && buf==0 && raw_nbytes>0x10000) { static int _b=0; if(_b++<2){ void* fr[30]; unsigned short nn=RtlCaptureStackBackTrace(0,30,fr,0); uintptr_t mb=(uintptr_t)GetModuleHandleA(0); fprintf(stderr,"[FSBT] null-buf read caller rvas:"); for(unsigned short i=0;i<nn&&i<16;i++) fprintf(stderr," %llX",(unsigned long long)((uintptr_t)fr[i]-mb)); fprintf(stderr,"\n"); } }
 #endif
     /* Per-fd totals, not just the first 50 lines. The flat cap made "this file is
@@ -450,6 +452,7 @@ static void cellFsWrite(ppu_context* ctx)
     if (fd < 0 || fd >= FS_MAX || !g_files[fd]) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return; }
     fs_prefault(buf, nbytes);   /* kernel READS the buffer; same reserved-page trap */
     size_t n = fwrite(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);
+#ifndef NDEBUG
     /* DIAGNOSTIC (PS3_FSLOG_BT=1): dump the guest back-chain when the game logs the
      * render-config failure, to locate setScreenRenderTargetInternal & the config obj. */
     if (getenv("PS3_FSLOG_BT") && buf && nbytes > 0 && nbytes < 4096 && vm_base) {
@@ -471,6 +474,7 @@ static void cellFsWrite(ppu_context* ctx)
             fflush(stderr);
         }
     }
+#endif
     if (nwr_ptr) vm_write64(nwr_ptr, n);
     ctx->gpr[3] = CELL_OK;
 }
