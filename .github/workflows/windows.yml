@@ -322,8 +322,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} `
             -DPS3RECOMP_REQUIRE_FFMPEG=ON `
             -DPS3RECOMP_FFMPEG_ROOT="$env:PS3RECOMP_FFMPEG_ROOT" `
-            -DPS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE=OFF `
-            -DPS3RECOMP_LLVM_OPT_BISECT_LIMIT=-1
+            -DPS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE=OFF
           if ($LASTEXITCODE -ne 0) { exit 1 }
           cmake --build eboot_port/build
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -337,4 +336,3 @@ jobs:
           path: |
             eboot_port/build/MyGameRecomp.exe
             eboot_port/build/*.dll
-            eboot_port/build/llvm_opt_bisect_summary.json
