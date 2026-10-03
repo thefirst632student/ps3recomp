@@ -4330,23 +4330,39 @@ static u32 current_rt_off(u32* out_w, u32* out_h, u32 out_mrt[3])
                 st->surface_zeta_offset, st->surface_clip_w, st->surface_clip_h,
                 cellGcmOffsetIsDisplay(raw), cellGcmOffsetIsDisplay(raw) ? 0 : raw); } } }
     if (cellGcmOffsetIsDisplay(raw)) return 0;
-    /* RT_DISPLAY_BY_SIZE=1: also treat a single-target surface whose clip
-     * exactly matches the display resolution as the backbuffer.
+    /* Surface identity is the registered display-buffer OFFSET, not its
+     * dimensions. Post-processing commonly renders to full-resolution textures
+     * that are later sampled by another pass. Classifying those as the swapchain
+     * merely because they are 1280x720 splits one RSX resource into two host
+     * resources: the producer writes the backbuffer while the consumer uploads
+     * stale guest VRAM. The result is frame-to-frame flashing and a very costly
+     * full-screen texture upload.
      *
-     * cellGcmSetDisplayBuffer only registers the buffers the FLIP may point at;
-     * a guest is free to render into a different surface of the same size and
-     * flip to it later (PSGL does). Matching offsets alone then classifies every
-     * draw as offscreen, has_display stays 0, and render_frame() -- which is
-     * what draws ALL recorded geometry -- is never called. The backbuffer shows
-     * only the clear, which looks exactly like "nothing rasterizes". */
+     * Keep the old size heuristic only as an opt-in diagnostic escape hatch.
+     * Correct/default behaviour is offset identity via cellGcmOffsetIsDisplay(). */
     { static int _bs = -1;
+      int full_size = (st->color_target < 0x13 &&
+                       st->surface_clip_w == s_d3d.width &&
+                       st->surface_clip_h == s_d3d.height);
       if (_bs < 0) {
           const char* e = getenv("RT_DISPLAY_BY_SIZE");
-          _bs = (e && *e) ? atoi(e) : 1;
+          _bs = (e && *e) ? atoi(e) : 0;
       }
-      if (_bs && st->color_target < 0x13 &&
-          st->surface_clip_w == s_d3d.width && st->surface_clip_h == s_d3d.height)
-          return 0; }
+      if (_bs && full_size)
+          return 0;
+      if (!_bs && full_size && raw) {
+          static u32 seen[8];
+          static int ns = 0;
+          int known = 0;
+          for (int i = 0; i < ns; i++) if (seen[i] == raw) known = 1;
+          if (!known && ns < 8) {
+              seen[ns++] = raw;
+              fprintf(stderr,
+                      "[RT-ID] full-size surface raw=0x%08X is not a registered display buffer -> offscreen RTT%c",
+                      raw, 10);
+          }
+      }
+    }
     /* Surface clip dims when sane; else the window size. Any size works --
      * passes draw normalized full-surface quads -- this only picks resolution. */
     u32 w = st->surface_clip_w, h = st->surface_clip_h;
