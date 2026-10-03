@@ -332,91 +332,50 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           echo Copy-Item "$env:PS3RECOMP_FFMPEG_ROOT\bin\*.dll" "eboot_port\build\" -Force
 
-      - name: Upload fresh eboot_port Artifact
+      - name: Upload current fresh eboot_port Artifact
         if: steps.game_assets.outputs.enabled == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: MyGameRecomp-Windows-${{ matrix.build_type }}-Fresh
+          name: MyGameRecomp-Windows-${{ matrix.build_type }}-FreshCurrent
           path: |
             eboot_port/build/MyGameRecomp.exe
             eboot_port/build/*.dll
 
-      # v55 proved that a fresh re-lift is clean.  For Release, rebuild the
-      # exact same current runtime/toolchain against the last generated PPU tree
-      # that was actually tracked in Git.  This isolates generator-output drift
-      # from compiler/runtime drift without committing generated sources again.
-      - name: Locate last historical generated PPU tree
+      # v57 reproduction control: v28 made the genuine ppu_loader debug/dev
+      # instrumentation Debug-only by wrapping it in NDEBUG guards.  Keep every
+      # other HEAD source and the freshly lifted PPU output unchanged, then use
+      # python -c to make those ppu_loader guards always-on for the second
+      # Release build.  This is intentionally a runner-only patch; nothing under
+      # recompiled/ or runtime/ is committed back to Git.
+      - name: Re-enable pre-v28 ppu_loader instrumentation with python -c
         if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
-        id: historical_ppu
+        id: pre_v28_loader
         shell: pwsh
         run: |
-          $path = "eboot_port/recompiled/ppu_recomp_000.cpp"
-          $commits = @(git rev-list HEAD -- $path)
-          $found = $null
-          foreach ($commit in $commits) {
-            git cat-file -e "${commit}:$path" 2>$null
-            if ($LASTEXITCODE -eq 0) {
-              $found = $commit
-              break
-            }
-          }
-          if ([string]::IsNullOrWhiteSpace($found)) {
-            throw "Could not find any Git commit containing $path. The historical A/B control cannot run."
-          }
-          "commit=$found" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          Write-Host "Historical generated PPU commit: $found"
-          git show --no-patch --format="  %H %cI %s" $found
-
-      - name: Snapshot fresh generated PPU manifest
-        if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
-        shell: pwsh
-        run: |
-          $manifest = Join-Path $env:RUNNER_TEMP "ppu-generated-fresh.txt"
-          "kind=fresh" | Set-Content -Path $manifest -Encoding utf8
-          "source_commit=$env:GITHUB_SHA" | Add-Content -Path $manifest -Encoding utf8
-          Get-ChildItem -LiteralPath "eboot_port\recompiled" -File | Sort-Object Name | ForEach-Object {
-            $hash = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant()
-            "$($_.Name)`t$($_.Length)`t$hash" | Add-Content -Path $manifest -Encoding utf8
-          }
-          Get-Content $manifest
-
-      - name: Restore historical generated PPU tree from Git
-        if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
-        shell: pwsh
-        env:
-          HISTORICAL_PPU_COMMIT: ${{ steps.historical_ppu.outputs.commit }}
-        run: |
-          $historicalRoot = Join-Path $env:RUNNER_TEMP "ps3recomp-historical-ppu"
-          Remove-Item -Recurse -Force $historicalRoot -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force -Path $historicalRoot | Out-Null
-
-          # Export only the generated tree; the rest of the build stays on HEAD.
-          $archive = Join-Path $env:RUNNER_TEMP "historical-ppu.tar"
-          Remove-Item -Force $archive -ErrorAction SilentlyContinue
-          git archive --format=tar --output="$archive" $env:HISTORICAL_PPU_COMMIT eboot_port/recompiled
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          tar -xf $archive -C $historicalRoot
+          python -c 'from pathlib import Path; import hashlib, sys; p=Path("runtime/ppu/ppu_loader.cpp"); b=p.read_bytes(); s=b.decode("utf-8"); a=s.count("#if !defined(NDEBUG)"); c=s.count("#ifndef NDEBUG"); t=s.replace("#if !defined(NDEBUG)", "#if 1 /* AV_REPRO_PRE_V28: NDEBUG guard disabled */").replace("#ifndef NDEBUG", "#if 1 /* AV_REPRO_PRE_V28: NDEBUG guard disabled */"); (a+c)>0 or sys.exit("No NDEBUG guard found in ppu_loader.cpp"); p.write_text(t, encoding="utf-8", newline=""); print(f"patched_guards={a+c}"); print(f"sha256={hashlib.sha256(p.read_bytes()).hexdigest()}")'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          $restored = Join-Path $historicalRoot "eboot_port\recompiled"
-          if (-not (Test-Path -LiteralPath "$restored\ppu_recomp_000.cpp" -PathType Leaf)) {
-            throw "Historical commit did not export ppu_recomp_000.cpp as expected."
+          $patchedGuards = @(Select-String -Path runtime/ppu/ppu_loader.cpp -Pattern 'AV_REPRO_PRE_V28').Count
+          if ($patchedGuards -le 0) {
+            throw "python -c reported success but no AV_REPRO_PRE_V28 guards are present"
           }
+          "patched_guards=$patchedGuards" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          $sha = (Get-FileHash -Algorithm SHA256 runtime/ppu/ppu_loader.cpp).Hash.ToLowerInvariant()
+          "sha256=$sha" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
-          Remove-Item -Recurse -Force "eboot_port\recompiled" -ErrorAction SilentlyContinue
-          Copy-Item -Recurse -Force $restored "eboot_port\recompiled"
+          Write-Host "Runner-only ppu_loader Release instrumentation patch: $patchedGuards NDEBUG guard(s) forced on."
+          Write-Host "ppu_loader.cpp sha256=$sha"
+          Write-Host "Relevant instrumentation still present after patch:"
+          Select-String -Path runtime/ppu/ppu_loader.cpp -Pattern 'WARN2_WW_ARM|CreateToolhelp32Snapshot|AddVectoredExceptionHandler|VirtualProtect|SuspendThread|GetThreadContext|ResumeThread' |
+            Select-Object -First 40 |
+            ForEach-Object { Write-Host "  $($_.LineNumber): $($_.Line.Trim())" }
+          git diff -- runtime/ppu/ppu_loader.cpp | Select-Object -First 160
 
-          Write-Host "Historical generated PPU tree restored into runner working tree."
-          Get-ChildItem -LiteralPath "eboot_port\recompiled" -File | Sort-Object Name | ForEach-Object {
-            $hash = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant()
-            Write-Host "  $($_.Name) $($_.Length) bytes sha256=$hash"
-          }
-
-      - name: Build eboot_port (Historical generated PPU)
+      - name: Build eboot_port (Pre-v28 instrumentation repro)
         if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
         run: |
-          Remove-Item -Recurse -Force "eboot_port/build-historical" -ErrorAction SilentlyContinue
-          cmake -S eboot_port -B eboot_port/build-historical -G Ninja `
+          Remove-Item -Recurse -Force "eboot_port/build-pre-v28-repro" -ErrorAction SilentlyContinue
+          cmake -S eboot_port -B eboot_port/build-pre-v28-repro -G Ninja `
             -DCMAKE_C_COMPILER=clang-cl `
             -DCMAKE_CXX_COMPILER=clang-cl `
             -DCMAKE_BUILD_TYPE=Release `
@@ -424,34 +383,33 @@ jobs:
             -DPS3RECOMP_FFMPEG_ROOT="$env:PS3RECOMP_FFMPEG_ROOT" `
             -DPS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE=OFF
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          cmake --build eboot_port/build-historical
+          cmake --build eboot_port/build-pre-v28-repro
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          Copy-Item "$env:PS3RECOMP_FFMPEG_ROOT\bin\*.dll" "eboot_port\build-historical\" -Force
+          Copy-Item "$env:PS3RECOMP_FFMPEG_ROOT\bin\*.dll" "eboot_port\build-pre-v28-repro\" -Force
 
-      - name: Write historical generated PPU manifest
+      - name: Write pre-v28 instrumentation repro manifest
         if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
         shell: pwsh
         env:
-          HISTORICAL_PPU_COMMIT: ${{ steps.historical_ppu.outputs.commit }}
+          PATCHED_GUARDS: ${{ steps.pre_v28_loader.outputs.patched_guards }}
+          PATCHED_LOADER_SHA256: ${{ steps.pre_v28_loader.outputs.sha256 }}
         run: |
-          $manifest = Join-Path $env:RUNNER_TEMP "ppu-generated-historical.txt"
-          "kind=historical" | Set-Content -Path $manifest -Encoding utf8
-          "generated_tree_commit=$env:HISTORICAL_PPU_COMMIT" | Add-Content -Path $manifest -Encoding utf8
+          $manifest = Join-Path $env:RUNNER_TEMP "av-repro-pre-v28-runtime.txt"
+          "kind=pre-v28-ppu-loader-instrumentation-repro" | Set-Content -Path $manifest -Encoding utf8
           "build_source_commit=$env:GITHUB_SHA" | Add-Content -Path $manifest -Encoding utf8
-          Get-ChildItem -LiteralPath "eboot_port\recompiled" -File | Sort-Object Name | ForEach-Object {
-            $hash = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant()
-            "$($_.Name)`t$($_.Length)`t$hash" | Add-Content -Path $manifest -Encoding utf8
-          }
+          "patched_ndebug_guards=$env:PATCHED_GUARDS" | Add-Content -Path $manifest -Encoding utf8
+          "patched_ppu_loader_sha256=$env:PATCHED_LOADER_SHA256" | Add-Content -Path $manifest -Encoding utf8
+          $exe = "eboot_port\build-pre-v28-repro\MyGameRecomp.exe"
+          $exeHash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
+          "exe_sha256=$exeHash" | Add-Content -Path $manifest -Encoding utf8
           Get-Content $manifest
 
-      - name: Upload historical-generated Release Artifact
+      - name: Upload pre-v28 instrumentation repro Release Artifact
         if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
         uses: actions/upload-artifact@v4
         with:
-          name: MyGameRecomp-Windows-Release-HistoricalGenerated
+          name: MyGameRecomp-Windows-Release-PreV28InstrumentationRepro
           path: |
-            eboot_port/build-historical/MyGameRecomp.exe
-            eboot_port/build-historical/*.dll
-            ${{ runner.temp }}/ppu-generated-fresh.txt
-            ${{ runner.temp }}/ppu-generated-historical.txt
-
+            eboot_port/build-pre-v28-repro/MyGameRecomp.exe
+            eboot_port/build-pre-v28-repro/*.dll
+            ${{ runner.temp }}/av-repro-pre-v28-runtime.txt
