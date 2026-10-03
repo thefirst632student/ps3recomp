@@ -234,8 +234,27 @@ static DWORD WINAPI frame_clock(LPVOID)
             }
 
             if (rsx_backend_pump() != 0) {
-                rsx_ok = 0;              /* window closed */
-                continue;
+                /* WM_CLOSE/WM_QUIT is a HOST quit request, not merely a reason
+                 * to stop presenting.  ppu_run() owns the main thread and may
+                 * remain inside guest code indefinitely; if this frame-clock
+                 * thread only clears rsx_ok, every guest/audio worker keeps
+                 * running after the window disappears (BGM can play to EOF).
+                 *
+                 * Terminate the host process from here, after the backend has
+                 * finished dispatching the Win32 close message.  Do not call
+                 * this from WndProc itself: tearing the process down while
+                 * DispatchMessage is still on the callback stack makes close
+                 * handling needlessly re-entrant.  A host-window close is the
+                 * equivalent of the user killing the console process; it must
+                 * not wait for the guest to reach sys_process_exit(). */
+                fprintf(stderr, "[host] window closed -- terminating guest process\n");
+                fflush(stdout);
+                fflush(stderr);
+#ifdef _WIN32
+                ExitProcess(0);
+#else
+                exit(0);
+#endif
             }
             /* Present on a guest flip. A present on a fixed clock can catch the
              * drain mid-frame and flash a partial one. Before the first flip
