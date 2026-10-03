@@ -4393,6 +4393,142 @@ static int off_rt_find(u32 off)
     return -1;
 }
 
+/* Ordered RSX 2D blits whose source is a GPU render target.
+ *
+ * cellGcmSys emulates ordinary NV3089 transfers in guest RAM.  That is correct
+ * for CPU-backed images, but not for a source surface rendered by D3D12: the
+ * guest-memory shadow has not received the 3D draw.  Keep a small identity map
+ * from the NV3089 destination texture to its GPU RT producer.  The draw replay
+ * then samples that RT directly and existing off_rt_transition() supplies the
+ * required render-target -> shader-resource barrier in-order. */
+typedef struct D3D12BlitAlias {
+    u32 dst_raw;
+    u32 src_raw;
+    u32 in_w, in_h;
+    u32 out_w, out_h;
+    u32 ds_dx, dt_dy;
+    u32 fmt;
+    u32 serial;
+} D3D12BlitAlias;
+
+#define MAX_BLIT_ALIASES 32
+static D3D12BlitAlias s_blit_alias[MAX_BLIT_ALIASES];
+static u32 s_blit_alias_serial = 0;
+
+static int pending_rt_find(u32 raw, u32* out_w, u32* out_h)
+{
+    int rt = off_rt_find(raw);
+    if (rt >= 0) {
+        if (out_w) *out_w = s_d3d.off_rt[rt].w;
+        if (out_h) *out_h = s_d3d.off_rt[rt].h;
+        return 1;
+    }
+    for (u32 d = 0; d < s_d3d.draw_count && d < MAX_DRAWS; d++) {
+        D3D12DrawRecord* dr = &s_d3d.draws[d];
+        if (dr->rt_off == raw) {
+            if (out_w) *out_w = dr->rt_w;
+            if (out_h) *out_h = dr->rt_h;
+            return 1;
+        }
+        for (int m = 0; m < 3; m++) {
+            if (dr->rt_mrt[m] == raw) {
+                if (out_w) *out_w = dr->rt_w;
+                if (out_h) *out_h = dr->rt_h;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static void blit_alias_forget(u32 dst_raw)
+{
+    for (int i = 0; i < MAX_BLIT_ALIASES; i++)
+        if (s_blit_alias[i].dst_raw == dst_raw)
+            memset(&s_blit_alias[i], 0, sizeof(s_blit_alias[i]));
+}
+
+int rsx_d3d12_note_nv3089_blit(u32 src_raw, u32 dst_raw,
+                               u32 in_w, u32 in_h,
+                               u32 out_x, u32 out_y,
+                               u32 out_w, u32 out_h,
+                               u32 in_uv, u32 ds_dx, u32 dt_dy,
+                               u32 fmt)
+{
+    if (!src_raw || !dst_raw || !out_w || !out_h) return 0;
+
+    /* Any later CPU-backed write to the same destination invalidates an older
+     * GPU alias.  Re-add it below only when this exact source is GPU-backed. */
+    blit_alias_forget(dst_raw);
+
+    u32 rw = 0, rh = 0;
+    int gpu_src = pending_rt_find(src_raw, &rw, &rh);
+    { static int fn = 0;
+      if (out_w == s_d3d.width && out_h == s_d3d.height && fn++ < 16)
+          fprintf(stderr,
+                  "[NV3089-FULL] dst=0x%08X <- src=0x%08X in=%ux%u out=%ux%u xy=%u,%u uv=0x%08X scale=%08X/%08X gpu=%d rt=%ux%u fmt=0x%X%c",
+                  dst_raw, src_raw, in_w, in_h, out_w, out_h, out_x, out_y,
+                  in_uv, ds_dx, dt_dy, gpu_src, rw, rh, fmt, 10); }
+    if (!gpu_src) return 0;
+
+    /* Direct normalized sampling is equivalent to a full-image scale only.
+     * Subrect/atlas blits still need the CPU path (or a future explicit GPU
+     * blit op), so do not silently reinterpret them as whole-texture aliases. */
+    if (out_x != 0 || out_y != 0 || in_uv != 0 || !in_w || !in_h ||
+        (rw && rh && (rw != in_w || rh != in_h))) {
+        static int rn = 0;
+        if (rn++ < 12)
+            fprintf(stderr,
+                    "[NV3089-GPU] conservative reject dst=0x%08X src=0x%08X in=%ux%u rt=%ux%u out=%ux%u xy=%u,%u uv=0x%08X%c",
+                    dst_raw, src_raw, in_w, in_h, rw, rh, out_w, out_h,
+                    out_x, out_y, in_uv, 10);
+        return 0;
+    }
+
+    int slot = -1;
+    for (int i = 0; i < MAX_BLIT_ALIASES; i++) {
+        if (!s_blit_alias[i].dst_raw) { slot = i; break; }
+    }
+    if (slot < 0) {
+        /* Replace the oldest entry. */
+        u32 best = ~0u;
+        for (int i = 0; i < MAX_BLIT_ALIASES; i++)
+            if (s_blit_alias[i].serial < best) { best = s_blit_alias[i].serial; slot = i; }
+    }
+
+    D3D12BlitAlias* a = &s_blit_alias[slot];
+    a->dst_raw = dst_raw;
+    a->src_raw = src_raw;
+    a->in_w = in_w; a->in_h = in_h;
+    a->out_w = out_w; a->out_h = out_h;
+    a->ds_dx = ds_dx; a->dt_dy = dt_dy;
+    a->fmt = fmt; a->serial = ++s_blit_alias_serial;
+
+    { static int n = 0;
+      if (n++ < 12)
+          fprintf(stderr,
+                  "[NV3089-GPU] dst=0x%08X %ux%u <- RT src=0x%08X %ux%u scale=%08X/%08X fmt=0x%X%c",
+                  dst_raw, out_w, out_h, src_raw, in_w, in_h,
+                  ds_dx, dt_dy, fmt, 10); }
+    return 1;
+}
+
+static int blit_alias_rt(u32 dst_raw, u32 tex_w, u32 tex_h, u32* src_raw)
+{
+    D3D12BlitAlias* best = NULL;
+    for (int i = 0; i < MAX_BLIT_ALIASES; i++) {
+        D3D12BlitAlias* a = &s_blit_alias[i];
+        if (a->dst_raw != dst_raw) continue;
+        if (a->out_w != tex_w || a->out_h != tex_h) continue;
+        if (!best || a->serial > best->serial) best = a;
+    }
+    if (!best) return -1;
+    int rt = off_rt_find(best->src_raw);
+    if (rt < 0) return -1;
+    if (src_raw) *src_raw = best->src_raw;
+    return rt;
+}
+
 /* Ensure an RT resource exists for this surface; (re)creates the RTV at
  * rt_rtv_heap[i] and the SRV at srv_heap[RT_SRV_BASE+i]. */
 static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
@@ -5417,10 +5553,22 @@ static void render_frame(void)
             }
             if (dr->tex[_u].set) {
                 int rt = off_rt_find(dr->tex[_u].raw);
+                u32 alias_src = 0;
+                if (rt < 0)
+                    rt = blit_alias_rt(dr->tex[_u].raw, dr->tex[_u].w,
+                                       dr->tex[_u].h, &alias_src);
                 if (rt >= 0) {
                     dr->tex_rt[_u] = rt;
                     srv_write(wslot, s_d3d.off_rt[rt].res, (DXGI_FORMAT)s_d3d.off_rt[rt].dxgi,
                               D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+                    if (alias_src) {
+                        static int n = 0;
+                        if (n++ < 12)
+                            fprintf(stderr,
+                                    "[RTT-BLIT] texture dst=0x%08X %ux%u -> RT src=0x%08X slot=%d%c",
+                                    dr->tex[_u].raw, dr->tex[_u].w, dr->tex[_u].h,
+                                    alias_src, rt, 10);
+                    }
                     continue;
                 }
                 u32 _bf = dr->tex[_u].fmt & 0x9F;
@@ -8615,5 +8763,17 @@ void rsx_d3d12_backend_set_movie_mode(int on) { (void)on; }
 void rsx_d3d12_backend_submit_movie_rgba(const u8* rgba, u32 w, u32 h)
 { (void)rgba; (void)w; (void)h; }
 int rsx_d3d12_backend_movie_mode(void) { return 0; }
+int rsx_d3d12_note_nv3089_blit(u32 src_raw, u32 dst_raw,
+                               u32 in_w, u32 in_h,
+                               u32 out_x, u32 out_y,
+                               u32 out_w, u32 out_h,
+                               u32 in_uv, u32 ds_dx, u32 dt_dy,
+                               u32 fmt)
+{
+    (void)src_raw; (void)dst_raw; (void)in_w; (void)in_h;
+    (void)out_x; (void)out_y; (void)out_w; (void)out_h;
+    (void)in_uv; (void)ds_dx; (void)dt_dy; (void)fmt;
+    return 0;
+}
 
 #endif /* _WIN32 */

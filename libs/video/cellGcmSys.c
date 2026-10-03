@@ -872,6 +872,20 @@ static u32 s_fifo_calloff = 0;
  * -----------------------------------------------------------------------*/
 extern u32 cellGcmResolveLocated(int local, u32 offset);
 
+/* D3D12 keeps render targets on the GPU.  A linear NV3089 copy whose source
+ * is one of those targets must not immediately read the corresponding guest
+ * VRAM: that memory is only a shadow and may still contain the previous frame.
+ * The backend can preserve the RSX producer -> blit -> consumer dependency by
+ * aliasing the destination texture to the GPU RT.  Return non-zero only when
+ * the backend can satisfy this blit; otherwise nv3089_blit keeps the existing
+ * CPU implementation unchanged.  The non-Windows backend provides a stub. */
+extern int rsx_d3d12_note_nv3089_blit(u32 src_raw, u32 dst_raw,
+                                      u32 in_w, u32 in_h,
+                                      u32 out_x, u32 out_y,
+                                      u32 out_w, u32 out_h,
+                                      u32 in_uv, u32 ds_dx, u32 dt_dy,
+                                      u32 fmt);
+
 static struct {
     u32 dst_dma;      /* NV3062 0x0188 SET_CONTEXT_DMA_IMAGE_DESTIN */
     u32 color_fmt;    /* NV3062 0x0300 SET_COLOR_FORMAT             */
@@ -1004,6 +1018,26 @@ static void nv3089_blit(void)
     int dst_local = (s_gcm2d.dst_dma  != 0xFEED0001u);
     u32 src = cellGcmResolveLocated(src_local, s_nv3089.in_off);
     u32 dst = cellGcmResolveLocated(dst_local, s_gcm2d.dst_offset);
+
+    /* The D3D12 renderer records 3D draws and executes them later.  Therefore
+     * guest VRAM at s_nv3089.in_off is not authoritative when that offset is a
+     * GPU render target: doing the CPU blit here copies stale pixels.  Let the
+     * backend keep this linear blit on-GPU when it recognizes the source.
+     *
+     * This is deliberately conservative.  The backend only accepts a full
+     * destination image with a zero source origin and a source RT matching the
+     * NV3089 input dimensions; every other transfer falls through unchanged. */
+    {
+        u32 in_w = s_nv3089.in_sz & 0xFFFFu;
+        u32 in_h = s_nv3089.in_sz >> 16;
+        if (rsx_d3d12_note_nv3089_blit(s_nv3089.in_off, s_gcm2d.dst_offset,
+                                       in_w, in_h, out_x, out_y, out_w, out_h,
+                                       s_nv3089.in_uv, s_nv3089.ds_dx,
+                                       s_nv3089.dt_dy, f)) {
+            return;
+        }
+    }
+
     u32 u0 = s_nv3089.in_uv & 0xFFFF, v0 = s_nv3089.in_uv >> 16;   /* 12.4 start */
     for (u32 y = 0; y < out_h; y++) {
         u64 sv = ((u64)v0 << 8) + (u64)y * s_nv3089.dt_dy;         /* 20.12 */
