@@ -371,36 +371,21 @@ jobs:
             ForEach-Object { Write-Host "  $($_.LineNumber): $($_.Line.Trim())" }
           git diff -- runtime/ppu/ppu_loader.cpp | Select-Object -First 160
 
-      # v26 introduced the Windows VERSIONINFO resource.  Keep the app.rc path
-      # itself so CMake/source ordering stays as close as possible to HEAD, but
-      # replace its contents with an empty resource script for this runner-only
-      # cumulative reproduction build.
-      - name: Remove v26 Windows VERSIONINFO with python -c
+      # v26 introduced a generated Windows VERSIONINFO resource.  The .rc file
+      # is created by CMake inside the build directory (it is not a tracked
+      # eboot_port/app.rc). Configure the second build first, locate the
+      # generated resource that actually contains VERSIONINFO, then use
+      # python -c to replace only that generated file with an empty resource
+      # script before compilation.
+      - name: Configure cumulative repro and remove generated v26 VERSIONINFO with python -c
         if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
         id: pre_v26_resource
         shell: pwsh
         run: |
-          python -c 'from pathlib import Path; import hashlib, sys; p=Path("eboot_port/app.rc"); p.is_file() or sys.exit("eboot_port/app.rc not found"); b=p.read_bytes(); txt=b.decode("utf-8-sig", errors="replace"); print(f"original_bytes={len(b)}"); print(f"original_sha256={hashlib.sha256(b).hexdigest()}"); print("versioninfo_tokens="+str(txt.upper().count("VERSIONINFO"))); p.write_text("// AV_REPRO_PRE_V26: VERSIONINFO intentionally removed for CI reproduction control" + chr(10), encoding="utf-8", newline=""); print(f"patched_sha256={hashlib.sha256(p.read_bytes()).hexdigest()}")'
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $reproBuild = "eboot_port/build-pre-v26-pre-v28-repro"
+          Remove-Item -Recurse -Force $reproBuild -ErrorAction SilentlyContinue
 
-          $rc = "eboot_port/app.rc"
-          $patchedText = Get-Content -LiteralPath $rc -Raw
-          if ($patchedText -notmatch 'AV_REPRO_PRE_V26') {
-            throw "python -c reported success but app.rc was not replaced"
-          }
-          $sha = (Get-FileHash -Algorithm SHA256 $rc).Hash.ToLowerInvariant()
-          "sha256=$sha" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          Write-Host "Runner-only Windows resource rollback applied."
-          Write-Host "app.rc sha256=$sha"
-          Write-Host "app.rc now contains:"
-          Get-Content -LiteralPath $rc
-          git diff -- eboot_port/app.rc | Select-Object -First 120
-
-      - name: Build eboot_port (Pre-v26 + pre-v28 cumulative repro)
-        if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
-        run: |
-          Remove-Item -Recurse -Force "eboot_port/build-pre-v26-pre-v28-repro" -ErrorAction SilentlyContinue
-          cmake -S eboot_port -B eboot_port/build-pre-v26-pre-v28-repro -G Ninja `
+          cmake -S eboot_port -B $reproBuild -G Ninja `
             -DCMAKE_C_COMPILER=clang-cl `
             -DCMAKE_CXX_COMPILER=clang-cl `
             -DCMAKE_BUILD_TYPE=Release `
@@ -408,6 +393,33 @@ jobs:
             -DPS3RECOMP_FFMPEG_ROOT="$env:PS3RECOMP_FFMPEG_ROOT" `
             -DPS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE=OFF
           if ($LASTEXITCODE -ne 0) { exit 1 }
+
+          python -c 'from pathlib import Path; import hashlib, sys; root=Path("eboot_port/build-pre-v26-pre-v28-repro"); cand=[]; [(cand.append((q,b,t))) for q in root.rglob("*.rc") for b in [q.read_bytes()] for t in [b.decode("utf-8-sig", errors="replace")] if "VERSIONINFO" in t.upper()]; len(cand)==1 or sys.exit("Expected exactly one generated *.rc containing VERSIONINFO under "+str(root)+", found "+str(len(cand))+": "+", ".join(str(x[0]) for x in cand)); q,b,t=cand[0]; print("resource_path="+str(q)); print("original_bytes="+str(len(b))); print("original_sha256="+hashlib.sha256(b).hexdigest()); print("versioninfo_tokens="+str(t.upper().count("VERSIONINFO"))); q.write_text("// AV_REPRO_PRE_V26: VERSIONINFO intentionally removed for CI reproduction control"+chr(10), encoding="utf-8", newline=""); print("patched_sha256="+hashlib.sha256(q.read_bytes()).hexdigest()); Path("eboot_port/build-pre-v26-pre-v28-repro/av_repro_resource_path.txt").write_text(str(q), encoding="utf-8")'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $pathFile = Join-Path $reproBuild "av_repro_resource_path.txt"
+          if (-not (Test-Path -LiteralPath $pathFile -PathType Leaf)) {
+            throw "python -c did not record the generated resource path"
+          }
+          $rc = (Get-Content -LiteralPath $pathFile -Raw).Trim()
+          if (-not (Test-Path -LiteralPath $rc -PathType Leaf)) {
+            throw "Generated resource selected by python -c no longer exists: $rc"
+          }
+          $patchedText = Get-Content -LiteralPath $rc -Raw
+          if ($patchedText -notmatch 'AV_REPRO_PRE_V26') {
+            throw "python -c reported success but generated resource was not replaced"
+          }
+
+          $sha = (Get-FileHash -Algorithm SHA256 $rc).Hash.ToLowerInvariant()
+          "sha256=$sha" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "path=$rc" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Runner-only Windows resource rollback applied to generated file: $rc"
+          Write-Host "generated app.rc sha256=$sha"
+          Get-Content -LiteralPath $rc
+
+      - name: Build eboot_port (Pre-v26 + pre-v28 cumulative repro)
+        if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
+        run: |
           cmake --build eboot_port/build-pre-v26-pre-v28-repro
           if ($LASTEXITCODE -ne 0) { exit 1 }
           echo Copy-Item "$env:PS3RECOMP_FFMPEG_ROOT\bin\*.dll" "eboot_port\build-pre-v26-pre-v28-repro\" -Force
