@@ -28,6 +28,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # v56 compares the freshly lifted output against the last generated
+          # eboot_port/recompiled tree that existed in repository history.
+          fetch-depth: 0
 
       # Puts cl, the Windows SDK and the MSVC headers on PATH. clang-cl needs
       # the MSVC headers even though it is doing the compiling, and the
@@ -313,7 +317,7 @@ jobs:
             Write-Host "  $($_.Name) ($($_.Length) bytes)"
           }
 
-      - name: Build eboot_port (Game Port)
+      - name: Build eboot_port (Fresh re-lift)
         if: steps.game_assets.outputs.enabled == 'true'
         run: |
           cmake -S eboot_port -B eboot_port/build -G Ninja `
@@ -328,11 +332,126 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           echo Copy-Item "$env:PS3RECOMP_FFMPEG_ROOT\bin\*.dll" "eboot_port\build\" -Force
 
-      - name: Upload eboot_port Artifact
+      - name: Upload fresh eboot_port Artifact
         if: steps.game_assets.outputs.enabled == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: MyGameRecomp-Windows-${{ matrix.build_type }}
+          name: MyGameRecomp-Windows-${{ matrix.build_type }}-Fresh
           path: |
             eboot_port/build/MyGameRecomp.exe
             eboot_port/build/*.dll
+
+      # v55 proved that a fresh re-lift is clean.  For Release, rebuild the
+      # exact same current runtime/toolchain against the last generated PPU tree
+      # that was actually tracked in Git.  This isolates generator-output drift
+      # from compiler/runtime drift without committing generated sources again.
+      - name: Locate last historical generated PPU tree
+        if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
+        id: historical_ppu
+        shell: pwsh
+        run: |
+          $path = "eboot_port/recompiled/ppu_recomp_000.cpp"
+          $commits = @(git rev-list HEAD -- $path)
+          $found = $null
+          foreach ($commit in $commits) {
+            git cat-file -e "${commit}:$path" 2>$null
+            if ($LASTEXITCODE -eq 0) {
+              $found = $commit
+              break
+            }
+          }
+          if ([string]::IsNullOrWhiteSpace($found)) {
+            throw "Could not find any Git commit containing $path. The historical A/B control cannot run."
+          }
+          "commit=$found" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Historical generated PPU commit: $found"
+          git show --no-patch --format="  %H %cI %s" $found
+
+      - name: Snapshot fresh generated PPU manifest
+        if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
+        shell: pwsh
+        run: |
+          $manifest = Join-Path $env:RUNNER_TEMP "ppu-generated-fresh.txt"
+          "kind=fresh" | Set-Content -Path $manifest -Encoding utf8
+          "source_commit=$env:GITHUB_SHA" | Add-Content -Path $manifest -Encoding utf8
+          Get-ChildItem -LiteralPath "eboot_port\recompiled" -File | Sort-Object Name | ForEach-Object {
+            $hash = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant()
+            "$($_.Name)`t$($_.Length)`t$hash" | Add-Content -Path $manifest -Encoding utf8
+          }
+          Get-Content $manifest
+
+      - name: Restore historical generated PPU tree from Git
+        if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
+        shell: pwsh
+        env:
+          HISTORICAL_PPU_COMMIT: ${{ steps.historical_ppu.outputs.commit }}
+        run: |
+          $historicalRoot = Join-Path $env:RUNNER_TEMP "ps3recomp-historical-ppu"
+          Remove-Item -Recurse -Force $historicalRoot -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $historicalRoot | Out-Null
+
+          # Export only the generated tree; the rest of the build stays on HEAD.
+          $archive = Join-Path $env:RUNNER_TEMP "historical-ppu.tar"
+          Remove-Item -Force $archive -ErrorAction SilentlyContinue
+          git archive --format=tar --output="$archive" $env:HISTORICAL_PPU_COMMIT eboot_port/recompiled
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          tar -xf $archive -C $historicalRoot
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $restored = Join-Path $historicalRoot "eboot_port\recompiled"
+          if (-not (Test-Path -LiteralPath "$restored\ppu_recomp_000.cpp" -PathType Leaf)) {
+            throw "Historical commit did not export ppu_recomp_000.cpp as expected."
+          }
+
+          Remove-Item -Recurse -Force "eboot_port\recompiled" -ErrorAction SilentlyContinue
+          Copy-Item -Recurse -Force $restored "eboot_port\recompiled"
+
+          Write-Host "Historical generated PPU tree restored into runner working tree."
+          Get-ChildItem -LiteralPath "eboot_port\recompiled" -File | Sort-Object Name | ForEach-Object {
+            $hash = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant()
+            Write-Host "  $($_.Name) $($_.Length) bytes sha256=$hash"
+          }
+
+      - name: Build eboot_port (Historical generated PPU)
+        if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
+        run: |
+          Remove-Item -Recurse -Force "eboot_port/build-historical" -ErrorAction SilentlyContinue
+          cmake -S eboot_port -B eboot_port/build-historical -G Ninja `
+            -DCMAKE_C_COMPILER=clang-cl `
+            -DCMAKE_CXX_COMPILER=clang-cl `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DPS3RECOMP_REQUIRE_FFMPEG=ON `
+            -DPS3RECOMP_FFMPEG_ROOT="$env:PS3RECOMP_FFMPEG_ROOT" `
+            -DPS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE=OFF
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          cmake --build eboot_port/build-historical
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Copy-Item "$env:PS3RECOMP_FFMPEG_ROOT\bin\*.dll" "eboot_port\build-historical\" -Force
+
+      - name: Write historical generated PPU manifest
+        if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
+        shell: pwsh
+        env:
+          HISTORICAL_PPU_COMMIT: ${{ steps.historical_ppu.outputs.commit }}
+        run: |
+          $manifest = Join-Path $env:RUNNER_TEMP "ppu-generated-historical.txt"
+          "kind=historical" | Set-Content -Path $manifest -Encoding utf8
+          "generated_tree_commit=$env:HISTORICAL_PPU_COMMIT" | Add-Content -Path $manifest -Encoding utf8
+          "build_source_commit=$env:GITHUB_SHA" | Add-Content -Path $manifest -Encoding utf8
+          Get-ChildItem -LiteralPath "eboot_port\recompiled" -File | Sort-Object Name | ForEach-Object {
+            $hash = (Get-FileHash -Algorithm SHA256 $_.FullName).Hash.ToLowerInvariant()
+            "$($_.Name)`t$($_.Length)`t$hash" | Add-Content -Path $manifest -Encoding utf8
+          }
+          Get-Content $manifest
+
+      - name: Upload historical-generated Release Artifact
+        if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: MyGameRecomp-Windows-Release-HistoricalGenerated
+          path: |
+            eboot_port/build-historical/MyGameRecomp.exe
+            eboot_port/build-historical/*.dll
+            ${{ runner.temp }}/ppu-generated-fresh.txt
+            ${{ runner.temp }}/ppu-generated-historical.txt
+
