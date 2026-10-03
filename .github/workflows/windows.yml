@@ -330,7 +330,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           cmake --build eboot_port/build
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          echo Copy-Item "$env:PS3RECOMP_FFMPEG_ROOT\bin\*.dll" "eboot_port\build\" -Force
+          Copy-Item "$env:PS3RECOMP_FFMPEG_ROOT\bin\*.dll" "eboot_port\build\" -Force
 
       - name: Upload current fresh eboot_port Artifact
         if: steps.game_assets.outputs.enabled == 'true'
@@ -341,7 +341,7 @@ jobs:
             eboot_port/build/MyGameRecomp.exe
             eboot_port/build/*.dll
 
-      # v57 reproduction control: v28 made the genuine ppu_loader debug/dev
+      # v58 cumulative reproduction control: v28 made the genuine ppu_loader debug/dev
       # instrumentation Debug-only by wrapping it in NDEBUG guards.  Keep every
       # other HEAD source and the freshly lifted PPU output unchanged, then use
       # python -c to make those ppu_loader guards always-on for the second
@@ -371,11 +371,36 @@ jobs:
             ForEach-Object { Write-Host "  $($_.LineNumber): $($_.Line.Trim())" }
           git diff -- runtime/ppu/ppu_loader.cpp | Select-Object -First 160
 
-      - name: Build eboot_port (Pre-v28 instrumentation repro)
+      # v26 introduced the Windows VERSIONINFO resource.  Keep the app.rc path
+      # itself so CMake/source ordering stays as close as possible to HEAD, but
+      # replace its contents with an empty resource script for this runner-only
+      # cumulative reproduction build.
+      - name: Remove v26 Windows VERSIONINFO with python -c
+        if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
+        id: pre_v26_resource
+        shell: pwsh
+        run: |
+          python -c 'from pathlib import Path; import hashlib, sys; p=Path("eboot_port/app.rc"); p.is_file() or sys.exit("eboot_port/app.rc not found"); b=p.read_bytes(); txt=b.decode("utf-8-sig", errors="replace"); print(f"original_bytes={len(b)}"); print(f"original_sha256={hashlib.sha256(b).hexdigest()}"); print("versioninfo_tokens="+str(txt.upper().count("VERSIONINFO"))); p.write_text("// AV_REPRO_PRE_V26: VERSIONINFO intentionally removed for CI reproduction control" + chr(10), encoding="utf-8", newline=""); print(f"patched_sha256={hashlib.sha256(p.read_bytes()).hexdigest()}")'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $rc = "eboot_port/app.rc"
+          $patchedText = Get-Content -LiteralPath $rc -Raw
+          if ($patchedText -notmatch 'AV_REPRO_PRE_V26') {
+            throw "python -c reported success but app.rc was not replaced"
+          }
+          $sha = (Get-FileHash -Algorithm SHA256 $rc).Hash.ToLowerInvariant()
+          "sha256=$sha" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Runner-only Windows resource rollback applied."
+          Write-Host "app.rc sha256=$sha"
+          Write-Host "app.rc now contains:"
+          Get-Content -LiteralPath $rc
+          git diff -- eboot_port/app.rc | Select-Object -First 120
+
+      - name: Build eboot_port (Pre-v26 + pre-v28 cumulative repro)
         if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
         run: |
-          Remove-Item -Recurse -Force "eboot_port/build-pre-v28-repro" -ErrorAction SilentlyContinue
-          cmake -S eboot_port -B eboot_port/build-pre-v28-repro -G Ninja `
+          Remove-Item -Recurse -Force "eboot_port/build-pre-v26-pre-v28-repro" -ErrorAction SilentlyContinue
+          cmake -S eboot_port -B eboot_port/build-pre-v26-pre-v28-repro -G Ninja `
             -DCMAKE_C_COMPILER=clang-cl `
             -DCMAKE_CXX_COMPILER=clang-cl `
             -DCMAKE_BUILD_TYPE=Release `
@@ -383,33 +408,36 @@ jobs:
             -DPS3RECOMP_FFMPEG_ROOT="$env:PS3RECOMP_FFMPEG_ROOT" `
             -DPS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE=OFF
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          cmake --build eboot_port/build-pre-v28-repro
+          cmake --build eboot_port/build-pre-v26-pre-v28-repro
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          Copy-Item "$env:PS3RECOMP_FFMPEG_ROOT\bin\*.dll" "eboot_port\build-pre-v28-repro\" -Force
+          Copy-Item "$env:PS3RECOMP_FFMPEG_ROOT\bin\*.dll" "eboot_port\build-pre-v26-pre-v28-repro\" -Force
 
-      - name: Write pre-v28 instrumentation repro manifest
+      - name: Write pre-v26 + pre-v28 cumulative repro manifest
         if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
         shell: pwsh
         env:
           PATCHED_GUARDS: ${{ steps.pre_v28_loader.outputs.patched_guards }}
           PATCHED_LOADER_SHA256: ${{ steps.pre_v28_loader.outputs.sha256 }}
+          PATCHED_APP_RC_SHA256: ${{ steps.pre_v26_resource.outputs.sha256 }}
         run: |
-          $manifest = Join-Path $env:RUNNER_TEMP "av-repro-pre-v28-runtime.txt"
-          "kind=pre-v28-ppu-loader-instrumentation-repro" | Set-Content -Path $manifest -Encoding utf8
+          $manifest = Join-Path $env:RUNNER_TEMP "av-repro-pre-v26-pre-v28.txt"
+          "kind=pre-v26-versioninfo-plus-pre-v28-ppu-loader-repro" | Set-Content -Path $manifest -Encoding utf8
           "build_source_commit=$env:GITHUB_SHA" | Add-Content -Path $manifest -Encoding utf8
           "patched_ndebug_guards=$env:PATCHED_GUARDS" | Add-Content -Path $manifest -Encoding utf8
           "patched_ppu_loader_sha256=$env:PATCHED_LOADER_SHA256" | Add-Content -Path $manifest -Encoding utf8
-          $exe = "eboot_port\build-pre-v28-repro\MyGameRecomp.exe"
+          "patched_app_rc_sha256=$env:PATCHED_APP_RC_SHA256" | Add-Content -Path $manifest -Encoding utf8
+          "windows_versioninfo=removed" | Add-Content -Path $manifest -Encoding utf8
+          $exe = "eboot_port\build-pre-v26-pre-v28-repro\MyGameRecomp.exe"
           $exeHash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
           "exe_sha256=$exeHash" | Add-Content -Path $manifest -Encoding utf8
           Get-Content $manifest
 
-      - name: Upload pre-v28 instrumentation repro Release Artifact
+      - name: Upload pre-v26 + pre-v28 cumulative repro Release Artifact
         if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
         uses: actions/upload-artifact@v4
         with:
-          name: MyGameRecomp-Windows-Release-PreV28InstrumentationRepro
+          name: MyGameRecomp-Windows-Release-PreV26PreV28CumulativeRepro
           path: |
-            eboot_port/build-pre-v28-repro/MyGameRecomp.exe
-            eboot_port/build-pre-v28-repro/*.dll
-            ${{ runner.temp }}/av-repro-pre-v28-runtime.txt
+            eboot_port/build-pre-v26-pre-v28-repro/MyGameRecomp.exe
+            eboot_port/build-pre-v26-pre-v28-repro/*.dll
+            ${{ runner.temp }}/av-repro-pre-v26-pre-v28.txt
