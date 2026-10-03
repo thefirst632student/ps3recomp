@@ -80,6 +80,9 @@ static uint32_t read_be32(uint32_t addr)
  * -----------------------------------------------------------------------*/
 void lbp_hang_census(void)
 {
+#ifdef NDEBUG
+    return;
+#else
     uint32_t mgr = read_be32(0x009357B8);
     fprintf(stderr, "\n[HANGCENSUS] resource-manager mgr=0x%08X\n", mgr);
     const uint32_t qoff[3] = { 0x3C, 0x40, 0x44 };
@@ -137,6 +140,7 @@ void lbp_hang_census(void)
     }
 #endif
     fflush(stderr);
+#endif
 }
 
 /* ---------------------------------------------------------------------------
@@ -154,6 +158,9 @@ void lbp_hang_census(void)
  * -----------------------------------------------------------------------*/
 void lbp_unstick_once(void)
 {
+#ifdef NDEBUG
+    return;
+#else
 #ifdef _WIN32
     uint32_t mgr = read_be32(0x009357B8);
     if (!mgr) return;
@@ -180,6 +187,7 @@ void lbp_unstick_once(void)
         }
     }
 #endif
+#endif
 }
 
 /* ---------------------------------------------------------------------------
@@ -196,6 +204,9 @@ void lbp_unstick_once(void)
  * because such a caller is invariably spinning. */
 static void sem_report_bad_id(ppu_context* ctx, uint32_t sem_id, const char* op)
 {
+#ifdef NDEBUG
+    (void)ctx; (void)sem_id; (void)op;
+#else
     static int on = -1;
     if (on < 0) on = getenv("SEM_BADID") ? 1 : 0;
     if (!on) return;
@@ -211,6 +222,7 @@ static void sem_report_bad_id(ppu_context* ctx, uint32_t sem_id, const char* op)
     }
     fprintf(stderr, "%c", 10);
     fflush(stderr);
+#endif
 }
 
 int64_t sys_semaphore_create(ppu_context* ctx)

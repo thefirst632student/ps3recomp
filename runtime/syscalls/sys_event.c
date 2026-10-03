@@ -549,6 +549,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         }
     }
 
+#ifndef NDEBUG
     /* YDKJ_FAKECOMPLETE (diagnostic): the SPURS task-completion events the SPU
      * would post to q=2/q=3 never arrive (SPU video task not running), so the
      * main thread times out after 30s and the title tears down. Synthesize a
@@ -589,6 +590,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
 #endif
     }
 
+#endif
     /* Demand-driven sim-SPU dispatch. The game's persistent worker SPUs are
      * fed by event_port_send during ASSET LOAD, but its main loop never sends --
      * it just receives each worker's per-frame completion, expecting the SPU to

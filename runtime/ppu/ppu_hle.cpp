@@ -181,6 +181,7 @@ extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
+#ifndef NDEBUG
     /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
      * call it makes. WAITBT_EVERY only samples threads that are blocking on an
      * event queue, which misses a thread that stops looping while it is BUSY --
@@ -207,6 +208,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
           }
       } }
 
+#endif
     /* Preserve the caller TOC (r2) across the HLE call. ELFv1 makes r2 caller-saved
      * across a cross-module call: the glink stub does `std r2,40(r1)` before jumping and
      * the caller does `ld r2,40(r1)` after. Our HLE import stubs (`ps3_hle_call(nid);
@@ -239,8 +241,10 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
             fprintf(stderr, "[TUNERFIX] sysPrxForUser 0xE0998DBF -> 0x8001112E (profiler not loaded)\n");
         return;
     }
+#ifndef NDEBUG
     /* Guest-PC breadcrumb for the sampling profiler (see lv2_syscall). */
     ppu_prof_stamp(ctx, ppu_prof_resolve_host(__builtin_return_address(0)));
+#endif
     g_last_hle_nid = nid;
     /* Stamp the NAME here too, not only where a handler is found below.
      *
@@ -256,6 +260,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * now, overwritten with the real name once the handler is known. */
     g_last_hle_name = "(unimplemented)";
 
+#ifndef NDEBUG
     /* Boot trace: log the first N HLE calls (PS3_HLE_TRACE=N). Invaluable for
      * new-SDK bring-up (e.g. PSL1GHT) where the failure is "nothing happens". */
     static int s_trace = -2;
@@ -307,6 +312,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
           fprintf(stderr,"%s\n",line); }
 #endif
     }
+#endif
     /* PPC64 ELFv1 cross-module ABI: the caller restores its TOC right after the
      * call with `ld r2, 0x28(r1)`, expecting the import stub to have saved the
      * caller's r2 into that slot. The real .lib.stub trampoline did this; the

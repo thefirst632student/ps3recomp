@@ -20,14 +20,6 @@ option(PS3RECOMP_FAST_DEBUG
     "Keep Debug symbols/asserts while using optimized Debug codegen" ON)
 option(PS3RECOMP_FAST_DEBUG_RUNTIME
     "Also optimize host runtime/HLE in Debug" ON)
-option(PS3RECOMP_RELEASE_RUNTIME_BISECT_O1
-    "Bisect Defender false-positive by compiling only ps3recomp_runtime at O1 in Release" OFF)
-option(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_O1
-    "Legacy whole-lifted-PPU Defender bisect at O1 in Release" OFF)
-set(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE "A2A1B1" CACHE STRING
-    "Defender bisect for lifted PPU Release codegen: OFF, A1, A2, A2A, A2A1, A2A1A, A2A1B, A2A1B1, A2A1B2, A2A2, A2B, or B")
-set_property(CACHE PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE PROPERTY STRINGS
-    OFF A1 A2 A2A A2A1 A2A1A A2A1B A2A1B1 A2A1B2 A2A2 A2B B)
 
 # Prefer Ninja if available
 if(NOT CMAKE_GENERATOR MATCHES "Ninja" AND NOT DEFINED ENV{CMAKE_GENERATOR})
@@ -55,17 +47,9 @@ get_filename_component(PS3RECOMP_DIR "${PS3RECOMP_DIR}" ABSOLUTE)
 set(RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/recompiled" CACHE PATH
     "Directory holding the lifter's output: ppu_recomp.h and the lifted sources")
 get_filename_component(RECOMP_DIR "${RECOMP_DIR}" ABSOLUTE)
-set(PS3RECOMP_AV_BISECT_DIR "" CACHE PATH
-    "Optional build-time PPU function-bisect shards; original recompiled/ sources remain read-only")
-if(PS3RECOMP_AV_BISECT_DIR)
-    get_filename_component(PS3RECOMP_AV_BISECT_DIR "${PS3RECOMP_AV_BISECT_DIR}" ABSOLUTE)
-endif()
 
 message(STATUS "ps3recomp SDK:   ${PS3RECOMP_DIR}")
 message(STATUS "Lifted output:   ${RECOMP_DIR}")
-if(PS3RECOMP_AV_BISECT_DIR)
-    message(STATUS "AV bisect shards: ${PS3RECOMP_AV_BISECT_DIR}")
-endif()
 
 if(NOT EXISTS "${RECOMP_DIR}/ppu_recomp.h")
     message(FATAL_ERROR
@@ -81,78 +65,12 @@ file(GLOB RECOMP_SOURCES CONFIGURE_DEPENDS
     "${RECOMP_DIR}/*.c"
     "${RECOMP_DIR}/*.cpp"
 )
-# Keep Defender bisects reproducible across filesystems/generators.
-list(SORT RECOMP_SOURCES)
 if(NOT RECOMP_SOURCES)
     message(FATAL_ERROR
         "${RECOMP_DIR} has a ppu_recomp.h but no .c or .cpp beside it. The "
         "lifted functions and the function table live in those; without them "
         "there is nothing to run.")
 endif()
-
-# V52 single-TU control. Build-time AV experiments live OUTSIDE recompiled/.
-# Replace the original numbered ppu_recomp_NNN source at the SAME list position
-# rather than removing it and re-sorting the whole source list. That preserves
-# link/object ordering as closely as possible while allowing a byte-identical
-# temporary source copy (v52) and later single-TU function-codegen experiments.
-set(PS3RECOMP_AV_BISECT_SOURCES "")
-set(PS3RECOMP_AV_BISECT_O1_SOURCES "")
-if(PS3RECOMP_AV_BISECT_DIR)
-    file(GLOB PS3RECOMP_AV_BISECT_SOURCES CONFIGURE_DEPENDS
-        "${PS3RECOMP_AV_BISECT_DIR}/ppu_recomp_*_av_*.c"
-        "${PS3RECOMP_AV_BISECT_DIR}/ppu_recomp_*_av_*.cpp")
-    list(SORT PS3RECOMP_AV_BISECT_SOURCES)
-    if(NOT PS3RECOMP_AV_BISECT_SOURCES)
-        message(FATAL_ERROR
-            "PS3RECOMP_AV_BISECT_DIR=${PS3RECOMP_AV_BISECT_DIR} has no ppu_recomp_*_av_* sources.")
-    endif()
-
-    # All AV sources in one experiment must replace exactly one numbered lifted
-    # TU. Derive that original basename from ppu_recomp_NNN_av_*.cpp and splice
-    # the replacement(s) into the original list slot. Do not sort afterwards.
-    set(_av_original_base "")
-    foreach(_av_src IN LISTS PS3RECOMP_AV_BISECT_SOURCES)
-        get_filename_component(_av_name "${_av_src}" NAME_WE)
-        string(REGEX REPLACE "_av_.*$" "" _av_base "${_av_name}")
-        if(NOT _av_original_base)
-            set(_av_original_base "${_av_base}")
-        elseif(NOT _av_original_base STREQUAL _av_base)
-            message(FATAL_ERROR
-                "PS3RECOMP_AV_BISECT_DIR must replace one numbered TU at a time; "
-                "found ${_av_original_base} and ${_av_base}")
-        endif()
-        if(_av_src MATCHES "_av_01_o1\.(c|cpp)$")
-            list(APPEND PS3RECOMP_AV_BISECT_O1_SOURCES "${_av_src}")
-        endif()
-    endforeach()
-
-    set(_av_original_source "")
-    set(_av_original_index -1)
-    set(_av_scan_index 0)
-    foreach(_recomp_src IN LISTS RECOMP_SOURCES)
-        get_filename_component(_recomp_name "${_recomp_src}" NAME_WE)
-        if(_recomp_name STREQUAL _av_original_base)
-            set(_av_original_source "${_recomp_src}")
-            set(_av_original_index ${_av_scan_index})
-            break()
-        endif()
-        math(EXPR _av_scan_index "${_av_scan_index} + 1")
-    endforeach()
-    if(_av_original_index LESS 0)
-        message(FATAL_ERROR
-            "Could not find original lifted source ${_av_original_base}.c/.cpp in ${RECOMP_DIR}")
-    endif()
-
-    list(REMOVE_AT RECOMP_SOURCES ${_av_original_index})
-    list(INSERT RECOMP_SOURCES ${_av_original_index} ${PS3RECOMP_AV_BISECT_SOURCES})
-
-    list(LENGTH PS3RECOMP_AV_BISECT_SOURCES _av_source_count)
-    list(LENGTH PS3RECOMP_AV_BISECT_O1_SOURCES _av_o1_count)
-    message(STATUS
-        "Release build-time PPU AV control: replacing ${_av_original_source} in-place with "
-        "${_av_source_count} temporary source(s), ${_av_o1_count} at O1")
-endif()
-
 list(LENGTH RECOMP_SOURCES RECOMP_SOURCE_COUNT)
 message(STATUS "Lifted sources:  ${RECOMP_SOURCE_COUNT} file(s)")
 
@@ -383,167 +301,6 @@ if(PS3RECOMP_FAST_DEBUG)
         target_compile_options(${PROJECT_NAME} PRIVATE
             "$<$<CONFIG:Debug>:-O1>"
             "$<$<CONFIG:Debug>:-fno-omit-frame-pointer>")
-    endif()
-endif()
-
-# V41 lifted-PPU binary search.  V35 located the Defender-triggering Release
-# codegen in half A; v36 narrowed that to A2; v37 showed A2A is the culprit;
-# v39/v40 confirmed A2A1B is the culprit.  Split A2A1B once more and select
-# its first half (A2A1B1) by default.  Only selected numbered
-# ppu_recomp_NNN TU(s) are lowered to O1; helper sources, scaffold, runtime,
-# CRT, NDEBUG and linker settings remain normal Release.
-set(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES ${RECOMP_SOURCES})
-list(FILTER PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES INCLUDE
-    REGEX "ppu_recomp_[0-9]+\\.(c|cpp)$")
-list(SORT PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES)
-
-set(PS3RECOMP_RELEASE_LIFTED_PPU_O1_SOURCES "")
-if(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_O1 AND
-   PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES)
-    # Legacy whole-lifted mode retained for reproducing v34.
-    set(PS3RECOMP_RELEASE_LIFTED_PPU_O1_SOURCES
-        ${PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES})
-elseif(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES AND
-       NOT PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE STREQUAL "OFF")
-    set(_recomp_valid_slice FALSE)
-    foreach(_slice IN ITEMS A1 A2 A2A A2A1 A2A1A A2A1B A2A1B1 A2A1B2 A2A2 A2B B)
-        if(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE STREQUAL "${_slice}")
-            set(_recomp_valid_slice TRUE)
-        endif()
-    endforeach()
-    if(NOT _recomp_valid_slice)
-        message(FATAL_ERROR
-            "PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE must be OFF, A1, A2, A2A, A2A1, A2A1A, A2A1B, A2A1B1, A2A1B2, A2A2, A2B, or B")
-    endif()
-
-    list(LENGTH PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES _recomp_bisect_count)
-    # Preserve every earlier boundary exactly.
-    # A = ceil(N/2), A1 = ceil(A/2), A2 = A - A1.
-    math(EXPR _recomp_bisect_half "(${_recomp_bisect_count} + 1) / 2")
-    math(EXPR _recomp_bisect_a1_count "(${_recomp_bisect_half} + 1) / 2")
-    math(EXPR _recomp_bisect_a2_count
-        "${_recomp_bisect_half} - ${_recomp_bisect_a1_count}")
-    # V37 boundary: A2A = ceil(A2/2), A2B = remainder.
-    math(EXPR _recomp_bisect_a2a_count "(${_recomp_bisect_a2_count} + 1) / 2")
-    math(EXPR _recomp_bisect_a2b_count
-        "${_recomp_bisect_a2_count} - ${_recomp_bisect_a2a_count}")
-    # V38 boundary: A2A1 = ceil(A2A/2), A2A2 = remainder.
-    math(EXPR _recomp_bisect_a2a1_count "(${_recomp_bisect_a2a_count} + 1) / 2")
-    math(EXPR _recomp_bisect_a2a2_count
-        "${_recomp_bisect_a2a_count} - ${_recomp_bisect_a2a1_count}")
-    # V39 boundary: A2A1A = ceil(A2A1/2), A2A1B = remainder.
-    math(EXPR _recomp_bisect_a2a1a_count "(${_recomp_bisect_a2a1_count} + 1) / 2")
-    math(EXPR _recomp_bisect_a2a1b_count
-        "${_recomp_bisect_a2a1_count} - ${_recomp_bisect_a2a1a_count}")
-    # V41 boundary: A2A1B1 = ceil(A2A1B/2), A2A1B2 = remainder.
-    math(EXPR _recomp_bisect_a2a1b1_count "(${_recomp_bisect_a2a1b_count} + 1) / 2")
-    math(EXPR _recomp_bisect_a2a1b2_count
-        "${_recomp_bisect_a2a1b_count} - ${_recomp_bisect_a2a1b1_count}")
-    math(EXPR _recomp_bisect_a2_start "${_recomp_bisect_a1_count}")
-    math(EXPR _recomp_bisect_a2a1b_start
-        "${_recomp_bisect_a2_start} + ${_recomp_bisect_a2a1a_count}")
-    math(EXPR _recomp_bisect_a2a1b2_start
-        "${_recomp_bisect_a2a1b_start} + ${_recomp_bisect_a2a1b1_count}")
-    math(EXPR _recomp_bisect_a2a2_start
-        "${_recomp_bisect_a2_start} + ${_recomp_bisect_a2a1_count}")
-    math(EXPR _recomp_bisect_a2b_start
-        "${_recomp_bisect_a2_start} + ${_recomp_bisect_a2a_count}")
-
-    if(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE STREQUAL "A1")
-        list(SUBLIST PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES
-            0 ${_recomp_bisect_a1_count}
-            PS3RECOMP_RELEASE_LIFTED_PPU_O1_SOURCES)
-    elseif(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE STREQUAL "A2")
-        if(_recomp_bisect_a2_count GREATER 0)
-            list(SUBLIST PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES
-                ${_recomp_bisect_a2_start} ${_recomp_bisect_a2_count}
-                PS3RECOMP_RELEASE_LIFTED_PPU_O1_SOURCES)
-        endif()
-    elseif(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE STREQUAL "A2A")
-        if(_recomp_bisect_a2a_count GREATER 0)
-            list(SUBLIST PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES
-                ${_recomp_bisect_a2_start} ${_recomp_bisect_a2a_count}
-                PS3RECOMP_RELEASE_LIFTED_PPU_O1_SOURCES)
-        endif()
-    elseif(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE STREQUAL "A2A1")
-        if(_recomp_bisect_a2a1_count GREATER 0)
-            list(SUBLIST PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES
-                ${_recomp_bisect_a2_start} ${_recomp_bisect_a2a1_count}
-                PS3RECOMP_RELEASE_LIFTED_PPU_O1_SOURCES)
-        endif()
-    elseif(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE STREQUAL "A2A1A")
-        if(_recomp_bisect_a2a1a_count GREATER 0)
-            list(SUBLIST PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES
-                ${_recomp_bisect_a2_start} ${_recomp_bisect_a2a1a_count}
-                PS3RECOMP_RELEASE_LIFTED_PPU_O1_SOURCES)
-        endif()
-    elseif(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE STREQUAL "A2A1B")
-        if(_recomp_bisect_a2a1b_count GREATER 0)
-            list(SUBLIST PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES
-                ${_recomp_bisect_a2a1b_start} ${_recomp_bisect_a2a1b_count}
-                PS3RECOMP_RELEASE_LIFTED_PPU_O1_SOURCES)
-        endif()
-    elseif(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE STREQUAL "A2A1B1")
-        if(_recomp_bisect_a2a1b1_count GREATER 0)
-            list(SUBLIST PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES
-                ${_recomp_bisect_a2a1b_start} ${_recomp_bisect_a2a1b1_count}
-                PS3RECOMP_RELEASE_LIFTED_PPU_O1_SOURCES)
-        endif()
-    elseif(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE STREQUAL "A2A1B2")
-        if(_recomp_bisect_a2a1b2_count GREATER 0)
-            list(SUBLIST PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES
-                ${_recomp_bisect_a2a1b2_start} ${_recomp_bisect_a2a1b2_count}
-                PS3RECOMP_RELEASE_LIFTED_PPU_O1_SOURCES)
-        endif()
-    elseif(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE STREQUAL "A2A2")
-        if(_recomp_bisect_a2a2_count GREATER 0)
-            list(SUBLIST PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES
-                ${_recomp_bisect_a2a2_start} ${_recomp_bisect_a2a2_count}
-                PS3RECOMP_RELEASE_LIFTED_PPU_O1_SOURCES)
-        endif()
-    elseif(PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE STREQUAL "A2B")
-        if(_recomp_bisect_a2b_count GREATER 0)
-            list(SUBLIST PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES
-                ${_recomp_bisect_a2b_start} ${_recomp_bisect_a2b_count}
-                PS3RECOMP_RELEASE_LIFTED_PPU_O1_SOURCES)
-        endif()
-    else()
-        math(EXPR _recomp_bisect_b_count
-            "${_recomp_bisect_count} - ${_recomp_bisect_half}")
-        if(_recomp_bisect_b_count GREATER 0)
-            list(SUBLIST PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_CANDIDATES
-                ${_recomp_bisect_half} ${_recomp_bisect_b_count}
-                PS3RECOMP_RELEASE_LIFTED_PPU_O1_SOURCES)
-        endif()
-    endif()
-
-    list(LENGTH PS3RECOMP_RELEASE_LIFTED_PPU_O1_SOURCES _recomp_bisect_o1_count)
-    message(STATUS
-        "Release lifted-PPU Defender bisect slice ${PS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE}: "
-        "${_recomp_bisect_o1_count}/${_recomp_bisect_count} TU(s) at O1")
-endif()
-
-if(PS3RECOMP_RELEASE_LIFTED_PPU_O1_SOURCES)
-    if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" OR MSVC)
-        set_property(SOURCE ${PS3RECOMP_RELEASE_LIFTED_PPU_O1_SOURCES}
-            APPEND PROPERTY COMPILE_OPTIONS "$<$<CONFIG:Release>:/O1>")
-    elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        set_property(SOURCE ${PS3RECOMP_RELEASE_LIFTED_PPU_O1_SOURCES}
-            APPEND PROPERTY COMPILE_OPTIONS "$<$<CONFIG:Release>:-O1>")
-    endif()
-endif()
-
-# Build-time function-bisect shards use the same final-flag-wins mechanism as
-# the earlier TU bisect. In v51 control mode there are zero *_av_01_o1.cpp
-# files, so every shard remains normal Release. A later diagnostic can rename
-# only the selected shard to *_av_01_o1.cpp without changing split/layout logic.
-if(PS3RECOMP_AV_BISECT_O1_SOURCES)
-    if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" OR MSVC)
-        set_property(SOURCE ${PS3RECOMP_AV_BISECT_O1_SOURCES}
-            APPEND PROPERTY COMPILE_OPTIONS "$<$<CONFIG:Release>:/O1>")
-    elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        set_property(SOURCE ${PS3RECOMP_AV_BISECT_O1_SOURCES}
-            APPEND PROPERTY COMPILE_OPTIONS "$<$<CONFIG:Release>:-O1>")
     endif()
 endif()
 
