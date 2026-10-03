@@ -4408,6 +4408,7 @@ typedef struct D3D12BlitAlias {
     u32 out_w, out_h;
     u32 ds_dx, dt_dy;
     u32 fmt;
+    u32 src_kind;  /* 1 = offscreen RT, 2 = registered display snapshot */
     u32 serial;
 } D3D12BlitAlias;
 
@@ -4462,7 +4463,20 @@ int rsx_d3d12_note_nv3089_blit(u32 src_raw, u32 dst_raw,
     blit_alias_forget(dst_raw);
 
     u32 rw = 0, rh = 0;
-    int gpu_src = pending_rt_find(src_raw, &rw, &rh);
+    int gpu_src = pending_rt_find(src_raw, &rw, &rh) ? 1 : 0;
+    /* A registered display buffer is GPU-backed too.  The guest VRAM shadow
+     * is not updated by D3D12 draws, so a CPU NV3089 read from that address
+     * copies stale pixels.  s_screen_copy is the persistent GPU snapshot used
+     * by direct display-as-texture sampling; it is also the authoritative
+     * source for a full display -> texture blit. */
+    if (!gpu_src) {
+        extern int cellGcmOffsetIsDisplay(u32 offset);
+        if (cellGcmOffsetIsDisplay(src_raw) && s_screen_copy) {
+            gpu_src = 2;
+            rw = s_d3d.width;
+            rh = s_d3d.height;
+        }
+    }
     { static int fn = 0;
       if (out_w == s_d3d.width && out_h == s_d3d.height && fn++ < 16)
           fprintf(stderr,
@@ -4502,14 +4516,21 @@ int rsx_d3d12_note_nv3089_blit(u32 src_raw, u32 dst_raw,
     a->in_w = in_w; a->in_h = in_h;
     a->out_w = out_w; a->out_h = out_h;
     a->ds_dx = ds_dx; a->dt_dy = dt_dy;
-    a->fmt = fmt; a->serial = ++s_blit_alias_serial;
+    a->fmt = fmt; a->src_kind = (u32)gpu_src;
+    a->serial = ++s_blit_alias_serial;
 
     { static int n = 0;
-      if (n++ < 12)
-          fprintf(stderr,
-                  "[NV3089-GPU] dst=0x%08X %ux%u <- RT src=0x%08X %ux%u scale=%08X/%08X fmt=0x%X%c",
-                  dst_raw, out_w, out_h, src_raw, in_w, in_h,
-                  ds_dx, dt_dy, fmt, 10); }
+      if (n++ < 16) {
+          if (gpu_src == 2)
+              fprintf(stderr,
+                      "[NV3089-DISPLAY] dst=0x%08X %ux%u <- display src=0x%08X snapshot=%p fmt=0x%X%c",
+                      dst_raw, out_w, out_h, src_raw, (void*)s_screen_copy, fmt, 10);
+          else
+              fprintf(stderr,
+                      "[NV3089-GPU] dst=0x%08X %ux%u <- RT src=0x%08X %ux%u scale=%08X/%08X fmt=0x%X%c",
+                      dst_raw, out_w, out_h, src_raw, in_w, in_h,
+                      ds_dx, dt_dy, fmt, 10);
+      } }
     return 1;
 }
 
@@ -4522,11 +4543,26 @@ static int blit_alias_rt(u32 dst_raw, u32 tex_w, u32 tex_h, u32* src_raw)
         if (a->out_w != tex_w || a->out_h != tex_h) continue;
         if (!best || a->serial > best->serial) best = a;
     }
-    if (!best) return -1;
+    if (!best || best->src_kind != 1) return -1;
     int rt = off_rt_find(best->src_raw);
     if (rt < 0) return -1;
     if (src_raw) *src_raw = best->src_raw;
     return rt;
+}
+
+static ID3D12Resource* blit_alias_display(u32 dst_raw, u32 tex_w, u32 tex_h,
+                                          u32* src_raw)
+{
+    D3D12BlitAlias* best = NULL;
+    for (int i = 0; i < MAX_BLIT_ALIASES; i++) {
+        D3D12BlitAlias* a = &s_blit_alias[i];
+        if (a->dst_raw != dst_raw || a->src_kind != 2) continue;
+        if (a->out_w != tex_w || a->out_h != tex_h) continue;
+        if (!best || a->serial > best->serial) best = a;
+    }
+    if (!best || !s_screen_copy) return NULL;
+    if (src_raw) *src_raw = best->src_raw;
+    return s_screen_copy;
 }
 
 /* Ensure an RT resource exists for this surface; (re)creates the RTV at
@@ -5552,6 +5588,20 @@ static void render_frame(void)
                 }
             }
             if (dr->tex[_u].set) {
+                u32 display_alias_src = 0;
+                ID3D12Resource* display_alias = blit_alias_display(
+                    dr->tex[_u].raw, dr->tex[_u].w, dr->tex[_u].h,
+                    &display_alias_src);
+                if (display_alias) {
+                    srv_write(wslot, display_alias, DXGI_FORMAT_R8G8B8A8_UNORM,
+                              D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+                    { static int n = 0; if (n++ < 12)
+                        fprintf(stderr,
+                                "[SCREEN-BLIT] texture dst=0x%08X %ux%u -> display snapshot src=0x%08X%c",
+                                dr->tex[_u].raw, dr->tex[_u].w, dr->tex[_u].h,
+                                display_alias_src, 10); }
+                    continue;
+                }
                 int rt = off_rt_find(dr->tex[_u].raw);
                 u32 alias_src = 0;
                 if (rt < 0)
