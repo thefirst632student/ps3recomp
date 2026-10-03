@@ -2442,14 +2442,6 @@ extern "C" void ppu_unlifted_stub(uint64_t addr, ppu_context* ctx)
 /* The real lv2 syscall table (runtime/syscalls/lv2_register.c). */
 extern "C" int lv2_try_syscall(ppu_context* ctx);
 
-/* Pending GCM callbacks are normally pumped at HLE-import boundaries.  A title
- * can also wait for flip completion entirely through raw LV2 syscalls
- * (White Album 2 polls sys_timer_usleep(300)); without a pump here the guest
- * flip handler cannot run while that poll loop is active.  Pump before
- * dispatching the syscall, using cellGcmSys' serialized/non-reentrant pump,
- * so completion is delivered on the guest thread at the next syscall edge. */
-extern "C" void ppu_gcm_pump(void);
-
 /* lv2 syscall dispatch: r11 = syscall number, args in r3.. (PPC ABI).
  * A few syscalls the CRT needs at boot are handled inline (boot-tuned); the
  * rest are dispatched to the real lv2 table, and only genuinely-unregistered
@@ -2463,11 +2455,6 @@ extern "C" uint32_t g_sc_inflight[PS3_SC_INFLIGHT_MAX] = { 0 };
 extern "C" void lv2_syscall(ppu_context* ctx)
 {
     uint64_t num = ctx->gpr[11];
-
-    /* Raw syscalls are guest scheduling boundaries too.  In particular this
-     * lets a 300 us flip-wait loop observe the real 60 Hz completion callback
-     * instead of needing the old title-specific forced-completion write. */
-    ppu_gcm_pump();
 #ifndef NDEBUG
     /* One-shot: PPU_GUARD_EA=<hex> arms the page guard on that address without
      * waiting for a store watch to fire. Armed here because lv2_syscall runs
