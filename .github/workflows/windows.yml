@@ -28,10 +28,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          # v56 compares the freshly lifted output against the last generated
-          # eboot_port/recompiled tree that existed in repository history.
-          fetch-depth: 0
 
       # Puts cl, the Windows SDK and the MSVC headers on PATH. clang-cl needs
       # the MSVC headers even though it is doing the compiling, and the
@@ -317,7 +313,7 @@ jobs:
             Write-Host "  $($_.Name) ($($_.Length) bytes)"
           }
 
-      - name: Build eboot_port (Fresh re-lift)
+      - name: Build eboot_port (Game Port)
         if: steps.game_assets.outputs.enabled == 'true'
         run: |
           cmake -S eboot_port -B eboot_port/build -G Ninja `
@@ -330,250 +326,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           cmake --build eboot_port/build
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          echo Copy-Item "$env:PS3RECOMP_FFMPEG_ROOT\bin\*.dll" "eboot_port\build\" -Force
+          Copy-Item "$env:PS3RECOMP_FFMPEG_ROOT\bin\*.dll" "eboot_port\build\" -Force
 
-      - name: Upload current fresh eboot_port Artifact
+      - name: Upload eboot_port Artifact
         if: steps.game_assets.outputs.enabled == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: MyGameRecomp-Windows-${{ matrix.build_type }}-FreshCurrent
+          name: MyGameRecomp-Windows-${{ matrix.build_type }}
           path: |
             eboot_port/build/MyGameRecomp.exe
             eboot_port/build/*.dll
-
-      # v60 pinned historical-source reproduction. The current/fresh artifact
-      # above is the in-run control. For Release, restore a broad tracked
-      # source/build snapshot from the explicitly chosen baseline commit using
-      # python -c + git show. Never restore eboot_port/recompiled: it remains
-      # generated-only and is freshly lifted from the same private EBOOT.
-      - name: Restore pinned b1b1 baseline source with python -c
-        if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
-        id: historical_snapshot
-        shell: pwsh
-        env:
-          V60_BASELINE_COMMIT: b1b1cece387a76722f0fd4e97bc953af6e37bfcd
-        run: |
-          git cat-file -e "$env:V60_BASELINE_COMMIT^{commit}"
-          if ($LASTEXITCODE -ne 0) {
-            throw "Pinned v60 baseline commit does not exist in fetched history: $env:V60_BASELINE_COMMIT"
-          }
-
-          $py = @'
-          import hashlib
-          import os
-          from pathlib import Path
-          import subprocess
-          import sys
-
-          baseline = os.environ["V60_BASELINE_COMMIT"].strip()
-
-          def git(*args, check=True):
-              p = subprocess.run(["git", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-              if check and p.returncode != 0:
-                  sys.stderr.write(p.stderr.decode("utf-8", errors="replace"))
-                  raise SystemExit(p.returncode)
-              return p
-
-          resolved = git("rev-parse", f"{baseline}^{{commit}}").stdout.decode().strip()
-          head = git("rev-parse", "HEAD").stdout.decode().strip()
-
-          selected_prefixes = (
-              "cmake/",
-              "include/",
-              "runtime/",
-              "libs/",
-              "tools/",
-              "eboot_port/",
-              "templates/",
-          )
-
-          def selected(path):
-              if path == "CMakeLists.txt":
-                  return True
-              if path.startswith("eboot_port/recompiled/"):
-                  return False
-              return path.startswith(selected_prefixes)
-
-          historical_all = git("ls-tree", "-r", "--name-only", resolved).stdout.decode("utf-8", errors="replace").splitlines()
-          historical = [x for x in historical_all if selected(x)]
-          historical_set = set(historical)
-          current = [x for x in git("ls-files").stdout.decode("utf-8", errors="replace").splitlines() if selected(x)]
-
-          deleted = []
-          for name in current:
-              if name in historical_set:
-                  continue
-              q = Path(name)
-              if q.exists() or q.is_symlink():
-                  q.unlink()
-                  deleted.append(name)
-
-          restored = []
-          digest = hashlib.sha256()
-          for name in historical:
-              blob = git("show", f"{resolved}:{name}").stdout
-              q = Path(name)
-              q.parent.mkdir(parents=True, exist_ok=True)
-              q.write_bytes(blob)
-              restored.append(name)
-              digest.update(name.encode("utf-8") + b"\0")
-              digest.update(hashlib.sha256(blob).digest())
-
-          manifest = Path("av_repro_v60_pinned_b1b1.txt")
-          manifest.write_text(
-              "kind=v60-pinned-b1b1-historical-source-snapshot\n"
-              f"head_commit={head}\n"
-              f"baseline_commit={resolved}\n"
-              f"restored_files={len(restored)}\n"
-              f"deleted_post_baseline_files={len(deleted)}\n"
-              f"snapshot_content_digest={digest.hexdigest()}\n",
-              encoding="utf-8",
-          )
-          print(f"baseline_commit={resolved}")
-          print(f"restored_files={len(restored)}")
-          print(f"deleted_post_baseline_files={len(deleted)}")
-          print(f"snapshot_content_digest={digest.hexdigest()}")
-          '@
-
-          python -c $py
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-          $manifest = Get-Content av_repro_v60_pinned_b1b1.txt
-          $snapshot = (($manifest | Where-Object { $_ -like 'baseline_commit=*' }) -split '=', 2)[1]
-          if ([string]::IsNullOrWhiteSpace($snapshot)) { throw "v60 baseline commit missing from manifest" }
-          "snapshot_commit=$snapshot" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-
-          Write-Host "v60 pinned b1b1 baseline restored runner-only."
-          Get-Content av_repro_v60_pinned_b1b1.txt
-          Write-Host "Working-tree changes after broad restore:"
-          git status --short | Select-Object -First 200
-
-          if (Test-Path -LiteralPath "eboot_port/recompiled") {
-            Write-Host "recompiled exists only from the current fresh lift and will be deleted/re-generated next; it was not restored from Git."
-          }
-
-      - name: Install Python dependencies from v60 baseline
-        if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
-        shell: pwsh
-        run: |
-          if (Test-Path -LiteralPath "tools/requirements.txt" -PathType Leaf) {
-            python -m pip install -r tools/requirements.txt
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
-
-      - name: Rebuild runtime from v60 pinned b1b1 baseline
-        if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
-        shell: pwsh
-        run: |
-          Remove-Item -Recurse -Force build -ErrorAction SilentlyContinue
-          cmake -S . -B build -G Ninja `
-            -DCMAKE_C_COMPILER=clang-cl `
-            -DCMAKE_CXX_COMPILER=clang-cl `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DPS3RECOMP_REQUIRE_FFMPEG=ON `
-            -DPS3RECOMP_FFMPEG_ROOT="$env:PS3RECOMP_FFMPEG_ROOT"
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          cmake --build build
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          $runtimeLib = "build/ps3recomp_runtime.lib"
-          if (-not (Test-Path -LiteralPath $runtimeLib -PathType Leaf)) {
-            throw "v60 baseline runtime build did not produce ps3recomp_runtime.lib"
-          }
-          $runtimeHash = (Get-FileHash -Algorithm SHA256 $runtimeLib).Hash.ToLowerInvariant()
-          "runtime_lib_sha256=$runtimeHash" | Add-Content -Path av_repro_v60_pinned_b1b1.txt -Encoding utf8
-          Write-Host "v60 baseline runtime sha256=$runtimeHash"
-
-      - name: Re-lift game PPU with v60 baseline tools
-        if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
-        shell: pwsh
-        env:
-          WA2_EBOOT_PATH: ${{ vars.WA2_EBOOT_PATH }}
-        run: |
-          $relativeEboot = $env:WA2_EBOOT_PATH
-          if ([string]::IsNullOrWhiteSpace($relativeEboot)) { $relativeEboot = "EBOOT.ELF" }
-          $eboot = Join-Path (Join-Path $env:GITHUB_WORKSPACE "_private\wa2-assets") $relativeEboot
-          if (-not (Test-Path -LiteralPath $eboot -PathType Leaf)) { throw "Private EBOOT missing: $eboot" }
-
-          $analysisDir = Join-Path $env:RUNNER_TEMP "ps3recomp-wa2-analysis-v60-b1b1"
-          $recompDir = Join-Path $env:GITHUB_WORKSPACE "eboot_port\recompiled"
-          Remove-Item -Recurse -Force $analysisDir -ErrorAction SilentlyContinue
-          Remove-Item -Recurse -Force $recompDir -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force -Path $analysisDir | Out-Null
-          New-Item -ItemType Directory -Force -Path $recompDir | Out-Null
-
-          python tools/ppu_loader.py "$eboot" -o "$analysisDir"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $functionFiles = @(Get-ChildItem -LiteralPath $analysisDir -Filter "*.functions.json" -File)
-          $importFiles = @(Get-ChildItem -LiteralPath $analysisDir -Filter "*.imports.json" -File)
-          if ($functionFiles.Count -ne 1 -or $importFiles.Count -ne 1) {
-            throw "v60 baseline ppu_loader output is ambiguous: functions=$($functionFiles.Count), imports=$($importFiles.Count)"
-          }
-
-          python tools/ppu_lifter.py "$eboot" `
-            --functions "$($functionFiles[0].FullName)" `
-            --hle-stubs "$($importFiles[0].FullName)" `
-            --output "$recompDir" `
-            -j 2
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-          python tools/gen_hle_nids.py --all --out "$recompDir\ppu_hle_nids.cpp"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-          $lifted = @(Get-ChildItem -LiteralPath $recompDir -Filter "ppu_recomp_*.cpp" -File |
-            Where-Object { $_.Name -ne "ppu_hle_nids.cpp" } |
-            Sort-Object Name)
-          if ($lifted.Count -eq 0) { throw "v60 baseline lifter produced no lifted PPU source" }
-
-          $funcCount = 0
-          foreach ($f in $lifted) {
-            $funcCount += @(Select-String -LiteralPath $f.FullName -Pattern '^void func_[0-9A-Fa-f]{8}\(ppu_context\* ctx\)').Count
-          }
-
-          $digestLines = foreach ($f in $lifted) {
-            $sha = (Get-FileHash -Algorithm SHA256 $f.FullName).Hash.ToLowerInvariant()
-            "$($f.Name):$($sha):$($f.Length)"
-          }
-          $digestText = ($digestLines -join "`n") + "`n"
-          $digestPath = Join-Path $env:RUNNER_TEMP "v60-ppu-digest.txt"
-          [System.IO.File]::WriteAllText($digestPath, $digestText, [System.Text.UTF8Encoding]::new($false))
-          $ppuDigest = (Get-FileHash -Algorithm SHA256 $digestPath).Hash.ToLowerInvariant()
-
-          Write-Host "v60 baseline lift: $($lifted.Count) TU(s), $funcCount lifted function definitions"
-          $digestLines | ForEach-Object { Write-Host "  $_" }
-          "historical_lifted_functions=$funcCount" | Add-Content -Path av_repro_v60_pinned_b1b1.txt -Encoding utf8
-          "ppu_generated_digest=$ppuDigest" | Add-Content -Path av_repro_v60_pinned_b1b1.txt -Encoding utf8
-
-      - name: Build eboot_port from v60 pinned b1b1 baseline
-        if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
-        shell: pwsh
-        run: |
-          $histBuild = "eboot_port/build-v60-b1b1-baseline"
-          Remove-Item -Recurse -Force $histBuild -ErrorAction SilentlyContinue
-
-          cmake -S eboot_port -B $histBuild -G Ninja `
-            -DCMAKE_C_COMPILER=clang-cl `
-            -DCMAKE_CXX_COMPILER=clang-cl `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DPS3RECOMP_REQUIRE_FFMPEG=ON `
-            -DPS3RECOMP_FFMPEG_ROOT="$env:PS3RECOMP_FFMPEG_ROOT"
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          cmake --build $histBuild
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          echo Copy-Item "$env:PS3RECOMP_FFMPEG_ROOT\bin\*.dll" "$histBuild\" -Force
-
-          $exe = Join-Path $histBuild "MyGameRecomp.exe"
-          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "v60 baseline build produced no MyGameRecomp.exe" }
-          $exeHash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
-          "exe_sha256=$exeHash" | Add-Content -Path av_repro_v60_pinned_b1b1.txt -Encoding utf8
-          Write-Host "v60 baseline exe sha256=$exeHash"
-          Get-Content av_repro_v60_pinned_b1b1.txt
-
-      - name: Upload v60 pinned b1b1 baseline Release Artifact
-        if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
-        uses: actions/upload-artifact@v4
-        with:
-          name: MyGameRecomp-Windows-Release-V60PinnedB1B1Baseline
-          path: |
-            eboot_port/build-v60-b1b1-baseline/MyGameRecomp.exe
-            eboot_port/build-v60-b1b1-baseline/*.dll
-            av_repro_v60_pinned_b1b1.txt
