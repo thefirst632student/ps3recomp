@@ -341,115 +341,239 @@ jobs:
             eboot_port/build/MyGameRecomp.exe
             eboot_port/build/*.dll
 
-      # v58 cumulative reproduction control: v28 made the genuine ppu_loader debug/dev
-      # instrumentation Debug-only by wrapping it in NDEBUG guards.  Keep every
-      # other HEAD source and the freshly lifted PPU output unchanged, then use
-      # python -c to make those ppu_loader guards always-on for the second
-      # Release build.  This is intentionally a runner-only patch; nothing under
-      # recompiled/ or runtime/ is committed back to Git.
-      - name: Re-enable pre-v28 ppu_loader instrumentation with python -c
+      # v60 pinned historical-source reproduction. The current/fresh artifact
+      # above is the in-run control. For Release, restore a broad tracked
+      # source/build snapshot from the explicitly chosen baseline commit using
+      # python -c + git show. Never restore eboot_port/recompiled: it remains
+      # generated-only and is freshly lifted from the same private EBOOT.
+      - name: Restore pinned b1b1 baseline source with python -c
         if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
-        id: pre_v28_loader
+        id: historical_snapshot
         shell: pwsh
+        env:
+          V60_BASELINE_COMMIT: b1b1cece387a76722f0fd4e97bc953af6e37bfcd
         run: |
-          python -c 'from pathlib import Path; import hashlib, sys; p=Path("runtime/ppu/ppu_loader.cpp"); b=p.read_bytes(); s=b.decode("utf-8"); a=s.count("#if !defined(NDEBUG)"); c=s.count("#ifndef NDEBUG"); t=s.replace("#if !defined(NDEBUG)", "#if 1 /* AV_REPRO_PRE_V28: NDEBUG guard disabled */").replace("#ifndef NDEBUG", "#if 1 /* AV_REPRO_PRE_V28: NDEBUG guard disabled */"); (a+c)>0 or sys.exit("No NDEBUG guard found in ppu_loader.cpp"); p.write_text(t, encoding="utf-8", newline=""); print(f"patched_guards={a+c}"); print(f"sha256={hashlib.sha256(p.read_bytes()).hexdigest()}")'
+          git cat-file -e "$env:V60_BASELINE_COMMIT^{commit}"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Pinned v60 baseline commit does not exist in fetched history: $env:V60_BASELINE_COMMIT"
+          }
+
+          $py = @'
+          import hashlib
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          baseline = os.environ["V60_BASELINE_COMMIT"].strip()
+
+          def git(*args, check=True):
+              p = subprocess.run(["git", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+              if check and p.returncode != 0:
+                  sys.stderr.write(p.stderr.decode("utf-8", errors="replace"))
+                  raise SystemExit(p.returncode)
+              return p
+
+          resolved = git("rev-parse", f"{baseline}^{{commit}}").stdout.decode().strip()
+          head = git("rev-parse", "HEAD").stdout.decode().strip()
+
+          selected_prefixes = (
+              "cmake/",
+              "include/",
+              "runtime/",
+              "libs/",
+              "tools/",
+              "eboot_port/",
+              "templates/",
+          )
+
+          def selected(path):
+              if path == "CMakeLists.txt":
+                  return True
+              if path.startswith("eboot_port/recompiled/"):
+                  return False
+              return path.startswith(selected_prefixes)
+
+          historical_all = git("ls-tree", "-r", "--name-only", resolved).stdout.decode("utf-8", errors="replace").splitlines()
+          historical = [x for x in historical_all if selected(x)]
+          historical_set = set(historical)
+          current = [x for x in git("ls-files").stdout.decode("utf-8", errors="replace").splitlines() if selected(x)]
+
+          deleted = []
+          for name in current:
+              if name in historical_set:
+                  continue
+              q = Path(name)
+              if q.exists() or q.is_symlink():
+                  q.unlink()
+                  deleted.append(name)
+
+          restored = []
+          digest = hashlib.sha256()
+          for name in historical:
+              blob = git("show", f"{resolved}:{name}").stdout
+              q = Path(name)
+              q.parent.mkdir(parents=True, exist_ok=True)
+              q.write_bytes(blob)
+              restored.append(name)
+              digest.update(name.encode("utf-8") + b"\0")
+              digest.update(hashlib.sha256(blob).digest())
+
+          manifest = Path("av_repro_v60_pinned_b1b1.txt")
+          manifest.write_text(
+              "kind=v60-pinned-b1b1-historical-source-snapshot\n"
+              f"head_commit={head}\n"
+              f"baseline_commit={resolved}\n"
+              f"restored_files={len(restored)}\n"
+              f"deleted_post_baseline_files={len(deleted)}\n"
+              f"snapshot_content_digest={digest.hexdigest()}\n",
+              encoding="utf-8",
+          )
+          print(f"baseline_commit={resolved}")
+          print(f"restored_files={len(restored)}")
+          print(f"deleted_post_baseline_files={len(deleted)}")
+          print(f"snapshot_content_digest={digest.hexdigest()}")
+          '@
+
+          python -c $py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          $patchedGuards = @(Select-String -Path runtime/ppu/ppu_loader.cpp -Pattern 'AV_REPRO_PRE_V28').Count
-          if ($patchedGuards -le 0) {
-            throw "python -c reported success but no AV_REPRO_PRE_V28 guards are present"
+          $manifest = Get-Content av_repro_v60_pinned_b1b1.txt
+          $snapshot = (($manifest | Where-Object { $_ -like 'baseline_commit=*' }) -split '=', 2)[1]
+          if ([string]::IsNullOrWhiteSpace($snapshot)) { throw "v60 baseline commit missing from manifest" }
+          "snapshot_commit=$snapshot" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+          Write-Host "v60 pinned b1b1 baseline restored runner-only."
+          Get-Content av_repro_v60_pinned_b1b1.txt
+          Write-Host "Working-tree changes after broad restore:"
+          git status --short | Select-Object -First 200
+
+          if (Test-Path -LiteralPath "eboot_port/recompiled") {
+            Write-Host "recompiled exists only from the current fresh lift and will be deleted/re-generated next; it was not restored from Git."
           }
-          "patched_guards=$patchedGuards" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          $sha = (Get-FileHash -Algorithm SHA256 runtime/ppu/ppu_loader.cpp).Hash.ToLowerInvariant()
-          "sha256=$sha" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
-          Write-Host "Runner-only ppu_loader Release instrumentation patch: $patchedGuards NDEBUG guard(s) forced on."
-          Write-Host "ppu_loader.cpp sha256=$sha"
-          Write-Host "Relevant instrumentation still present after patch:"
-          Select-String -Path runtime/ppu/ppu_loader.cpp -Pattern 'WARN2_WW_ARM|CreateToolhelp32Snapshot|AddVectoredExceptionHandler|VirtualProtect|SuspendThread|GetThreadContext|ResumeThread' |
-            Select-Object -First 40 |
-            ForEach-Object { Write-Host "  $($_.LineNumber): $($_.Line.Trim())" }
-          git diff -- runtime/ppu/ppu_loader.cpp | Select-Object -First 160
-
-      # v26 introduced a generated Windows VERSIONINFO resource.  The .rc file
-      # is created by CMake inside the build directory (it is not a tracked
-      # eboot_port/app.rc). Configure the second build first, locate the
-      # generated resource that actually contains VERSIONINFO, then use
-      # python -c to replace only that generated file with an empty resource
-      # script before compilation.
-      - name: Configure cumulative repro and remove generated v26 VERSIONINFO with python -c
+      - name: Install Python dependencies from v60 baseline
         if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
-        id: pre_v26_resource
         shell: pwsh
         run: |
-          $reproBuild = "eboot_port/build-pre-v26-pre-v28-repro"
-          Remove-Item -Recurse -Force $reproBuild -ErrorAction SilentlyContinue
+          if (Test-Path -LiteralPath "tools/requirements.txt" -PathType Leaf) {
+            python -m pip install -r tools/requirements.txt
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
 
-          cmake -S eboot_port -B $reproBuild -G Ninja `
+      - name: Rebuild runtime from v60 pinned b1b1 baseline
+        if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force build -ErrorAction SilentlyContinue
+          cmake -S . -B build -G Ninja `
             -DCMAKE_C_COMPILER=clang-cl `
             -DCMAKE_CXX_COMPILER=clang-cl `
             -DCMAKE_BUILD_TYPE=Release `
             -DPS3RECOMP_REQUIRE_FFMPEG=ON `
-            -DPS3RECOMP_FFMPEG_ROOT="$env:PS3RECOMP_FFMPEG_ROOT" `
-            -DPS3RECOMP_RELEASE_LIFTED_PPU_BISECT_SLICE=OFF
+            -DPS3RECOMP_FFMPEG_ROOT="$env:PS3RECOMP_FFMPEG_ROOT"
           if ($LASTEXITCODE -ne 0) { exit 1 }
-
-          python -c 'from pathlib import Path; import hashlib, sys; root=Path("eboot_port/build-pre-v26-pre-v28-repro"); cand=[]; [(cand.append((q,b,t))) for q in root.rglob("*.rc") for b in [q.read_bytes()] for t in [b.decode("utf-8-sig", errors="replace")] if "VERSIONINFO" in t.upper()]; len(cand)==1 or sys.exit("Expected exactly one generated *.rc containing VERSIONINFO under "+str(root)+", found "+str(len(cand))+": "+", ".join(str(x[0]) for x in cand)); q,b,t=cand[0]; print("resource_path="+str(q)); print("original_bytes="+str(len(b))); print("original_sha256="+hashlib.sha256(b).hexdigest()); print("versioninfo_tokens="+str(t.upper().count("VERSIONINFO"))); q.write_text("// AV_REPRO_PRE_V26: VERSIONINFO intentionally removed for CI reproduction control"+chr(10), encoding="utf-8", newline=""); print("patched_sha256="+hashlib.sha256(q.read_bytes()).hexdigest()); Path("eboot_port/build-pre-v26-pre-v28-repro/av_repro_resource_path.txt").write_text(str(q), encoding="utf-8")'
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-          $pathFile = Join-Path $reproBuild "av_repro_resource_path.txt"
-          if (-not (Test-Path -LiteralPath $pathFile -PathType Leaf)) {
-            throw "python -c did not record the generated resource path"
-          }
-          $rc = (Get-Content -LiteralPath $pathFile -Raw).Trim()
-          if (-not (Test-Path -LiteralPath $rc -PathType Leaf)) {
-            throw "Generated resource selected by python -c no longer exists: $rc"
-          }
-          $patchedText = Get-Content -LiteralPath $rc -Raw
-          if ($patchedText -notmatch 'AV_REPRO_PRE_V26') {
-            throw "python -c reported success but generated resource was not replaced"
-          }
-
-          $sha = (Get-FileHash -Algorithm SHA256 $rc).Hash.ToLowerInvariant()
-          "sha256=$sha" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "path=$rc" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          Write-Host "Runner-only Windows resource rollback applied to generated file: $rc"
-          Write-Host "generated app.rc sha256=$sha"
-          Get-Content -LiteralPath $rc
-
-      - name: Build eboot_port (Pre-v26 + pre-v28 cumulative repro)
-        if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
-        run: |
-          cmake --build eboot_port/build-pre-v26-pre-v28-repro
+          cmake --build build
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          echo Copy-Item "$env:PS3RECOMP_FFMPEG_ROOT\bin\*.dll" "eboot_port\build-pre-v26-pre-v28-repro\" -Force
+          $runtimeLib = "build/ps3recomp_runtime.lib"
+          if (-not (Test-Path -LiteralPath $runtimeLib -PathType Leaf)) {
+            throw "v60 baseline runtime build did not produce ps3recomp_runtime.lib"
+          }
+          $runtimeHash = (Get-FileHash -Algorithm SHA256 $runtimeLib).Hash.ToLowerInvariant()
+          "runtime_lib_sha256=$runtimeHash" | Add-Content -Path av_repro_v60_pinned_b1b1.txt -Encoding utf8
+          Write-Host "v60 baseline runtime sha256=$runtimeHash"
 
-      - name: Write pre-v26 + pre-v28 cumulative repro manifest
+      - name: Re-lift game PPU with v60 baseline tools
         if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
         shell: pwsh
         env:
-          PATCHED_GUARDS: ${{ steps.pre_v28_loader.outputs.patched_guards }}
-          PATCHED_LOADER_SHA256: ${{ steps.pre_v28_loader.outputs.sha256 }}
-          PATCHED_APP_RC_SHA256: ${{ steps.pre_v26_resource.outputs.sha256 }}
+          WA2_EBOOT_PATH: ${{ vars.WA2_EBOOT_PATH }}
         run: |
-          $manifest = Join-Path $env:RUNNER_TEMP "av-repro-pre-v26-pre-v28.txt"
-          "kind=pre-v26-versioninfo-plus-pre-v28-ppu-loader-repro" | Set-Content -Path $manifest -Encoding utf8
-          "build_source_commit=$env:GITHUB_SHA" | Add-Content -Path $manifest -Encoding utf8
-          "patched_ndebug_guards=$env:PATCHED_GUARDS" | Add-Content -Path $manifest -Encoding utf8
-          "patched_ppu_loader_sha256=$env:PATCHED_LOADER_SHA256" | Add-Content -Path $manifest -Encoding utf8
-          "patched_app_rc_sha256=$env:PATCHED_APP_RC_SHA256" | Add-Content -Path $manifest -Encoding utf8
-          "windows_versioninfo=removed" | Add-Content -Path $manifest -Encoding utf8
-          $exe = "eboot_port\build-pre-v26-pre-v28-repro\MyGameRecomp.exe"
-          $exeHash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
-          "exe_sha256=$exeHash" | Add-Content -Path $manifest -Encoding utf8
-          Get-Content $manifest
+          $relativeEboot = $env:WA2_EBOOT_PATH
+          if ([string]::IsNullOrWhiteSpace($relativeEboot)) { $relativeEboot = "EBOOT.ELF" }
+          $eboot = Join-Path (Join-Path $env:GITHUB_WORKSPACE "_private\wa2-assets") $relativeEboot
+          if (-not (Test-Path -LiteralPath $eboot -PathType Leaf)) { throw "Private EBOOT missing: $eboot" }
 
-      - name: Upload pre-v26 + pre-v28 cumulative repro Release Artifact
+          $analysisDir = Join-Path $env:RUNNER_TEMP "ps3recomp-wa2-analysis-v60-b1b1"
+          $recompDir = Join-Path $env:GITHUB_WORKSPACE "eboot_port\recompiled"
+          Remove-Item -Recurse -Force $analysisDir -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force $recompDir -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $analysisDir | Out-Null
+          New-Item -ItemType Directory -Force -Path $recompDir | Out-Null
+
+          python tools/ppu_loader.py "$eboot" -o "$analysisDir"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $functionFiles = @(Get-ChildItem -LiteralPath $analysisDir -Filter "*.functions.json" -File)
+          $importFiles = @(Get-ChildItem -LiteralPath $analysisDir -Filter "*.imports.json" -File)
+          if ($functionFiles.Count -ne 1 -or $importFiles.Count -ne 1) {
+            throw "v60 baseline ppu_loader output is ambiguous: functions=$($functionFiles.Count), imports=$($importFiles.Count)"
+          }
+
+          python tools/ppu_lifter.py "$eboot" `
+            --functions "$($functionFiles[0].FullName)" `
+            --hle-stubs "$($importFiles[0].FullName)" `
+            --output "$recompDir" `
+            -j 2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          python tools/gen_hle_nids.py --all --out "$recompDir\ppu_hle_nids.cpp"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $lifted = @(Get-ChildItem -LiteralPath $recompDir -Filter "ppu_recomp_*.cpp" -File |
+            Where-Object { $_.Name -ne "ppu_hle_nids.cpp" } |
+            Sort-Object Name)
+          if ($lifted.Count -eq 0) { throw "v60 baseline lifter produced no lifted PPU source" }
+
+          $funcCount = 0
+          foreach ($f in $lifted) {
+            $funcCount += @(Select-String -LiteralPath $f.FullName -Pattern '^void func_[0-9A-Fa-f]{8}\(ppu_context\* ctx\)').Count
+          }
+
+          $digestLines = foreach ($f in $lifted) {
+            $sha = (Get-FileHash -Algorithm SHA256 $f.FullName).Hash.ToLowerInvariant()
+            "$($f.Name):$($sha):$($f.Length)"
+          }
+          $digestText = ($digestLines -join "`n") + "`n"
+          $digestPath = Join-Path $env:RUNNER_TEMP "v60-ppu-digest.txt"
+          [System.IO.File]::WriteAllText($digestPath, $digestText, [System.Text.UTF8Encoding]::new($false))
+          $ppuDigest = (Get-FileHash -Algorithm SHA256 $digestPath).Hash.ToLowerInvariant()
+
+          Write-Host "v60 baseline lift: $($lifted.Count) TU(s), $funcCount lifted function definitions"
+          $digestLines | ForEach-Object { Write-Host "  $_" }
+          "historical_lifted_functions=$funcCount" | Add-Content -Path av_repro_v60_pinned_b1b1.txt -Encoding utf8
+          "ppu_generated_digest=$ppuDigest" | Add-Content -Path av_repro_v60_pinned_b1b1.txt -Encoding utf8
+
+      - name: Build eboot_port from v60 pinned b1b1 baseline
+        if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
+        shell: pwsh
+        run: |
+          $histBuild = "eboot_port/build-v60-b1b1-baseline"
+          Remove-Item -Recurse -Force $histBuild -ErrorAction SilentlyContinue
+
+          cmake -S eboot_port -B $histBuild -G Ninja `
+            -DCMAKE_C_COMPILER=clang-cl `
+            -DCMAKE_CXX_COMPILER=clang-cl `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DPS3RECOMP_REQUIRE_FFMPEG=ON `
+            -DPS3RECOMP_FFMPEG_ROOT="$env:PS3RECOMP_FFMPEG_ROOT"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          cmake --build $histBuild
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          echo Copy-Item "$env:PS3RECOMP_FFMPEG_ROOT\bin\*.dll" "$histBuild\" -Force
+
+          $exe = Join-Path $histBuild "MyGameRecomp.exe"
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "v60 baseline build produced no MyGameRecomp.exe" }
+          $exeHash = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
+          "exe_sha256=$exeHash" | Add-Content -Path av_repro_v60_pinned_b1b1.txt -Encoding utf8
+          Write-Host "v60 baseline exe sha256=$exeHash"
+          Get-Content av_repro_v60_pinned_b1b1.txt
+
+      - name: Upload v60 pinned b1b1 baseline Release Artifact
         if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
         uses: actions/upload-artifact@v4
         with:
-          name: MyGameRecomp-Windows-Release-PreV26PreV28CumulativeRepro
+          name: MyGameRecomp-Windows-Release-V60PinnedB1B1Baseline
           path: |
-            eboot_port/build-pre-v26-pre-v28-repro/MyGameRecomp.exe
-            eboot_port/build-pre-v26-pre-v28-repro/*.dll
-            ${{ runner.temp }}/av-repro-pre-v26-pre-v28.txt
+            eboot_port/build-v60-b1b1-baseline/MyGameRecomp.exe
+            eboot_port/build-v60-b1b1-baseline/*.dll
+            av_repro_v60_pinned_b1b1.txt
