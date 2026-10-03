@@ -382,7 +382,15 @@ s32 cellRescCreateInterlaceTable(void* buf, float ea, u32 tableLen, s32 depth)
 
 s32 cellRescAdjustAspectRatio(float horizontal, float vertical)
 {
-    printf("[cellResc] AdjustAspectRatio(h=%.2f, v=%.2f)\n", horizontal, vertical);
+    /* WA2 calls this every frame with the same values.  Keep the diagnostic on
+     * state changes without turning stdout traffic into render cost. */
+    static int s_aspect_logged = 0;
+    static float s_log_h = 0.0f, s_log_v = 0.0f;
+    if (!s_aspect_logged || horizontal != s_log_h || vertical != s_log_v) {
+        printf("[cellResc] AdjustAspectRatio(h=%.2f, v=%.2f)\n", horizontal, vertical);
+        s_aspect_logged = 1;
+        s_log_h = horizontal; s_log_v = vertical;
+    }
 
     if (!s_initialized)
         return (s32)CELL_RESC_ERROR_NOT_INITIALIZED;

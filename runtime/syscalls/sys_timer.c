@@ -132,19 +132,19 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         }
     }
 
-    /* WA2 main game engine VSync / Flip sync: func_0006FBA8 (cia=0x0006FBD4) and
-     * func_0006EF60 (cia=0x0006EF74) spin on sys_timer_usleep(300) waiting for the
-     * VBlank/flip handler (func_00070E24) to signal flip complete at 0x003F3B8C.
-     * Set it to 1 so the game advances to flip the frame and process input. */
+    /* WA2 main game engine VSync / Flip sync: func_0006FBA8/func_0006EF60
+     * poll here while the RESC flip handler (func_00070E24) owns completion.
+     *
+     * Do NOT force 0x003F3B8C here.  That legacy workaround acknowledged every
+     * frame after only ~300 us, long before the FIFO/present path retired it,
+     * allowing effect passes from successive frames to overlap and making the
+     * producer outrun the renderer.  Raw LV2 syscall entry now pumps pending
+     * GCM callbacks, so the registered handler can release this poll on the
+     * real flip-completion edge. */
     if (usec == 300) {
-        extern uint8_t* vm_base;
-        if (vm_base) {
-            static int s_flip_wake = 0;
-            if (s_flip_wake++ < 10) {
-                fprintf(stderr, "[WA2-FLIP] sys_timer_usleep(300) -> setting flip flag 0x003F3B8C = 1\n");
-            }
-            vm_base[0x003F3B8C] = 1;
-        }
+        static int s_flip_poll_log = 0;
+        if (s_flip_poll_log++ == 0)
+            fprintf(stderr, "[WA2-FLIP] 300us poll paced by real GCM flip completion\n");
     }
     /* PS3_WAIT_OBJ=<lr-hex>: when a usleep spin is reached from this return
      * address, dump the registers and the object they point at. A poll loop

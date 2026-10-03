@@ -2050,8 +2050,28 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
 s32 cellGcmSetDisplayBuffer(u32 bufferId, u32 offset, u32 pitch,
                             u32 width, u32 height)
 {
-    printf("[cellGcmSys] SetDisplayBuffer(id=%u, offset=0x%X, pitch=%u, %ux%u)\n",
-           bufferId, offset, pitch, width, height);
+    /* Some RESC titles re-submit the identical display-buffer description every
+     * frame.  Printing that hot path synchronously in a Debug build can become
+     * a material part of frame time, especially during multi-pass effects. */
+    if (bufferId < CELL_GCM_MAX_DISPLAY_BUFFER_NUM) {
+        static u32 last_off[CELL_GCM_MAX_DISPLAY_BUFFER_NUM];
+        static u32 last_pitch[CELL_GCM_MAX_DISPLAY_BUFFER_NUM];
+        static u32 last_w[CELL_GCM_MAX_DISPLAY_BUFFER_NUM];
+        static u32 last_h[CELL_GCM_MAX_DISPLAY_BUFFER_NUM];
+        static u8  seen[CELL_GCM_MAX_DISPLAY_BUFFER_NUM];
+        if (!seen[bufferId] || last_off[bufferId] != offset ||
+            last_pitch[bufferId] != pitch || last_w[bufferId] != width ||
+            last_h[bufferId] != height) {
+            printf("[cellGcmSys] SetDisplayBuffer(id=%u, offset=0x%X, pitch=%u, %ux%u)\n",
+                   bufferId, offset, pitch, width, height);
+            seen[bufferId] = 1;
+            last_off[bufferId] = offset; last_pitch[bufferId] = pitch;
+            last_w[bufferId] = width; last_h[bufferId] = height;
+        }
+    } else {
+        printf("[cellGcmSys] SetDisplayBuffer(id=%u, offset=0x%X, pitch=%u, %ux%u)\n",
+               bufferId, offset, pitch, width, height);
+    }
 
     if (bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM)
         return CELL_GCM_ERROR_INVALID_VALUE;
