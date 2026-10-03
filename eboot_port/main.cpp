@@ -96,7 +96,6 @@ void     cellGcmTickFlip(void);
 int      cellGcm_take_flip_pending(void);
 void     cellGcm_rsx_process_fifo(void);      /* drain get -> put */
 void     cellGcm_fifo_kick_wait(unsigned ms); /* wakeable RSX idle wait */
-unsigned cellGcm_flip_request_count(void);
 }
 
 /* ---------------------------------------------------------------------------
@@ -157,10 +156,9 @@ extern "C" int  rsx_null_backend_pump_messages(void);
  * ticks behind it paces the whole game behind it. */
 static volatile LONG g_frames_presented = 0;
 
-/* Frames handed to the backend at a guest FLIP boundary -- one per frame the
- * guest actually finished. The presents made before the guest's first flip, so
- * a fresh window is not left blank through a long boot, carry no guest frame
- * and are deliberately not counted. */
+/* Frames handed to the backend only when a queued guest FLIP is retired at
+ * the synthesized vblank boundary.  Do not present from the faster FIFO-pump
+ * cadence: that exposes intermediate post-effect states as visible flicker. */
 extern "C" unsigned ppu_boot_frames_presented(void)
 {
     return (unsigned)g_frames_presented;
@@ -183,7 +181,6 @@ static DWORD WINAPI frame_clock(LPVOID)
     fprintf(stderr, "[rsx] %s backend init %s\n", RSX_BACKEND_NAME,
             rsx_ok ? "OK -- window open" : "FAILED");
 
-    unsigned  last_flip = 0;
     ULONGLONG next_tick = GetTickCount64();
 
     for (;;) {
@@ -212,7 +209,6 @@ static DWORD WINAPI frame_clock(LPVOID)
             if (rsx_ok) cellGcm_rsx_process_fifo();
             if (rsx_ok && cellGcm_take_flip_pending()) {
                 present_guest_frame();
-                last_flip = cellGcm_flip_request_count();
             }
             next_tick += 16;             /* ~60 Hz */
             fired++;
@@ -254,16 +250,10 @@ static DWORD WINAPI frame_clock(LPVOID)
                 exit(0);
 #endif
             }
-            /* Present on a guest flip. A present on a fixed clock can catch the
-             * drain mid-frame and flash a partial one. Before the first flip
-             * present freely, so the window is not blank during boot. */
-            unsigned fc = cellGcm_flip_request_count();
-            if (fc != last_flip) {
-                present_guest_frame();
-                last_flip = fc;
-            } else if (fc == 0) {
-                rsx_backend_present();
-            }
+            /* Scanout is intentionally absent from this high-frequency path.
+             * Guest flips are consumed and presented only by the vblank block
+             * above; this loop exists solely to advance FIFO/fence work and pump
+             * host window messages. */
         }
     }
     return 0;
