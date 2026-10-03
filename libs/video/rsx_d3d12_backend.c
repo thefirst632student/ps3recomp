@@ -470,6 +470,24 @@ static u64 s_req_verts = 0, s_req_draws = 0, s_drop_draws = 0;
  * Feeding it the previous frame costs one frame of latency, which for a water
  * reflection is not visible. */
 static ID3D12Resource* s_screen_copy = NULL;
+
+/* A display-sized texture is not automatically the scanout surface.  WA2 (and
+ * plenty of other titles) uses ordinary 1280x720 textures for post effects.
+ * Treating every texture whose dimensions match the window as the framebuffer
+ * aliases unrelated guest images to s_screen_copy, creating a one-frame
+ * feedback loop (visible as flashing) and bypassing the real guest/RTT source.
+ *
+ * RSX surface/texture identity is the raw local-memory offset.  cellGcm already
+ * tracks the offsets registered as display buffers, so use that identity rather
+ * than a size heuristic. */
+static int screen_tex_is_display(const D3D12DrawRecord* dr, int unit)
+{
+    extern int cellGcmOffsetIsDisplay(u32 offset);
+    if (!dr || unit < 0 || unit >= 4 || !dr->tex[unit].set) return 0;
+    if (dr->tex[unit].w != s_d3d.width || dr->tex[unit].h != s_d3d.height)
+        return 0;
+    return cellGcmOffsetIsDisplay(dr->tex[unit].raw);
+}
 /* Sub-viewport render-to-texture. This title renders its reflection/refraction
  * pre-pass into a REGION of the same surface (vp 0,208 512x512 and 0,208
  * 1024x512, cmask=F) and then samples a texture of exactly that size. On
@@ -5333,20 +5351,31 @@ static void render_frame(void)
         for (int _u = 0; _u < 4; _u++) {
             u32 wslot = DRAW_SRV_BASE + _d * DRAW_DESC_WIDTH + (u32)_u;
             dr->tex_rt[_u] = -1;
-            /* Display-sized sampler source -> the rendered frame. */
-            if (dr->tex[_u].set && s_screen_copy &&
-                dr->tex[_u].w == s_d3d.width && dr->tex[_u].h == s_d3d.height) {
+            /* Only a texture that aliases an actually registered display
+             * buffer may sample s_screen_copy.  Matching the display dimensions
+             * alone is not enough: post-effect textures commonly have the same
+             * size and must keep their own guest/RTT contents. */
+            if (screen_tex_is_display(dr, _u) && s_screen_copy) {
                 static int en = -1;
                 if (en < 0) { const char* e = getenv("SCREEN_AS_TEX"); en = e ? atoi(e) : 1; }
                 if (en) {
                     { static int _n = 0; if (_n++ < 3)
-                        fprintf(stderr, "[SCREENTEX] bound frame copy at unit %d for"
-                                        " fp=0x%X (%ux%u)%c", _u, dr->fp_addr,
+                        fprintf(stderr, "[SCREENTEX] display alias raw=0x%08X -> frame copy"
+                                        " unit=%d fp=0x%X (%ux%u)%c",
+                                dr->tex[_u].raw, _u, dr->fp_addr,
                                 dr->tex[_u].w, dr->tex[_u].h, 10); }
                     srv_write(wslot, s_screen_copy, DXGI_FORMAT_R8G8B8A8_UNORM,
                               D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
                     continue;
                 }
+            } else if (dr->tex[_u].set &&
+                       dr->tex[_u].w == s_d3d.width && dr->tex[_u].h == s_d3d.height) {
+                static int _guest_n = 0;
+                if (_guest_n++ < 4)
+                    fprintf(stderr, "[SCREENTEX] guest texture kept raw=0x%08X off=0x%08X"
+                                    " unit=%d fp=0x%X (%ux%u)%c",
+                            dr->tex[_u].raw, dr->tex[_u].off, _u, dr->fp_addr,
+                            dr->tex[_u].w, dr->tex[_u].h, 10);
             }
             /* A sampler whose guest buffer was never written, at the size of a
              * reduced-viewport pass we captured: that pass IS its producer. */
