@@ -224,14 +224,12 @@ static DWORD WINAPI frame_clock(LPVOID)
          * those at 16 ms apiece paces the guest into single-figure frame rates.
          * The real RSX writes them in microseconds. */
         if (rsx_ok) {
-            /* Same ordering at the high-frequency cadence: retire labels and
-             * other synchronization writes before a potentially blocking host
-             * present. */
+            /* High-frequency cadence is for RSX progress only.  Scanout is a
+             * vblank operation and is consumed exclusively by the 16 ms tick
+             * above.  Presenting ready flips here (~4 ms) lets a guest that
+             * prematurely observes its completion flag run/present at ~250 Hz,
+             * exposing intermediate post-effect states as visible flicker. */
             cellGcm_rsx_process_fifo();
-            if (cellGcm_take_flip_pending()) {
-                present_guest_frame();
-                last_flip = cellGcm_flip_request_count();
-            }
 
             if (rsx_backend_pump() != 0) {
                 /* WM_CLOSE/WM_QUIT is a HOST quit request, not merely a reason

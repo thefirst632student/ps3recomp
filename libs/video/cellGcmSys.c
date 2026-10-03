@@ -190,6 +190,50 @@ int cellGcm_take_flip_pending(void)
     return take;
 }
 
+/* RESC completion callbacks are vblank-driven, so there must not be an
+ * unbounded train of outstanding RESC flips.  Some titles poll their own
+ * completion byte; WA2's legacy 300 us compatibility write can make that byte
+ * look complete long before the host has scanned the frame out.  Keep the
+ * actual GCM queue one-deep instead: the frame-clock thread drains the FIFO and
+ * consumes the head at vblank, while the guest render thread waits here.
+ *
+ * This deliberately does not depend on ppu_gcm_pump() or on the guest callback
+ * running, so it cannot reproduce the v27 raw-syscall callback reentrancy bug. */
+static int gcm_flipq_has_pending(void)
+{
+    int pending;
+    AcquireSRWLockShared(&s_flip_q_lock);
+    pending = (s_flip_q_head != s_flip_q_tail);
+    ReleaseSRWLockShared(&s_flip_q_lock);
+    return pending;
+}
+
+static void gcm_resc_wait_previous_flip(void)
+{
+    if (!gcm_flipq_has_pending()) return;
+
+    u64 start = get_timestamp_ns();
+    int waited = 0;
+    while (gcm_flipq_has_pending()) {
+        /* The host frame-clock is independent of this guest thread and will
+         * retire the queued boundary on the next vblank.  Keep a generous
+         * escape hatch so a stopped/closing backend cannot deadlock shutdown. */
+        if (get_timestamp_ns() - start > 100000000ULL) {
+            static int warn = 0;
+            if (warn++ < 8)
+                fprintf(stderr, "[FLIP-PACE] RESC wait timed out; allowing queued flip%c", 10);
+            break;
+        }
+        waited = 1;
+        Sleep(1);
+    }
+    if (waited) {
+        static int n = 0;
+        if (n++ < 24)
+            fprintf(stderr, "[FLIP-PACE] previous RESC flip retired at vblank%c", 10);
+    }
+}
+
 static s32 cellGcmSetFlipCommandImplEx(u32 bufferId, int from_fifo,
                                        int suppress_request_callback);
 static s32 cellGcmSetFlipCommandImpl(u32 bufferId, int from_fifo)
@@ -2260,6 +2304,9 @@ s32 cellGcmSetFlipCommand(u32 bufferId)
  * run several frames ahead of the FIFO/present path. */
 s32 cellGcmSetFlipCommandForResc(u32 bufferId)
 {
+    /* RESC's handler is a completion interrupt.  Do not let a guest-side
+     * compatibility flag manufacture extra scanouts between real vblanks. */
+    gcm_resc_wait_previous_flip();
     return cellGcmSetFlipCommandImplEx(bufferId, 0, 1);
 }
 
