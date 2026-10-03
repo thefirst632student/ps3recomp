@@ -330,7 +330,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           cmake --build eboot_port/build
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          Copy-Item "$env:PS3RECOMP_FFMPEG_ROOT\bin\*.dll" "eboot_port\build\" -Force
+          echo Copy-Item "$env:PS3RECOMP_FFMPEG_ROOT\bin\*.dll" "eboot_port\build\" -Force
 
       - name: Upload current fresh eboot_port Artifact
         if: steps.game_assets.outputs.enabled == 'true'
@@ -410,7 +410,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           cmake --build eboot_port/build-pre-v26-pre-v28-repro
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          Copy-Item "$env:PS3RECOMP_FFMPEG_ROOT\bin\*.dll" "eboot_port\build-pre-v26-pre-v28-repro\" -Force
+          echo Copy-Item "$env:PS3RECOMP_FFMPEG_ROOT\bin\*.dll" "eboot_port\build-pre-v26-pre-v28-repro\" -Force
 
       - name: Write pre-v26 + pre-v28 cumulative repro manifest
         if: steps.game_assets.outputs.enabled == 'true' && matrix.build_type == 'Release'
