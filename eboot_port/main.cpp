@@ -194,22 +194,19 @@ static DWORD WINAPI frame_clock(LPVOID)
         while ((long long)(now - next_tick) >= 0 && fired < 240) {
             cellGcmTickVBlank();
             cellGcmTickFlip();
-            /* Retire guest FIFO work BEFORE entering Present().  A title may
-             * request a flip and then append a BACK_END_WRITE_SEMAPHORE_RELEASE
-             * which it immediately polls (WA2's movie vdisp does exactly this).
-             * Present() may block on the host compositor/GPU; doing it first
-             * leaves that release command stranded behind ctrl->put and creates
-             * a circular wait: guest waits for label, RSX drain waits for Present.
-             *
-             * The FIFO walker already stops at in-FIFO flip boundaries, so
-             * draining first does not consume the following frame for titles
-             * using FIFO flips. HLE/RESC flip users conventionally WaitFlip
-             * before submitting the next frame, so their post-flip fence is
-             * safe -- and required -- to retire before the host present. */
-            if (rsx_ok) cellGcm_rsx_process_fifo();
+            /* A flip becomes presentable only after the FIFO walker reaches its
+             * recorded boundary.  Once it is ready, present that completed batch
+             * BEFORE draining more FIFO work.  Draining first can cross into the
+             * next guest frame (especially after TickFlip wakes the render thread),
+             * so the host scanout can alternate between the completed warning/logo
+             * and an empty/partial successor batch.  The toolkit boot harness uses
+             * this same ordering for exactly that race. */
             if (rsx_ok && cellGcm_take_flip_pending()) {
                 present_guest_frame();
             }
+            /* With the completed frame already handed to scanout, advance FIFO
+             * fences and begin collecting the next frame. */
+            if (rsx_ok) cellGcm_rsx_process_fifo();
             next_tick += 16;             /* ~60 Hz */
             fired++;
         }
