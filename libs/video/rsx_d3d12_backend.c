@@ -3161,6 +3161,49 @@ static u32 rsx_remap_to_d3d(u32 c1, u32 basef)
     return out[1] | (out[2] << 3) | (out[3] << 6) | (out[0] << 9) | (1u << 12);
 }
 
+/* Formats for which rsx_texture_layout/rsx_texture_decode has an explicit
+ * implementation.  Keep this list separate from the layout fallback: the
+ * fallback intentionally classifies unknown formats as R8 so diagnostics can
+ * inspect them, but silently binding an unknown format as R8 is worse than a
+ * null texture because it makes a draw look like some unrelated previous
+ * texture. */
+static int vp_texture_base_supported(u32 basef)
+{
+    switch (basef) {
+    case 0x81:                         /* B8 */
+    case 0x82: case 0x83: case 0x84: /* packed 16-bit colour */
+    case 0x85: case 0x9E:             /* A8R8G8B8 / D8R8G8B8 */
+    case 0x86: case 0x87: case 0x88: /* DXT1/23/45 */
+    case 0x8B: case 0x8C: case 0x8D: /* G8B8 / HILO8 */
+    case 0x90: case 0x92: case 0x94: /* depth / X16 */
+    case 0x95:                         /* Y16_X16 */
+    case 0x97: case 0x9D:             /* packed 16-bit colour */
+    case 0x9A: case 0x9B: case 0x9C: case 0x9F: /* float */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static DXGI_FORMAT vp_dxgi_from_texfmt(rsx_texfmt f)
+{
+    switch (f) {
+    case RSX_TEXFMT_R8G8B8A8: return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case RSX_TEXFMT_R8G8: return DXGI_FORMAT_R8G8_UNORM;
+    case RSX_TEXFMT_BC1: return DXGI_FORMAT_BC1_UNORM;
+    case RSX_TEXFMT_BC2: return DXGI_FORMAT_BC2_UNORM;
+    case RSX_TEXFMT_BC3: return DXGI_FORMAT_BC3_UNORM;
+    case RSX_TEXFMT_R16: return DXGI_FORMAT_R16_UNORM;
+    case RSX_TEXFMT_R16G16: return DXGI_FORMAT_R16G16_UNORM;
+    case RSX_TEXFMT_R16G16F: return DXGI_FORMAT_R16G16_FLOAT;
+    case RSX_TEXFMT_R16G16B16A16F: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case RSX_TEXFMT_R32F: return DXGI_FORMAT_R32_FLOAT;
+    case RSX_TEXFMT_R32G32B32A32F: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+    case RSX_TEXFMT_R8:
+    default: return DXGI_FORMAT_R8_UNORM;
+    }
+}
+
 /* Morton/Z-order texel offset for RSX swizzled textures (LN bit clear).
  * Interleaves x (even bit positions) and y (odd) until the smaller dimension's
  * bits run out, then the larger dimension's remaining bits ride above -- the
@@ -3390,18 +3433,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, u32 guest_pitch, i
     /* The DECODED image's format, which is not always the guest's: the packed
      * 16-bit colour formats arrive here unpacked to RGBA8, and DEPTH24_D8 as a
      * float. rsx_texture_layout.h says which class each format byte lands in. */
-    DXGI_FORMAT dxfmt = (tl.fmt == RSX_TEXFMT_R8G8B8A8) ? DXGI_FORMAT_R8G8B8A8_UNORM
-                      : (tl.fmt == RSX_TEXFMT_R8G8)     ? DXGI_FORMAT_R8G8_UNORM
-                      : (tl.fmt == RSX_TEXFMT_BC1)      ? DXGI_FORMAT_BC1_UNORM
-                      : (tl.fmt == RSX_TEXFMT_BC2)      ? DXGI_FORMAT_BC2_UNORM
-                      : (tl.fmt == RSX_TEXFMT_BC3)      ? DXGI_FORMAT_BC3_UNORM
-                      : (tl.fmt == RSX_TEXFMT_R16)      ? DXGI_FORMAT_R16_UNORM
-                      : (tl.fmt == RSX_TEXFMT_R16G16)   ? DXGI_FORMAT_R16G16_UNORM
-                      : (tl.fmt == RSX_TEXFMT_R16G16F)  ? DXGI_FORMAT_R16G16_FLOAT
-                      : (tl.fmt == RSX_TEXFMT_R16G16B16A16F) ? DXGI_FORMAT_R16G16B16A16_FLOAT
-                      : (tl.fmt == RSX_TEXFMT_R32F)     ? DXGI_FORMAT_R32_FLOAT
-                      : (tl.fmt == RSX_TEXFMT_R32G32B32A32F) ? DXGI_FORMAT_R32G32B32A32_FLOAT
-                      : DXGI_FORMAT_R8_UNORM;
+    DXGI_FORMAT dxfmt = vp_dxgi_from_texfmt(tl.fmt);
     /* DXT data is stored as linear 4x4 block rows (compressed formats are
      * never Morton-swizzled on RSX). Row of blocks = (w/4)*blocksize. */
     u32 blkrow  = dxt ? tl.row_bytes : 0;
@@ -4838,13 +4870,54 @@ static void off_rt_transition(int slot, D3D12_RESOURCE_STATES to)
     r->st = to;
 }
 
-/* Replay display-source NV3089 copies at their FIFO/draw boundary.  The source
- * is the current persistent display snapshot at that point; the destination is
- * its own OffRT resource, so later screen_copy_capture() calls cannot mutate an
- * already-completed copy. */
-static void display_blit_replay_until(u32 draw_pos)
+/* A swapchain backbuffer does not preserve the previously scanned-out image:
+ * render_frame() starts by clearing the new buffer.  RSX display memory does
+ * persist, however, and this title immediately copies that display surface with
+ * NV3089 before/among the next frame's draws.  Seed the new backbuffer from the
+ * last completed display snapshot only for batches that contain such ordered
+ * display copies.  Guest clears/draws then modify this image in FIFO order. */
+static void display_blit_seed_framebuffer(u32 fi)
 {
-    if (!s_screen_copy || !s_d3d.cmd_list) return;
+    if (!s_screen_copy || !s_d3d.cmd_list || fi >= FRAME_COUNT ||
+        !s_d3d.render_targets[fi] || !s_display_blit_count)
+        return;
+
+    D3D12_RESOURCE_BARRIER b[2] = {0};
+    b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b[0].Transition.pResource = s_d3d.render_targets[fi];
+    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    b[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b[1] = b[0];
+    b[1].Transition.pResource = s_screen_copy;
+    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 2, b);
+
+    s_d3d.cmd_list->lpVtbl->CopyResource(
+        s_d3d.cmd_list, s_d3d.render_targets[fi], s_screen_copy);
+
+    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 2, b);
+
+    { static int sn = 0; if (sn++ < 16)
+        fprintf(stderr,
+                "[NV3089-SEED] frame=%u backbuffer=%p <- previous display %p%c",
+                fi, (void*)s_d3d.render_targets[fi], (void*)s_screen_copy, 10); }
+}
+
+/* Replay display-source NV3089 copies at their exact FIFO/draw boundary.  The
+ * source must be the LIVE display surface after all preceding draws in this
+ * batch, not s_screen_copy (which is only a persistent snapshot and therefore
+ * can be one frame old).  Copying the current backbuffer gives the NV3089 op
+ * value semantics: later display writes cannot mutate the destination. */
+static void display_blit_replay_until(u32 draw_pos, u32 fi)
+{
+    if (!s_d3d.cmd_list || fi >= FRAME_COUNT || !s_d3d.render_targets[fi]) return;
+    ID3D12Resource* display = s_d3d.render_targets[fi];
     for (u32 i = 0; i < s_display_blit_count; i++) {
         D3D12DisplayBlitOp* op = &s_display_blit_ops[i];
         if (op->done || op->draw_pos > draw_pos) continue;
@@ -4857,24 +4930,24 @@ static void display_blit_replay_until(u32 draw_pos)
         off_rt_transition(op->dst_rt, D3D12_RESOURCE_STATE_COPY_DEST);
         D3D12_RESOURCE_BARRIER b = {0};
         b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        b.Transition.pResource = s_screen_copy;
-        b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        b.Transition.pResource = display;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
         b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
         s_d3d.cmd_list->lpVtbl->CopyResource(
-            s_d3d.cmd_list, s_d3d.off_rt[op->dst_rt].res, s_screen_copy);
+            s_d3d.cmd_list, s_d3d.off_rt[op->dst_rt].res, display);
         b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
         s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
         off_rt_transition(op->dst_rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         op->done = 1;
 
         { static int rn = 0; if (rn++ < 32)
             fprintf(stderr,
-                    "[NV3089-REPLAY] pos=%u dst=0x%08X rt=%d <- snapshot %p%c",
+                    "[NV3089-REPLAY] pos=%u dst=0x%08X rt=%d <- live display %p%c",
                     op->draw_pos, op->dst_raw, op->dst_rt,
-                    (void*)s_screen_copy, 10); }
+                    (void*)display, 10); }
     }
 }
 
@@ -5732,9 +5805,7 @@ static void render_frame(void)
                     continue;
                 }
                 u32 _bf = dr->tex[_u].fmt & 0x9F;
-                if (dr->tex[_u].off &&
-                    (_bf == 0x81 || _bf == 0x85 || _bf == 0x8B ||
-                     (_bf >= 0x86 && _bf <= 0x88))) {
+                if (dr->tex[_u].off && vp_texture_base_supported(_bf)) {
                     double _tt = perf_on() ? perf_now() : 0.0;
                     int _cube = dr->tex[_u].cube && (dr_cube_mask(dr) & (1u << _u));
                     int ts = vp_upload_tex_slot(dr->tex[_u].off, dr->tex[_u].w,
@@ -5752,13 +5823,10 @@ static void render_frame(void)
                                     _d, _u, wslot, ts, dr->tex[_u].raw,
                                     (void*)s_d3d.vp_tex[ts].res,
                                     (_bf == 0x81) ? 0x1000u : rsx_remap_to_d3d(dr->tex[_u].ctrl1, _bf), 10);
-                        DXGI_FORMAT sf =
-                            (_bf == 0x85) ? DXGI_FORMAT_R8G8B8A8_UNORM :
-                            (_bf == 0x8B) ? DXGI_FORMAT_R8G8_UNORM :
-                            (_bf == 0x86) ? DXGI_FORMAT_BC1_UNORM :
-                            (_bf == 0x87) ? DXGI_FORMAT_BC2_UNORM :
-                            (_bf == 0x88) ? DXGI_FORMAT_BC3_UNORM :
-                                            DXGI_FORMAT_R8_UNORM;
+                        rsx_tex_layout _tl;
+                        rsx_texture_layout_pitched(dr->tex[_u].fmt, dr->tex[_u].w,
+                                                   dr->tex[_u].h, dr->tex[_u].pitch, &_tl);
+                        DXGI_FORMAT sf = vp_dxgi_from_texfmt(_tl.fmt);
                         srv_write_ex(wslot, s_d3d.vp_tex[ts].res, sf,
                                   (_bf == 0x81) ? 0x1000
                                                 : rsx_remap_to_d3d(dr->tex[_u].ctrl1, _bf),
@@ -5819,6 +5887,12 @@ static void render_frame(void)
         s_d3d.cmd_list, dsv_handle,
         D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
         1.0f, 0, 0, NULL);
+
+    /* The host clear above is only an implementation convenience; PS3 display
+     * memory itself persists.  Restore the previous scanout before replaying
+     * any display-source NV3089 op so FIFO-ordered copies see the same contents
+     * the guest would see, then let guest clears/draws update it normally. */
+    display_blit_seed_framebuffer(fi);
 
     /* Set viewport and scissor */
     D3D12_VIEWPORT viewport = {0, 0, (float)s_d3d.width, (float)s_d3d.height, 0.0f, 1.0f};
@@ -6008,7 +6082,7 @@ static void render_frame(void)
                  * when the guest copies the display at that boundary, the copy
                  * must freeze the just-rendered display image, not the previous
                  * frame's snapshot. */
-                display_blit_replay_until(d);
+                display_blit_replay_until(d, fi);
                 /* Render-to-texture: retarget when this op's surfaces differ.
                  * Depth is a single shared buffer, so clear it per switch. */
                 int want  = dr->rt_off  ? off_rt_find(dr->rt_off)  : -1;
@@ -6243,7 +6317,7 @@ static void render_frame(void)
                             dr->vs_idx, dr->cb_slot, dr->vb_byte_offset / 256,
                             dr->cull, dr->blend, 10); } }
             }
-            display_blit_replay_until(s_d3d.draw_count);
+            display_blit_replay_until(s_d3d.draw_count, fi);
             if (perf_on()) s_perf_gpu += perf_now() - _rec0;   /* reuse: record time */
             /* Leave the backbuffer bound for the dump/present epilogue. */
             if (cur_rt >= 0) {
@@ -8323,6 +8397,48 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
     u32 height = tex->image_rect & 0xFFFF;
     u32 format = (tex->format >> 8) & 0xFF;
     u32 offset = tex->offset;
+    u32 base_fmt = format & 0x9F;   /* strip LN(0x20)/UN(0x40) flags */
+
+    /* The draw recorder currently carries t0..t3.  rsx_commands can still
+     * notify us about all 16 RSX units, so never index cur_texs[] with a unit
+     * outside the recorder's range (the old B8 legacy path did exactly that). */
+    if (unit >= 4) {
+        static u32 seen_units = 0;
+        if (unit < 32 && !(seen_units & (1u << unit))) {
+            seen_units |= 1u << unit;
+            fprintf(stderr, "[TEX-UNIT] ignoring unsupported texture unit=%u raw=0x%08X fmt=0x%02X%c",
+                    unit, offset, format, 10);
+        }
+        return;
+    }
+
+    /* CONTROL0 bit 31 is the RSX texture-unit enable bit.  Null/Metal already
+     * unbind on disable; D3D12 used to retain the preceding resource, so a UI
+     * sprite that disabled/reused a unit sampled whichever snow/logo/credit
+     * texture happened to be there before it.  Invalid/unsupported bindings
+     * must likewise clear state rather than inherit an unrelated texture. */
+    if (!(tex->control0 & 0x80000000u) || !offset || !width || !height) {
+        if (s_d3d.cur_texs[unit].set) {
+            static int n = 0;
+            if (n++ < 32)
+                fprintf(stderr, "[TEX-STATE] disable unit=%u prev_raw=0x%08X ctrl0=0x%08X%c",
+                        unit, s_d3d.cur_texs[unit].raw, tex->control0, 10);
+        }
+        memset(&s_d3d.cur_texs[unit], 0, sizeof(s_d3d.cur_texs[unit]));
+        if (unit == 0) s_d3d.tex_bound = 0;
+        return;
+    }
+    if (!vp_texture_base_supported(base_fmt)) {
+        static u32 seen_fmt[32]; static int ns = 0; int known = 0;
+        for (int i = 0; i < ns; i++) if (seen_fmt[i] == base_fmt) known = 1;
+        if (!known && ns < 32) { seen_fmt[ns++] = base_fmt;
+            fprintf(stderr, "[TEX-UNSUPPORTED] unit=%u raw=0x%08X fmt=0x%02X base=0x%02X %ux%u -- unbound%c",
+                    unit, offset, format, base_fmt, width, height, 10);
+        }
+        memset(&s_d3d.cur_texs[unit], 0, sizeof(s_d3d.cur_texs[unit]));
+        if (unit == 0) s_d3d.tex_bound = 0;
+        return;
+    }
     /* CUBEDBG=1: NV4097_SET_TEXTURE_FORMAT bit 2 is the cubemap flag, and the
      * line above throws it away with the rest of the low byte. Nothing in this
      * backend handles cube textures, so a cubemap bound for an environment
@@ -8375,20 +8491,15 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
 
     if (!vm_base || width == 0 || height == 0) return;
 
-    /* Record the currently-bound atlas so subsequent quad draws sample it. The
-     * actual GPU upload happens in render_frame (we have no open command list
-     * here). Only the 8-bit single-channel font atlas (B8, RSX fmt base 0x81 /
-     * as-seen 0xA1 with the LN flag) is wired up so far; other formats fall
-     * back to untextured. */
-    u32 base_fmt = format & 0x9F;   /* strip LN(0x20)/UN(0x40) flags */
-    /* VP path: record the latest bound texture (any supported format) so draws
-     * can carry it per-draw. Location bits (format[1:0]): 1 = LOCAL, 2 = MAIN. */
+    /* Record the currently-bound guest texture so subsequent VP draws sample
+     * it. The actual GPU upload happens in render_frame (there is no open
+     * command list here). Format classification/decoding is shared with the
+     * Metal backend through rsx_texture_layout.c. */
+    /* VP path: record the latest bound texture (any format the shared
+     * decoder explicitly supports) so draws can carry it per-draw. Location
+     * bits (format[1:0]): 1 = LOCAL, 2 = MAIN. */
     extern u32 cellGcmResolveLocated(int local, u32 offset);
-    if (unit < 4 &&
-        (base_fmt == 0x81 /* B8 */ || base_fmt == 0x85 /* A8R8G8B8 */ ||
-         base_fmt == 0x8B /* G8B8: LBP's font atlas */ ||
-         (base_fmt >= 0x86 && base_fmt <= 0x88) /* DXT1/23/45 */ ||
-         base_fmt == 0x9A /* W16Z16Y16X16 half-float: RTT intermediates */)) {
+    {
         /* TEX_RESOLVE_AUTO=1: resolve through the page tables (local-page map
          * then IO table) instead of trusting the format's location bits. A
          * texture the guest built in main memory but tagged local resolves to
@@ -8505,8 +8616,8 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
                         (tex->format>>16)&0xFFFFu, (tex->format&4)?1:0, offset, 10); } }
         s_d3d.cur_texs[unit].set = 1;
     }
-    if (base_fmt == 0x81 /* B8 */) {
-        s_d3d.tex_src_offset = s_d3d.cur_texs[unit].off;
+    if (unit == 0 && base_fmt == 0x81 /* B8 */) {
+        s_d3d.tex_src_offset = s_d3d.cur_texs[0].off;
         if (s_d3d.tex_w != width || s_d3d.tex_h != height) {
             /* dims changed -> resource must be (re)created in render_frame */
             s_d3d.tex_ready = 0;
