@@ -165,7 +165,18 @@ typedef struct {
  * references unit 0. */
 #define DRAW_DESC_WIDTH 16
 #define DRAW_SRV_BASE 32
-#define SRV_HEAP_SIZE (DRAW_SRV_BASE + MAX_DRAWS * DRAW_DESC_WIDTH)
+/* Per-draw SRVs are GPU-visible descriptors and therefore have the same
+ * lifetime problem as the mapped VP/CB streams: frame N+1 may be prepared
+ * while frame N is still executing. Keep two complete descriptor windows and
+ * select them with vp_parity, rather than rewriting descriptors referenced by
+ * an in-flight command list. */
+#define DRAW_SRV_FRAME_STRIDE (MAX_DRAWS * DRAW_DESC_WIDTH)
+#define SRV_HEAP_SIZE (DRAW_SRV_BASE + FRAME_COUNT * DRAW_SRV_FRAME_STRIDE)
+static u32 draw_srv_slot(u32 parity, u32 draw, u32 unit)
+{
+    return DRAW_SRV_BASE + (parity % FRAME_COUNT) * DRAW_SRV_FRAME_STRIDE
+         + draw * DRAW_DESC_WIDTH + unit;
+}
 #define VP_SMP_TABLE_WIDTH 16
 #define VP_SMP_TABLES 128 /* 128*16 = 2048, D3D12 shader-visible sampler-heap limit */
 #define VP_SMP_HEAP_SIZE (VP_SMP_TABLE_WIDTH * VP_SMP_TABLES)
@@ -173,8 +184,10 @@ typedef struct {
 #define VP_SMP_CPU_HEAP_SIZE (VP_SMP_CACHE_SLOTS + 1) /* slot 0 = default */
 
 /* Per-frame VP texture slot: a guest texture uploaded for this frame's VP
- * draws (re-uploaded every frame -- gcm/cube's plasma animates in guest
- * memory). SRV lives at heap index 1+slot. */
+ * draws (re-uploaded when guest bytes change). The resource itself is cached
+ * here; its SRV is written only into the parity-protected per-draw descriptor
+ * window. Older code also wrote a legacy SRV at heap[1+slot], which overlapped
+ * both offscreen-RT descriptors and draw tables once slot >= 31. */
 typedef struct {
     ID3D12Resource* res;
     ID3D12Resource* up;
@@ -1273,11 +1286,11 @@ static int init_d3d12(u32 width, u32 height)
             if (ptb) ptb->lpVtbl->Release(ptb);
         }
 
-        /* SRV descriptor heap (shader-visible). Layout: slot 0 = legacy atlas
-         * (dbgfont / textured 2D path), slots 1-4 = per-draw VP textures,
-         * 5-20 = offscreen render targets (render-to-texture), rest spare.
-         * All slots start as null SRVs so any 4-wide table window (the
-         * root signature binds t0-t3) is valid on tier-1 hardware. */
+        /* SRV descriptor heap (shader-visible). Layout: slot 0 = legacy atlas,
+         * slots 5-20 = fixed offscreen-RT descriptors, slots 32+ = two full
+         * parity-separated per-draw 16-wide SRV tables. VP texture resources do
+         * not own persistent descriptors; each draw writes the correct remap
+         * into its current parity window. All slots start as null SRVs. */
         {
             D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
             hd.Type  = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -3126,8 +3139,9 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
 
 /* Upload the guest texture for a VP draw into a per-frame texture slot
  * (re-uploaded every frame: gcm/cube's plasma animates in guest memory).
- * Returns the slot index (SRV at heap 1+slot) or -1. Must run while the
- * command list is open, before the draw passes. */
+ * Returns the cached resource slot index or -1. Must run while the command
+ * list is open, before the draw passes. Per-draw SRVs are emitted by the
+ * caller into its parity-protected descriptor window. */
 /* NV4097 TEXTURE_CONTROL1 component remap -> D3D12 Shader4ComponentMapping.
  * The crossbar decode itself is RSX semantics and lives in
  * rsx_texture_layout.c; all that is left here is packing the four selectors
@@ -4089,26 +4103,10 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, u32 guest_pitch, i
             s_logo_tex_copy_issued = 1;
         }
     }
-    /* SRV at heap slot 1+slot */
-    D3D12_SHADER_RESOURCE_VIEW_DESC sv = {0};
-    sv.Format = dxfmt;
-    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    /* RSX B8 replicates the byte into all four channels (dbgfont's FP reads
-     * coverage from .w); DXGI R8 defaults to (r,0,0,1), so swizzle (R,R,R,R)
-     * = encoded 0x1000 (component 0 in all lanes + always-set bit). ARGB8
-     * keeps the identity mapping. */
-    sv.Shader4ComponentMapping = (basef == 0x81) ? 0x1000 : D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    sv.Texture2D.MipLevels = 1;
-    D3D12_CPU_DESCRIPTOR_HANDLE sh;
-    s_d3d.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &sh);
-    sh.ptr += (u64)(1 + slot) * s_d3d.srv_inc;
-    if (cube) {
-        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
-        sv.TextureCube.MipLevels = 1;
-        sv.TextureCube.MostDetailedMip = 0;
-        sv.TextureCube.ResourceMinLODClamp = 0.0f;
-    }
-    s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, t->res, &sv, sh);
+    /* Do NOT create a persistent SRV at heap[1+slot].  vp_tex has 96 cache
+     * entries, so those descriptors reached heap[32..96] and overwrote the
+     * first per-draw SRV tables.  The draw prepass below already creates the
+     * correctly-remapped SRV from t->res in its own descriptor window. */
 
     t->off = off; t->key = key_off; t->w = w; t->h = h; t->fmt = fmt;
     t->guest_pitch = guest_pitch;
@@ -5627,13 +5625,18 @@ static void render_frame(void)
         if (rt < 0) op->done = 1;
     }
 
-    /* Per-frame VP textures + guest-FP pipelines: for each VP draw, upload the
-     * texture it had bound at submit time into a slot (SRV heap 1+slot; plasma
-     * animates so contents re-upload every frame) and pre-build its FP PSO.
-     * A texture whose offset matches an offscreen RT samples the RT directly
-     * (tex_slot 1000+idx) -- no guest-memory upload. */
+    /* Per-frame VP textures + guest-FP pipelines: for each VP draw, upload or
+     * locate the texture resource it had bound at submit time, then write an
+     * SRV into this frame parity's per-draw descriptor window and pre-build its
+     * FP PSO. A texture whose offset matches an offscreen RT samples that RT
+     * directly -- no guest-memory upload. */
     double _pre0 = perf_on() ? perf_now() : 0.0;
     for (int _i = 0; _i < VP_TEX_SLOTS; _i++) s_d3d.vp_tex[_i].used = 0;
+    { static int _srv_ring_log = 0;
+      if (_srv_ring_log++ < 8)
+          fprintf(stderr, "[SRV-RING] parity=%d base=%u stride=%u draws=%u%c",
+                  s_d3d.vp_parity, draw_srv_slot((u32)s_d3d.vp_parity, 0, 0),
+                  (u32)DRAW_SRV_FRAME_STRIDE, s_d3d.draw_count, 10); }
     for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
         D3D12DrawRecord* dr = &s_d3d.draws[_d];
         if (!dr->is_vp || dr->is_clear) continue;
@@ -5713,12 +5716,35 @@ static void render_frame(void)
                               dr->tex[_u].fmt, dr->fp_addr, dr->vertex_count,
                               dr->vp_x, dr->vp_y, dr->vp_w, dr->vp_h, 10); }
               } }
+        /* Title/UI texture signature probe.  It is intentionally data-only and
+         * capped: if the snowflake remains wrong after descriptor lifetime is
+         * fixed, the next log tells us its exact format/remap/wrap/filter state
+         * without another instrument-only build. */
+        if (s_d3d.draw_count >= 32) {
+            static u64 _title_seen[96]; static int _title_n = 0;
+            for (int _tu = 0; _tu < 4; _tu++) if (dr->tex[_tu].set && _title_n < 96) {
+                u64 _k = ((u64)dr->tex[_tu].raw << 32)
+                       ^ ((u64)(dr->tex[_tu].fmt & 0xFFu) << 24)
+                       ^ ((u64)(dr->tex[_tu].w & 0xFFFu) << 12)
+                       ^ (u64)(dr->tex[_tu].h & 0xFFFu);
+                int _known = 0;
+                for (int _ti = 0; _ti < _title_n; _ti++) if (_title_seen[_ti] == _k) { _known = 1; break; }
+                if (!_known) {
+                    _title_seen[_title_n++] = _k;
+                    fprintf(stderr, "[TITLE-TEX] u=%d raw=0x%08X off=0x%08X fmt=0x%02X %ux%u pitch=%u ctrl1=0x%08X addr=0x%08X ctrl0=0x%08X filt=0x%08X%c",
+                            _tu, dr->tex[_tu].raw, dr->tex[_tu].off, dr->tex[_tu].fmt,
+                            dr->tex[_tu].w, dr->tex[_tu].h, dr->tex[_tu].pitch,
+                            dr->tex[_tu].ctrl1, dr->tex[_tu].address,
+                            dr->tex[_tu].control0, dr->tex[_tu].filter, 10);
+                }
+            }
+        }
         /* Fill this draw's 16-wide SRV window. Units 0..3 are currently tracked; each unit
          * resolves to an offscreen RT (sampled directly), an uploaded guest
          * texture, or a null SRV. */
         double _sv0 = perf_on() ? perf_now() : 0.0;
         for (int _u = 0; _u < 4; _u++) {
-            u32 wslot = DRAW_SRV_BASE + _d * DRAW_DESC_WIDTH + (u32)_u;
+            u32 wslot = draw_srv_slot((u32)s_d3d.vp_parity, _d, (u32)_u);
             dr->tex_rt[_u] = -1;
             /* Only a texture that aliases an actually registered display
              * buffer may sample s_screen_copy.  Matching the display dimensions
@@ -6228,7 +6254,7 @@ static void render_frame(void)
                         off_rt_transition(rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                 }
                 D3D12_GPU_DESCRIPTOR_HANDLE gh = gh_base;
-                gh.ptr += (u64)(DRAW_SRV_BASE + d * DRAW_DESC_WIDTH) * s_d3d.srv_inc;
+                gh.ptr += (u64)draw_srv_slot((u32)s_d3d.vp_parity, d, 0) * s_d3d.srv_inc;
                 s_d3d.cmd_list->lpVtbl->SetGraphicsRootDescriptorTable(s_d3d.cmd_list, 1, gh);
                 if (s_d3d.vp_sampler_heap) {
                     int sti = vp_sampler_table_for_draw(dr);
