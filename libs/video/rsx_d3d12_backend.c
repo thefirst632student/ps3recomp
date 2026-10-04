@@ -80,6 +80,7 @@ typedef struct {
     /* VP path per-draw shader/texture state, captured at draw_arrays time. */
     u32 fp_addr;        /* SET_SHADER_PROGRAM value (guest FP ucode location)   */
     int fp_exp32;       /* SET_SHADER_CONTROL 32-bit-exports bit at draw time   */
+    u32 texcoord_2d_mask; /* SET_TEX_COORD_CONTROL[0..9] bit0 snapshot */
     u32 alpha_ctl;      /* alpha test: enable<<16 | (func&0xFF)<<8 | ref */
     u32 begin_epoch;    /* SET_BEGIN_END generation, for batch concatenation */
     u32 merge_dyn_sig;  /* draw-time VP constants/attribs/microcode fingerprint */
@@ -242,6 +243,7 @@ typedef struct {
     u32 cmask;              /* colour write mask (PSO key) */
     u32 cull;               /* packed face culling (PSO key) */
     u32 depth;              /* packed guest depth state (PSO key) */
+    u32 texcoord_2d_mask;   /* 2D fragment-interpolant control mask (PSO key) */
     u32 cube_mask;          /* which units are cube textures (PSO key): the HLSL
                              * declares those samplers as TextureCube, so a cube
                              * and a 2D variant of the same program are different
@@ -2638,9 +2640,51 @@ static u32 dr_cube_mask(const D3D12DrawRecord* dr)
     return m;
 }
 
+static u32 rsx_texcoord_2d_mask(const rsx_state* st)
+{
+    u32 m = 0;
+    if (!st) return 0;
+    for (u32 i = 0; i < 10; i++)
+        m |= (st->texcoord_control[i] & 1u) << i;
+    return m;
+}
+
+/* RPCS3 oracle: SET_TEX_COORD_CONTROL bit0 makes TCn a 2D fragment input.
+ * gl_FragCoord.w is reciprocal clip-W, and D3D pixel-shader SV_Position.w has
+ * the same reciprocal-W role, so reconstructed W is 1/SV_Position.w. Z is 0.
+ * Inject after the decompiler's main() prologue so every INPUT read sees the
+ * corrected value without changing the NV40 instruction decoder itself. */
+static int fp_apply_texcoord_2d_control(char* hlsl, size_t cap, u32 mask)
+{
+    if (!hlsl || !mask) return 0;
+    char* sig = strstr(hlsl, "main(PSInput input) {");
+    if (!sig) return -1;
+    char* at = strchr(sig, '\n');
+    if (!at) return -1;
+    at++;
+    char ins[1024];
+    size_t n = 0;
+    for (u32 i = 0; i < 8; i++) {
+        if (!(mask & (1u << i))) continue;
+        int w = snprintf(ins + n, sizeof(ins) - n,
+            "    input.tc%u = float4(input.tc%u.xy, 0.0f, "
+            "(input.position.w != 0.0f ? 1.0f / input.position.w : 0.0f));\n",
+            i, i);
+        if (w < 0 || (size_t)w >= sizeof(ins) - n) return -1;
+        n += (size_t)w;
+    }
+    if (!n) return 0;
+    size_t used = strlen(hlsl) + 1u;
+    size_t off = (size_t)(at - hlsl);
+    if (used + n > cap) return -1;
+    memmove(hlsl + off + n, hlsl + off, used - off);
+    memcpy(hlsl + off, ins, n);
+    return (int)n;
+}
+
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
                                           DXGI_FORMAT rtfmt, int exp32, u32 cmask, u32 cull,
-                                          u32 depth, u32 cube_mask)
+                                          u32 depth, u32 cube_mask, u32 texcoord_2d_mask)
 {
     if (nrt < 1) nrt = 1; if (nrt > 4) nrt = 4;
     if (rtfmt == 0) rtfmt = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -2690,7 +2734,8 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             s_d3d.vp_fp[i].rtfmt == (u32)rtfmt && s_d3d.vp_fp[i].exp32 == exp32 &&
             s_d3d.vp_fp[i].ucode_hash == uhash && s_d3d.vp_fp[i].cmask == cmask &&
             s_d3d.vp_fp[i].cull == cull && s_d3d.vp_fp[i].depth == depth &&
-            s_d3d.vp_fp[i].cube_mask == cube_mask)
+            s_d3d.vp_fp[i].cube_mask == cube_mask &&
+            s_d3d.vp_fp[i].texcoord_2d_mask == texcoord_2d_mask)
             return s_d3d.vp_fp[i].pso;
     s_perf_pso_miss++;      /* falls through to a full decompile + D3DCompile */
     /* PSOMISSDBG=1: on a miss, name the key field that differs from an existing
@@ -2749,6 +2794,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      * draw -- exactly what the WA2 logo probes observed. */
     const u32 fp_ctrl = exp32 ? 0x40u : 0u;
     int n = rsx_fp_decompile(vm_base + off, 4096, fp_ctrl, hlsl, sizeof(hlsl));
+    if (n > 0 && texcoord_2d_mask) fp_apply_texcoord_2d_control(hlsl, sizeof(hlsl), texcoord_2d_mask);
     if (n <= 0) { static int _e=0; if(_e++<16) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr); return NULL; }
 
     /* WA2 warning-2 FP raw probe.  Dump the exact guest microcode for
@@ -3151,6 +3197,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     s_d3d.vp_fp[s_d3d.vp_fp_n].cmask   = cmask;
     s_d3d.vp_fp[s_d3d.vp_fp_n].cull    = cull;
     s_d3d.vp_fp[s_d3d.vp_fp_n].depth   = depth;
+    s_d3d.vp_fp[s_d3d.vp_fp_n].texcoord_2d_mask = texcoord_2d_mask;
     s_d3d.vp_fp[s_d3d.vp_fp_n].cube_mask = cube_mask;
     s_d3d.vp_fp[s_d3d.vp_fp_n].pso     = pso;
     s_d3d.vp_fp_n++;
@@ -4599,6 +4646,7 @@ static int d3d12_merge_state_matches_current(const D3D12DrawRecord* dr)
     if (dr->merge_dyn_sig != vp_merge_dynamic_sig(st)) return 0;
     if (dr->fp_addr != st->shader_program) return 0;
     if (dr->fp_exp32 != ((st->shader_control & 0x40u) != 0)) return 0;
+    if (dr->texcoord_2d_mask != rsx_texcoord_2d_mask(st)) return 0;
     if (dr->cull != rsx_cull_key(st) || dr->depth != rsx_depth_key(st)) return 0;
     {
         u32 cm = ((st->color_mask & 0x00010000u) ? 1u : 0u)
@@ -5976,13 +6024,13 @@ static void render_frame(void)
                         u32 _vh = (_vb && _vbytes) ? tex_csum(_vb, _vbytes) : 0;
                         u32 _full = tex_csum_full(vm_base + dr->tex[_u].off, _nb);
                         fprintf(stderr,
-                            "[SNOW-DRAW] frame=%llu draw=%u rec=%08X now=%08X full=%08X vtx=%08X verts=%u fp=0x%08X blend=%d key=0x%08X alpha=0x%08X map=0x%X pitch=%u%c",
+                            "[SNOW-DRAW] frame=%llu draw=%u rec=%08X now=%08X full=%08X vtx=%08X verts=%u fp=0x%08X blend=%d key=0x%08X alpha=0x%08X map=0x%X pitch=%u tc2d=0x%X%c",
                             (unsigned long long)s_d3d.frame_count, _d,
                             dr->tex[_u].diag_src_csum, _now, _full, _vh,
                             dr->vertex_count, dr->fp_addr, dr->blend,
                             dr->blend_key, dr->alpha_ctl,
                             rsx_remap_to_d3d(dr->tex[_u].ctrl1, dr->tex[_u].fmt & 0x9Fu),
-                            dr->tex[_u].pitch, 10);
+                            dr->tex[_u].pitch, dr->texcoord_2d_mask, 10);
                     }
                 }
             }
@@ -6122,7 +6170,7 @@ static void render_frame(void)
                                        dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                   : DXGI_FORMAT_R8G8B8A8_UNORM,
                                        dr->fp_exp32, dr->cmask, dr->cull, dr->depth,
-                                       dr_cube_mask(dr));
+                                       dr_cube_mask(dr), dr->texcoord_2d_mask);
         if (perf_on()) s_perf_pso += perf_now() - _ps0;
     }
 
@@ -6461,7 +6509,7 @@ static void render_frame(void)
                                                 dr->rt_off ? rsx_surface_dxgi(dr->rt_fmt)
                                                            : DXGI_FORMAT_R8G8B8A8_UNORM,
                                                 dr->fp_exp32, dr->cmask, dr->cull, dr->depth,
-                                                dr_cube_mask(dr)) : NULL;
+                                                dr_cube_mask(dr), dr->texcoord_2d_mask) : NULL;
                 s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list,
                                                          dpso ? dpso : vpso);
                 /* Per-draw viewport: the guest rect when sane, else the
@@ -8323,6 +8371,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
                 dr->fp_exp32 = s_d3d.current_rsx_state ?
                     ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
+                dr->texcoord_2d_mask = rsx_texcoord_2d_mask(s_d3d.current_rsx_state);
                 dr->cull = rsx_cull_key(s_d3d.current_rsx_state);
                 dr->depth = rsx_depth_key(s_d3d.current_rsx_state);
             dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
@@ -8453,6 +8502,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
             dr->fp_exp32 = s_d3d.current_rsx_state ?
                 ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
+            dr->texcoord_2d_mask = rsx_texcoord_2d_mask(s_d3d.current_rsx_state);
             dr->cull = rsx_cull_key(s_d3d.current_rsx_state);
             dr->depth = rsx_depth_key(s_d3d.current_rsx_state);
             dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
@@ -8608,6 +8658,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         dr->fp_addr = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->shader_program : 0;
         dr->fp_exp32 = s_d3d.current_rsx_state ?
             ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
+        dr->texcoord_2d_mask = rsx_texcoord_2d_mask(s_d3d.current_rsx_state);
         dr->cull = rsx_cull_key(s_d3d.current_rsx_state);
         dr->depth = rsx_depth_key(s_d3d.current_rsx_state);
         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;

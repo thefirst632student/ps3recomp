@@ -140,6 +140,7 @@ extern "C" {
 
 /* Shader programs */
 #define NV4097_SET_SHADER_PROGRAM               0x000008E4
+#define NV4097_SET_TEX_COORD_CONTROL             0x00000B40 /* + unit*4, units 0..9 */
 #define NV4097_SET_SHADER_CONTROL               0x00001D60
 /* shader_control bit: fragment colour exports come from r0/r2/r3/r4 (32-bit)
  * instead of h0/h4/h6/h8 (half). */
@@ -288,6 +289,11 @@ typedef struct rsx_state {
     u32 alpha_func;
     u32 alpha_ref;
     int alpha_dirty;
+
+    /* Fragment texcoord control (NV4097_SET_TEX_COORD_CONTROL[0..9]).
+     * Bit 0 marks that interpolant as 2D; the fragment input must become
+     * (x,y,0,clipW), matching RSX/RPCS3 semantics. */
+    u32 texcoord_control[10];
 
     /* Textures */
     rsx_texture_state textures[RSX_MAX_TEXTURES];
