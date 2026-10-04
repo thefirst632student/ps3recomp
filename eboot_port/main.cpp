@@ -254,15 +254,15 @@ static DWORD WINAPI frame_clock(LPVOID)
                 exit(0);
 #endif
             }
-            /* Present on a guest flip. A present on a fixed clock can catch the
-             * drain mid-frame and flash a partial one. Before the first flip
-             * present freely, so the window is not blank during boot. */
+            /* Present only when the guest actually submits a new FLIP.
+             * This preserves the last-known-good timing: completed frames
+             * become visible immediately after their FLIP request instead of
+             * waiting for the next synthesized 16 ms vblank.  Unlike v33, do
+             * not free-run Present() before the first guest flip. */
             unsigned fc = cellGcm_flip_request_count();
             if (fc != last_flip) {
                 present_guest_frame();
                 last_flip = fc;
-            } else if (fc == 0) {
-                rsx_backend_present();
             }
         }
     }
