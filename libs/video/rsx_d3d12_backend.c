@@ -4910,25 +4910,24 @@ static void off_rt_transition(int slot, D3D12_RESOURCE_STATES to)
 }
 
 /* A swapchain backbuffer does not preserve the previously scanned-out image:
- * render_frame() starts by clearing the new buffer.  RSX display memory does
- * persist, however, and this title immediately copies that display surface with
- * NV3089 before/among the next frame's draws.  Seed the new backbuffer from the
- * last completed display snapshot only for batches that contain such ordered
- * display copies.  Guest clears/draws then modify this image in FIFO order. */
+ * render_frame() starts by clearing the new host buffer.  RSX display memory
+ * persists independently of whether the next guest frame happens to issue an
+ * NV3089 display copy.  Therefore restore the last COMPLETED display image for
+ * every frame, then replay guest clears/draws in FIFO order.  A real guest
+ * CLEAR_SURFACE still overwrites this seed normally.  Gating the restore on
+ * s_display_blit_count made alpha-only frames (logo fades) and occasional
+ * snow batches with ops=0 blend against the host clear instead of persistent
+ * guest display memory, producing density-dependent flicker. */
 static void display_blit_seed_framebuffer(u32 fi)
 {
-    if (!s_screen_copy || !s_d3d.cmd_list || fi >= FRAME_COUNT ||
-        !s_d3d.render_targets[fi] || !s_display_blit_count)
-        return;
-    /* s_display_blit_ops now also carries RT->texture snapshots.  Seeding the
-     * new swapchain buffer is required only when this batch actually contains
-     * a display-source copy; an RT-only snapshot must not change scanout. */
-    {
-        int have_display_copy = 0;
-        for (u32 i = 0; i < s_display_blit_count; i++)
-            if (s_display_blit_ops[i].src_kind == 2) { have_display_copy = 1; break; }
-        if (!have_display_copy) return;
+    static int persist = -1;
+    if (persist < 0) {
+        const char* e = getenv("RSX_DISPLAY_PERSIST");
+        persist = (e && *e == '0') ? 0 : 1;
     }
+    if (!persist || !s_screen_copy || !s_d3d.cmd_list || fi >= FRAME_COUNT ||
+        !s_d3d.render_targets[fi])
+        return;
 
     D3D12_RESOURCE_BARRIER b[2] = {0};
     b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -4951,10 +4950,11 @@ static void display_blit_seed_framebuffer(u32 fi)
     b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 2, b);
 
-    { static int sn = 0; if (sn++ < 16)
+    { static int sn = 0; if (sn++ < 32)
         fprintf(stderr,
-                "[NV3089-SEED] frame=%u backbuffer=%p <- previous display %p%c",
-                fi, (void*)s_d3d.render_targets[fi], (void*)s_screen_copy, 10); }
+                "[DISPLAY-PERSIST] frame=%u ops=%u backbuffer=%p <- previous display %p%c",
+                fi, s_display_blit_count, (void*)s_d3d.render_targets[fi],
+                (void*)s_screen_copy, 10); }
 }
 
 /* Dedicated scaling path for full-image NV3089 RT->texture copies.
@@ -6242,9 +6242,8 @@ static void render_frame(void)
         1.0f, 0, 0, NULL);
 
     /* The host clear above is only an implementation convenience; PS3 display
-     * memory itself persists.  Restore the previous scanout before replaying
-     * any display-source NV3089 op so FIFO-ordered copies see the same contents
-     * the guest would see, then let guest clears/draws update it normally. */
+     * memory itself persists.  Restore the previous completed scanout on every
+     * frame, then let guest clears/draws and FIFO-ordered copies modify it. */
     display_blit_seed_framebuffer(fi);
 
     /* Set viewport and scissor */
