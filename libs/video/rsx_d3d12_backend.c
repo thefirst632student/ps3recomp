@@ -82,6 +82,7 @@ typedef struct {
     int fp_exp32;       /* SET_SHADER_CONTROL 32-bit-exports bit at draw time   */
     u32 alpha_ctl;      /* alpha test: enable<<16 | (func&0xFF)<<8 | ref */
     u32 begin_epoch;    /* SET_BEGIN_END generation, for batch concatenation */
+    u32 merge_dyn_sig;  /* draw-time VP constants/attribs/microcode fingerprint */
     u32 cull;           /* packed face culling: bit0 enable, bit1 cull FRONT
                          * (else BACK), bit2 front face is CCW. RSX culls back
                          * faces on most solid geometry; rendering everything
@@ -2174,6 +2175,34 @@ static u32 vp_hash_ucode(const u8* p, u32 n)
 {
     u32 h = 2166136261u;
     for (u32 i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
+    return h ? h : 1u;
+}
+
+static u32 vp_fnv_update(u32 h, const void* data, size_t n)
+{
+    const u8* p = (const u8*)data;
+    for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
+    return h;
+}
+
+/* RPCS3 keeps execution barriers inside a draw clause for transform/base
+ * changes. ps3recomp records host draw calls immediately, so fingerprint the
+ * draw-time inputs that are not already explicit fields on D3D12DrawRecord. */
+static u32 vp_merge_dynamic_sig(const rsx_state* st)
+{
+    if (!st) return 0;
+    u32 h = 2166136261u;
+    h = vp_fnv_update(h, st->vertex_constants, sizeof st->vertex_constants);
+    h = vp_fnv_update(h, st->viewport_scale, sizeof st->viewport_scale);
+    h = vp_fnv_update(h, st->viewport_offset, sizeof st->viewport_offset);
+    h = vp_fnv_update(h, st->vertex_attribs, sizeof st->vertex_attribs);
+    h = vp_fnv_update(h, st->vertex_data4f, sizeof st->vertex_data4f);
+    h = vp_fnv_update(h, &st->frequency_divider_op, sizeof st->frequency_divider_op);
+    h = vp_fnv_update(h, &st->transform_program_start, sizeof st->transform_program_start);
+    h = vp_fnv_update(h, &st->index_array_offset, sizeof st->index_array_offset);
+    h = vp_fnv_update(h, &st->index_array_dma, sizeof st->index_array_dma);
+    if (st->vp_ucode_bytes)
+        h = vp_fnv_update(h, st->vp_ucode, st->vp_ucode_bytes);
     return h ? h : 1u;
 }
 
@@ -4495,6 +4524,111 @@ static u32 current_rt_off(u32* out_w, u32* out_h, u32 out_mrt[3])
     if (out_w) *out_w = w;
     if (out_h) *out_h = h;
     return raw;
+}
+
+/* d3d12_bind_texture is defined below the draw recorders. */
+static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex);
+
+static int d3d12_live_tex_matches(u32 unit, const rsx_texture_state* tex)
+{
+    if (unit >= 4 || !tex) return 1;
+    const u32 w = (tex->image_rect >> 16) & 0xFFFFu;
+    const u32 h = tex->image_rect & 0xFFFFu;
+    const u32 fmt = (tex->format >> 8) & 0xFFu;
+    const u32 base = fmt & 0x9Fu;
+    const int enabled = (tex->control0 & 0x80000000u) && tex->offset && w && h &&
+                        vp_texture_base_supported(base);
+    if (!enabled) return !s_d3d.cur_texs[unit].set;
+    return s_d3d.cur_texs[unit].set &&
+           s_d3d.cur_texs[unit].raw == tex->offset &&
+           s_d3d.cur_texs[unit].w == w && s_d3d.cur_texs[unit].h == h &&
+           s_d3d.cur_texs[unit].fmt == fmt &&
+           s_d3d.cur_texs[unit].pitch == (tex->control3 & 0xFFFFu) &&
+           s_d3d.cur_texs[unit].ctrl1 == tex->control1 &&
+           s_d3d.cur_texs[unit].address == tex->address &&
+           s_d3d.cur_texs[unit].control0 == tex->control0 &&
+           s_d3d.cur_texs[unit].filter == tex->filter &&
+           s_d3d.cur_texs[unit].border == tex->border_color &&
+           s_d3d.cur_texs[unit].cube == ((tex->format & 4u) ? 1 : 0) &&
+           s_d3d.cur_texs[unit].mips == ((tex->format >> 16) & 0xFFFFu);
+}
+
+/* rsx_commands historically flushes dirty textures at SET_BEGIN_END. Keep the
+ * backend binding synchronized with the live RSX registers at the actual draw
+ * boundary; this mirrors the descriptor preparation point in RPCS3. */
+static void d3d12_sync_draw_textures(void)
+{
+    const rsx_state* st = s_d3d.current_rsx_state;
+    if (!st) return;
+    for (u32 u = 0; u < 4; u++) {
+        if (!d3d12_live_tex_matches(u, &st->textures[u])) {
+            static int n = 0;
+            if (n++ < 64)
+                fprintf(stderr, "[DRAW-TEX-SYNC] frame=%llu unit=%u old=0x%08X live=0x%08X ctrl0=0x%08X\n",
+                        (unsigned long long)s_d3d.frame_count, u,
+                        s_d3d.cur_texs[u].set ? s_d3d.cur_texs[u].raw : 0u,
+                        st->textures[u].offset, st->textures[u].control0);
+            d3d12_bind_texture(NULL, u, &st->textures[u]);
+        }
+    }
+}
+
+static int d3d12_record_tex_matches_current(const D3D12DrawRecord* dr, u32 u)
+{
+    if (!dr || u >= 4) return 0;
+    if (dr->tex[u].set != s_d3d.cur_texs[u].set) return 0;
+    if (!dr->tex[u].set) return 1;
+    return dr->tex[u].off == s_d3d.cur_texs[u].off &&
+           dr->tex[u].raw == s_d3d.cur_texs[u].raw &&
+           dr->tex[u].w == s_d3d.cur_texs[u].w && dr->tex[u].h == s_d3d.cur_texs[u].h &&
+           dr->tex[u].fmt == s_d3d.cur_texs[u].fmt &&
+           dr->tex[u].pitch == s_d3d.cur_texs[u].pitch &&
+           dr->tex[u].ctrl1 == s_d3d.cur_texs[u].ctrl1 &&
+           dr->tex[u].address == s_d3d.cur_texs[u].address &&
+           dr->tex[u].control0 == s_d3d.cur_texs[u].control0 &&
+           dr->tex[u].filter == s_d3d.cur_texs[u].filter &&
+           dr->tex[u].border == s_d3d.cur_texs[u].border &&
+           dr->tex[u].cube == s_d3d.cur_texs[u].cube &&
+           dr->tex[u].mips == s_d3d.cur_texs[u].mips;
+}
+
+static int d3d12_merge_state_matches_current(const D3D12DrawRecord* dr)
+{
+    const rsx_state* st = s_d3d.current_rsx_state;
+    if (!dr || !st) return 0;
+    if (dr->merge_dyn_sig != vp_merge_dynamic_sig(st)) return 0;
+    if (dr->fp_addr != st->shader_program) return 0;
+    if (dr->fp_exp32 != ((st->shader_control & 0x40u) != 0)) return 0;
+    if (dr->cull != rsx_cull_key(st) || dr->depth != rsx_depth_key(st)) return 0;
+    {
+        u32 cm = ((st->color_mask & 0x00010000u) ? 1u : 0u)
+               | ((st->color_mask & 0x00000100u) ? 2u : 0u)
+               | ((st->color_mask & 0x00000001u) ? 4u : 0u)
+               | ((st->color_mask & 0x01000000u) ? 8u : 0u);
+        if (dr->cmask != cm) return 0;
+    }
+    {
+        u32 ac = ((st->alpha_test_enable ? 1u : 0u) << 16)
+               | ((st->alpha_func & 0xFFu) << 8)
+               | (st->alpha_ref & 0xFFu);
+        if (dr->alpha_ctl != ac) return 0;
+    }
+    if (dr->blend != st->blend_enable ||
+        dr->blend_key != rsx_blend_key(st, st->blend_enable)) return 0;
+    if (dr->vs_idx != vp_get_vs(st)) return 0;
+    for (u32 u = 0; u < 4; u++)
+        if (!d3d12_record_tex_matches_current(dr, u)) return 0;
+    {
+        u32 w = 0, h = 0, mrt[3] = {0, 0, 0};
+        u32 rt = current_rt_off(&w, &h, mrt);
+        if (dr->rt_off != rt || dr->rt_w != w || dr->rt_h != h ||
+            dr->rt_fmt != st->surface_format ||
+            dr->rt_mrt[0] != mrt[0] || dr->rt_mrt[1] != mrt[1] || dr->rt_mrt[2] != mrt[2])
+            return 0;
+    }
+    if (dr->vp_x != st->viewport_x || dr->vp_y != st->viewport_y ||
+        dr->vp_w != st->viewport_w || dr->vp_h != st->viewport_h) return 0;
+    return 1;
 }
 
 /* RSX surface colour format (SET_SURFACE_FORMAT bits [4:0]) -> DXGI. Float
@@ -7964,6 +8098,8 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
     }
     s_total++;
 
+    d3d12_sync_draw_textures();
+
     /* WA2 warning-2 composition probe.  The screen is built from four
      * consecutive draws.  Log each pass once, including post-fetch vertex
      * attributes and blend/texture state.  This is diagnostic only and does
@@ -8189,8 +8325,8 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                     ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
                 dr->cull = rsx_cull_key(s_d3d.current_rsx_state);
                 dr->depth = rsx_depth_key(s_d3d.current_rsx_state);
-        dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
             dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
+            dr->merge_dyn_sig = vp_merge_dynamic_sig(s_d3d.current_rsx_state);
                 dr->cmask = 0xF;
                 if (s_d3d.current_rsx_state) {
                     u32 _cm = s_d3d.current_rsx_state->color_mask;
@@ -8300,7 +8436,8 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 pv->fp_addr == fpnow && primitive == RSX_PRIMITIVE_TRIANGLES &&
                 pv->begin_epoch == (s_d3d.current_rsx_state
                                     ? s_d3d.current_rsx_state->begin_epoch : 0) &&
-                pv->vb_byte_offset + pv->vertex_count * VP_VERT_STRIDE == rec) {
+                pv->vb_byte_offset + pv->vertex_count * VP_VERT_STRIDE == rec &&
+                d3d12_merge_state_matches_current(pv)) {
                 pv->vertex_count += emitted;
                 s_d3d.merge_first_end = first + count;
                 return;
@@ -8318,8 +8455,8 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 ((s_d3d.current_rsx_state->shader_control & 0x40) != 0) : 1;
             dr->cull = rsx_cull_key(s_d3d.current_rsx_state);
             dr->depth = rsx_depth_key(s_d3d.current_rsx_state);
-        dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
             dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
+            dr->merge_dyn_sig = vp_merge_dynamic_sig(s_d3d.current_rsx_state);
             dr->cmask = 0xF;
             if (s_d3d.current_rsx_state) {
                 u32 _cm = s_d3d.current_rsx_state->color_mask;
@@ -8425,6 +8562,8 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
     if (count == 0 || count > MAX_VERTICES) return;
     if (!s_d3d.vp_vb_mapped || !s_d3d.vp_root_sig) return;
 
+    d3d12_sync_draw_textures();
+
     /* Expand through the VP path (indices resolved CPU-side): QUADS -> two
      * triangles per quad, TRIANGLES straight through, STRIP/FAN -> triangle
      * list. Other primitives are skipped rather than drawn wrong. */
@@ -8452,7 +8591,8 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
             pv->fp_addr == fpnow &&
             pv->begin_epoch == (s_d3d.current_rsx_state
                                 ? s_d3d.current_rsx_state->begin_epoch : 0) &&
-            pv->vb_byte_offset + pv->vertex_count * VP_VERT_STRIDE == rec) {
+            pv->vb_byte_offset + pv->vertex_count * VP_VERT_STRIDE == rec &&
+            d3d12_merge_state_matches_current(pv)) {
             pv->vertex_count += emitted;
             s_d3d.merge_first_end = first + count;
             return;
@@ -8471,6 +8611,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
         dr->cull = rsx_cull_key(s_d3d.current_rsx_state);
         dr->depth = rsx_depth_key(s_d3d.current_rsx_state);
         dr->begin_epoch = s_d3d.current_rsx_state ? s_d3d.current_rsx_state->begin_epoch : 0;
+        dr->merge_dyn_sig = vp_merge_dynamic_sig(s_d3d.current_rsx_state);
         dr->cmask = 0xF;
         if (s_d3d.current_rsx_state) {
             u32 _cm = s_d3d.current_rsx_state->color_mask;
