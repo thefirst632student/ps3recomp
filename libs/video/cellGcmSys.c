@@ -1591,12 +1591,41 @@ static void gcm_rsx_process_fifo_unlocked(void)
           fflush(stderr);
       } }
 
-    int budget = 0x100000;                    /* words per tick cap */
+    int budget = 0x100000;                    /* hard safety cap; time slice is primary */
+    /* Do not let one busy FIFO drain monopolise the frame-clock thread. WA2's
+     * title/snow pass can grow to hundreds of sprite draws; with the old
+     * million-word budget a single call could run for >100 ms. During that
+     * interval vblank/present cannot run, RESC's one-deep flip wait times out,
+     * and the guest is allowed to queue still more work -- a positive feedback
+     * loop that ends with an enormous draw/NV3089 batch and sub-1 FPS.
+     *
+     * Time-slice the walker instead. GET is persistent, so no command is
+     * discarded: the next frame-clock pass resumes at exactly the same word.
+     * Four milliseconds matches the outer RSX cadence and remains comfortably
+     * below RESC's 100 ms escape timeout. GCM_FIFO_SLICE_US=0 restores the
+     * legacy unbounded-per-call behaviour for diagnostics. */
+    static int s_slice_us = -1;
+    if (s_slice_us < 0) {
+        const char* e = getenv("GCM_FIFO_SLICE_US");
+        s_slice_us = e ? atoi(e) : 4000;
+        if (s_slice_us < 0) s_slice_us = 0;
+    }
+    const u64 slice_start_ns = s_slice_us ? get_timestamp_ns() : 0;
+    u32 slice_probe = 0;
+
     /* GCM_DRAINDBG also reports WHY each pass stopped. A drain that ends far
      * short of `put` every tick is the signature of a FIFO that can never
      * catch up, and the reason is the whole diagnosis. */
     const char* why = "caught-up";
     while (s_fifo_getoff != put && budget-- > 0) {
+        /* Querying the host clock for every FIFO word is needlessly costly;
+         * every 256 headers is frequent enough to bound monopolisation while
+         * keeping the hot decoder loop cheap. */
+        if (s_slice_us && ((slice_probe++ & 0xFFu) == 0u) &&
+            get_timestamp_ns() - slice_start_ns >= (u64)s_slice_us * 1000ULL) {
+            why = "timeslice";
+            break;
+        }
         u32 ea = gcm_io2ea(s_fifo_getoff);
         if (!ea) {
             /* get is sitting on an IO offset with no mapping -- the title
