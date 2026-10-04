@@ -4436,7 +4436,10 @@ typedef struct D3D12DisplayBlitOp {
     u32 draw_pos;
     u32 src_raw;
     u32 dst_raw;
-    u32 w, h;
+    u32 w, h;              /* logical destination dimensions */
+    u32 store_w, store_h;  /* physical snapshot dimensions */
+    u32 src_kind;          /* 1 = offscreen RT, 2 = live display */
+    int src_rt;
     int dst_rt;
     int done;
 } D3D12DisplayBlitOp;
@@ -4551,13 +4554,19 @@ int rsx_d3d12_note_nv3089_blit(u32 src_raw, u32 dst_raw,
         return 0;
     }
 
-    /* Display-source blits must freeze the snapshot into destination storage.
-     * Directly aliasing dst to s_screen_copy (v31) made every consumer observe
-     * whichever version of the shared snapshot happened to exist at replay
-     * time, so a later capture changed the apparent contents of an earlier
-     * NV3089 copy.  Only exact 1:1 full-display copies use this ordered path;
-     * anything else keeps the CPU fallback until an explicit scaled blitter
-     * exists. */
+    /* GPU-backed NV3089 copies have value semantics.  Both display sources
+     * and offscreen-RT sources must freeze the pixels that existed at this FIFO
+     * position.  The old RT path only remembered an alias dst->src, so later
+     * rendering into src retroactively changed every earlier copy.  WA2 uses
+     * exactly that pattern for its 1280x720 -> 640x360 effect buffers; the
+     * result was overlay/snow flicker while the directly-rendered BG stayed
+     * stable.  Record an ordered snapshot op for both source kinds.
+     *
+     * Display copies are exact 1:1.  RT copies may be scaled; until there is an
+     * explicit scaling blitter we snapshot at the source resolution and keep
+     * the existing normalized-coordinate sampling behaviour.  This preserves
+     * the visual mapping of the old alias path while fixing its lifetime/value
+     * semantics. */
     if (gpu_src == 2) {
         if (out_w != rw || out_h != rh ||
             ds_dx != 0x00100000u || dt_dy != 0x00100000u ||
@@ -4570,19 +4579,39 @@ int rsx_d3d12_note_nv3089_blit(u32 src_raw, u32 dst_raw,
                         ds_dx, dt_dy, s_display_blit_count, 10);
             return 0;
         }
-        if (!s_d3d.initialized || !s_d3d.rt_rtv_heap || !s_d3d.srv_heap)
-            return 0;
+    } else if (s_display_blit_count >= MAX_DISPLAY_BLIT_OPS) {
+        static int gn = 0;
+        if (gn++ < 12)
+            fprintf(stderr,
+                    "[NV3089-RTSNAP] ordered-copy reject dst=0x%08X src=0x%08X ops=%u%c",
+                    dst_raw, src_raw, s_display_blit_count, 10);
+        return 0;
+    }
+    if (!s_d3d.initialized || !s_d3d.rt_rtv_heap || !s_d3d.srv_heap)
+        return 0;
+    {
         D3D12DisplayBlitOp* op = &s_display_blit_ops[s_display_blit_count++];
         op->draw_pos = s_d3d.draw_count;
         op->src_raw = src_raw;
         op->dst_raw = dst_raw;
         op->w = out_w; op->h = out_h;
+        op->store_w = (gpu_src == 1 && rw) ? rw : out_w;
+        op->store_h = (gpu_src == 1 && rh) ? rh : out_h;
+        op->src_kind = (u32)gpu_src;
+        op->src_rt = -1;
         op->dst_rt = -1;
         op->done = 0;
-        { static int on = 0; if (on++ < 24)
-            fprintf(stderr,
-                    "[NV3089-ORDER] pos=%u dst=0x%08X <- display 0x%08X (%ux%u)%c",
-                    op->draw_pos, dst_raw, src_raw, out_w, out_h, 10); }
+        { static int on = 0; if (on++ < 32) {
+            if (gpu_src == 2)
+                fprintf(stderr,
+                        "[NV3089-ORDER] pos=%u dst=0x%08X <- display 0x%08X (%ux%u)%c",
+                        op->draw_pos, dst_raw, src_raw, out_w, out_h, 10);
+            else
+                fprintf(stderr,
+                        "[NV3089-RTSNAP] pos=%u dst=0x%08X %ux%u <- RT 0x%08X snapshot=%ux%u%c",
+                        op->draw_pos, dst_raw, out_w, out_h, src_raw,
+                        op->store_w, op->store_h, 10);
+        } }
     }
 
     int slot = -1;
@@ -4631,7 +4660,8 @@ static int blit_alias_rt(u32 dst_raw, u32 tex_w, u32 tex_h, u32* src_raw)
         if (!best || a->serial > best->serial) best = a;
     }
     if (!best || best->src_kind != 1) return -1;
-    int rt = off_rt_find(best->src_raw);
+    /* Sample the frozen destination snapshot, not the live producer RT. */
+    int rt = off_rt_find(best->dst_raw);
     if (rt < 0) return -1;
     if (src_raw) *src_raw = best->src_raw;
     return rt;
@@ -4881,6 +4911,15 @@ static void display_blit_seed_framebuffer(u32 fi)
     if (!s_screen_copy || !s_d3d.cmd_list || fi >= FRAME_COUNT ||
         !s_d3d.render_targets[fi] || !s_display_blit_count)
         return;
+    /* s_display_blit_ops now also carries RT->texture snapshots.  Seeding the
+     * new swapchain buffer is required only when this batch actually contains
+     * a display-source copy; an RT-only snapshot must not change scanout. */
+    {
+        int have_display_copy = 0;
+        for (u32 i = 0; i < s_display_blit_count; i++)
+            if (s_display_blit_ops[i].src_kind == 2) { have_display_copy = 1; break; }
+        if (!have_display_copy) return;
+    }
 
     D3D12_RESOURCE_BARRIER b[2] = {0};
     b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -4928,6 +4967,39 @@ static void display_blit_replay_until(u32 draw_pos, u32 fi)
         }
 
         off_rt_transition(op->dst_rt, D3D12_RESOURCE_STATE_COPY_DEST);
+
+        if (op->src_kind == 1) {
+            if (op->src_rt < 0 || op->src_rt >= MAX_OFF_RTS ||
+                !s_d3d.off_rt[op->src_rt].res ||
+                s_d3d.off_rt[op->src_rt].w != s_d3d.off_rt[op->dst_rt].w ||
+                s_d3d.off_rt[op->src_rt].h != s_d3d.off_rt[op->dst_rt].h ||
+                s_d3d.off_rt[op->src_rt].dxgi != s_d3d.off_rt[op->dst_rt].dxgi) {
+                op->done = 1;
+                off_rt_transition(op->dst_rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                continue;
+            }
+            if (op->src_rt == op->dst_rt) {
+                op->done = 1;
+                off_rt_transition(op->dst_rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                continue;
+            }
+            off_rt_transition(op->src_rt, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            s_d3d.cmd_list->lpVtbl->CopyResource(
+                s_d3d.cmd_list, s_d3d.off_rt[op->dst_rt].res,
+                s_d3d.off_rt[op->src_rt].res);
+            /* Leave the producer readable.  A later draw targeting it will
+             * transition it back to RENDER_TARGET in the normal retarget path. */
+            off_rt_transition(op->src_rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            off_rt_transition(op->dst_rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            op->done = 1;
+            { static int rn = 0; if (rn++ < 32)
+                fprintf(stderr,
+                        "[NV3089-RTSNAP-REPLAY] pos=%u dst=0x%08X rt=%d <- src=0x%08X rt=%d%c",
+                        op->draw_pos, op->dst_raw, op->dst_rt,
+                        op->src_raw, op->src_rt, 10); }
+            continue;
+        }
+
         D3D12_RESOURCE_BARRIER b = {0};
         b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
         b.Transition.pResource = display;
@@ -4950,6 +5022,7 @@ static void display_blit_replay_until(u32 draw_pos, u32 fi)
                     (void*)display, 10); }
     }
 }
+
 
 
 /* Set by the present entry point: 1 = this batch ends with a swapchain
@@ -5617,14 +5690,18 @@ static void render_frame(void)
                 off_rt_get(dr->rt_mrt[_m], dr->rt_w, dr->rt_h, dr->rt_fmt);
     }
 
-    /* Destination storage for ordered display-source NV3089 copies.  Creation
+    /* Destination storage for ordered GPU-backed NV3089 snapshots. Creation
      * happens here (not in the FIFO parser) because off_rt_get records an init
-     * upload on the currently-open D3D12 command list. */
+     * upload on the currently-open D3D12 command list.  RT-source snapshots use
+     * the producer dimensions so CopyResource is exact; consumers still address
+     * them with the logical destination dimensions from the guest texture state. */
     for (u32 _b = 0; _b < s_display_blit_count; _b++) {
         D3D12DisplayBlitOp* op = &s_display_blit_ops[_b];
-        int rt = off_rt_get(op->dst_raw, op->w, op->h, 0);
+        if (op->src_kind == 1) op->src_rt = off_rt_find(op->src_raw);
+        int rt = off_rt_get(op->dst_raw, op->store_w ? op->store_w : op->w,
+                            op->store_h ? op->store_h : op->h, 0);
         op->dst_rt = rt;
-        if (rt < 0) op->done = 1;
+        if (rt < 0 || (op->src_kind == 1 && op->src_rt < 0)) op->done = 1;
     }
 
     /* Per-frame VP textures + guest-FP pipelines: for each VP draw, upload the
