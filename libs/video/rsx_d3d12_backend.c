@@ -2649,37 +2649,31 @@ static u32 rsx_texcoord_2d_mask(const rsx_state* st)
     return m;
 }
 
-/* RPCS3 oracle: SET_TEX_COORD_CONTROL bit0 makes TCn a 2D fragment input.
- * gl_FragCoord.w is reciprocal clip-W, and D3D pixel-shader SV_Position.w has
- * the same reciprocal-W role, so reconstructed W is 1/SV_Position.w. Z is 0.
- * Inject after the decompiler's main() prologue so every INPUT read sees the
- * corrected value without changing the NV40 instruction decoder itself. */
-static int fp_apply_texcoord_2d_control(char* hlsl, size_t cap, u32 mask)
+/* Diagnostic count for the other half of RSX fragment-input semantics:
+ * SRC2 bit31 is perspective_corr. This is instruction state (not texture
+ * state), and RPCS3 consumes it together with TEX_COORD_CONTROL while loading
+ * an interpolant. */
+static int fp_count_perspective_inputs(const u8* ucode, u32 max_bytes)
 {
-    if (!hlsl || !mask) return 0;
-    char* sig = strstr(hlsl, "main(PSInput input) {");
-    if (!sig) return -1;
-    char* at = strchr(sig, '\n');
-    if (!at) return -1;
-    at++;
-    char ins[1024];
-    size_t n = 0;
-    for (u32 i = 0; i < 8; i++) {
-        if (!(mask & (1u << i))) continue;
-        int w = snprintf(ins + n, sizeof(ins) - n,
-            "    input.tc%u = float4(input.tc%u.xy, 0.0f, "
-            "(input.position.w != 0.0f ? 1.0f / input.position.w : 0.0f));\n",
-            i, i);
-        if (w < 0 || (size_t)w >= sizeof(ins) - n) return -1;
-        n += (size_t)w;
+    if (!ucode) return 0;
+    u32 off = 0;
+    int count = 0;
+    while (off + 16u <= max_bytes) {
+        const u32 w0 = rsx_fp_read_word(ucode + off + 0);
+        const u32 w1 = rsx_fp_read_word(ucode + off + 4);
+        const u32 w2 = rsx_fp_read_word(ucode + off + 8);
+        const u32 w3 = rsx_fp_read_word(ucode + off + 12);
+        const u32 input_src = (w0 >> 13) & 0xFu;
+        if ((w3 & 0x80000000u) && input_src >= 4u && input_src <= 0xBu)
+            count++;
+        off += 16u;
+        if (((w1 & 3u) == 2u) || ((w2 & 3u) == 2u) || ((w3 & 3u) == 2u)) {
+            if (off + 16u > max_bytes) break;
+            off += 16u;
+        }
+        if (w0 & 1u) break;
     }
-    if (!n) return 0;
-    size_t used = strlen(hlsl) + 1u;
-    size_t off = (size_t)(at - hlsl);
-    if (used + n > cap) return -1;
-    memmove(hlsl + off + n, hlsl + off, used - off);
-    memcpy(hlsl + off, ins, n);
-    return (int)n;
+    return count;
 }
 
 static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
@@ -2793,9 +2787,16 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
      * the wrong register file and produce a perfectly rasterized all-black
      * draw -- exactly what the WA2 logo probes observed. */
     const u32 fp_ctrl = exp32 ? 0x40u : 0u;
-    int n = rsx_fp_decompile(vm_base + off, 4096, fp_ctrl, hlsl, sizeof(hlsl));
-    if (n > 0 && texcoord_2d_mask) fp_apply_texcoord_2d_control(hlsl, sizeof(hlsl), texcoord_2d_mask);
+    const int persp_inputs = fp_count_perspective_inputs(vm_base + off, 4096);
+    int n = rsx_fp_decompile_controlled(
+        vm_base + off, 4096, fp_ctrl, texcoord_2d_mask, hlsl, sizeof(hlsl));
     if (n <= 0) { static int _e=0; if(_e++<16) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr); return NULL; }
+    if (persp_inputs || texcoord_2d_mask) {
+        static int _pc = 0;
+        if (_pc++ < 32)
+            fprintf(stderr, "[FP-INTERP] fp=0x%08X tc2d=0x%X perspective_inputs=%d%c",
+                    fp_addr, texcoord_2d_mask, persp_inputs, 10);
+    }
 
     /* WA2 warning-2 FP raw probe.  Dump the exact guest microcode for
      * 0x01BF9101 once, using the same resolved address and byte order consumed

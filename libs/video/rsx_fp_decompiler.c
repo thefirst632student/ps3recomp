@@ -43,7 +43,8 @@
 #define FP_SRC_NEGATE       (1u << 17)
 #define FP_SRC0_ABS         (1u << 29) /* in DWORD1 */
 #define FP_SRC1_ABS         (1u << 18) /* in DWORD2 */
-#define FP_BRANCH           (1u << 31) /* DWORD2 bit31: instruction is a branch */
+#define FP_OPCODE_HI        (1u << 31) /* SRC1 bit31: opcode bit 6 */
+#define FP_PERSPECTIVE_CORR (1u << 31) /* SRC2 bit31: perspective-correct input */
 
 /* ---- Execution-condition / condition-code fields (SRC0 = DWORD1) ---------
  * The NV40 fragment ISA predicates each instruction on a condition register
@@ -73,7 +74,9 @@ enum {
     OP_SIN=0x23, OP_PK2H=0x24, OP_UP2H=0x25, OP_POW=0x26, OP_PK4UB=0x27,
     OP_UP4UB=0x28, OP_PK2US=0x29, OP_UP2US=0x2A, OP_DP2A=0x2E, OP_TXL=0x2F,
     OP_TXB=0x31, OP_RFL=0x36, OP_DP2=0x38, OP_NRM=0x39, OP_DIV=0x3A,
-    OP_DIVSQ=0x3B, OP_LIF=0x3C, OP_FENCT=0x3D, OP_FENCB=0x3E
+    OP_DIVSQ=0x3B, OP_LIF=0x3C, OP_FENCT=0x3D, OP_FENCB=0x3E,
+    OP_BRK=0x40, OP_CAL=0x41, OP_IFE=0x42, OP_LOOP=0x43, OP_REP=0x44,
+    OP_RET=0x45, OP_OR16_LO=0x46, OP_OR16_HI=0x47
 };
 
 const char* rsx_fp_opcode_name(u32 op)
@@ -95,6 +98,9 @@ const char* rsx_fp_opcode_name(u32 op)
     case OP_DIV: return "DIV"; case OP_DP2: return "DP2"; case OP_NRM: return "NRM";
     case OP_DIVSQ: return "DIVSQ"; case OP_LIF: return "LIF";
     case OP_FENCT: return "FENCT"; case OP_FENCB: return "FENCB";
+    case OP_BRK: return "BRK"; case OP_CAL: return "CAL"; case OP_IFE: return "IFE";
+    case OP_LOOP: return "LOOP"; case OP_REP: return "REP"; case OP_RET: return "RET";
+    case OP_OR16_LO: return "OR16_LO"; case OP_OR16_HI: return "OR16_HI";
     default:     return "?";
     }
 }
@@ -347,13 +353,49 @@ static const char* input_expr(u32 input_src)
 
 /* Build the swizzled/negated/abs'd HLSL for one source into `buf`. */
 static void emit_src(const Src* s, u32 input_src, const float* k, int has_k,
-                     int buffered, u32 constant_slot, char* buf, u32 bufsz)
+                     int buffered, u32 constant_slot, int perspective_corr,
+                     u32 texcoord_2d_mask, char* buf, u32 bufsz)
 {
-    char base[96];
+    char base[256];
     if (s->type == FP_REG_TYPE_TEMP) {
         snprintf(base, sizeof(base), "%s[%u]", s->half ? "h" : "r", s->index);
     } else if (s->type == FP_REG_TYPE_INPUT) {
-        snprintf(base, sizeof(base), "%s", input_expr(input_src));
+        const char* in = input_expr(input_src);
+        if (input_src >= 0x4 && input_src <= 0xB) {
+            const u32 tc = input_src - 0x4;
+            const int is_2d = (texcoord_2d_mask & (1u << tc)) != 0;
+            int touches_z = 0, touches_w = 0;
+            for (int i = 0; i < 4; i++) {
+                if (s->swz[i] == 'z') touches_z = 1;
+                if (s->swz[i] == 'w') touches_w = 1;
+            }
+
+            /* RPCS3 oracle (FragmentProgramDecompiler.cpp): SRC2 bit31 is
+             * perspective_corr. For fragment inputs that flag multiplies the
+             * interpolant by gl_FragCoord.w. HLSL PS SV_Position.w carries the
+             * same reciprocal-clip-W quantity. TEX_COORD_CONTROL bit0 stacks
+             * with it: 2D coords force z=0 and, under perspective correction,
+             * w=1. Without perspective correction only materialise z/w when
+             * the source swizzle actually reads them. */
+            if (perspective_corr) {
+                if (is_2d)
+                    snprintf(base, sizeof(base),
+                             "float4((%s).xy * input.position.w, 0.0f, 1.0f)", in);
+                else
+                    snprintf(base, sizeof(base), "((%s) * input.position.w)", in);
+            } else if (is_2d && (touches_z || touches_w)) {
+                if (touches_w)
+                    snprintf(base, sizeof(base),
+                             "float4((%s).xy, 0.0f, (input.position.w != 0.0f ? 1.0f / input.position.w : 0.0f))",
+                             in);
+                else
+                    snprintf(base, sizeof(base), "float4((%s).xy, 0.0f, 0.0f)", in);
+            } else {
+                snprintf(base, sizeof(base), "%s", in);
+            }
+        } else {
+            snprintf(base, sizeof(base), "%s", in);
+        }
     } else { /* CONST */
         if (buffered && has_k)
             snprintf(
@@ -410,13 +452,28 @@ static int fp_export_target(u32 index, int half)
     return -1;
 }
 
+static int rsx_fp_decompile_internal(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
+    u32 texcoord_2d_mask,
+    int buffered, char* out, u32 out_size, u32* out_constant_count);
+
 int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 out_size)
 {
     return rsx_fp_decompile_ex(ucode, max_bytes, ctrl, 0u, out, out_size);
 }
 
+int rsx_fp_decompile_controlled(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 texcoord_2d_mask,
+    char* out, u32 out_size)
+{
+    return rsx_fp_decompile_internal(
+        ucode, max_bytes, ctrl, 0u, texcoord_2d_mask,
+        0, out, out_size, NULL);
+}
+
 static int rsx_fp_decompile_internal(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
+    u32 texcoord_2d_mask,
     int buffered, char* out, u32 out_size, u32* out_constant_count)
 {
     if (!ucode || !out || out_size == 0) return -1;
@@ -468,9 +525,11 @@ static int rsx_fp_decompile_internal(
         count++;
 
         u32 opcode    = (w0 & FP_OPCODE_MASK) >> FP_OPCODE_SHIFT;
+        if (w2 & FP_OPCODE_HI) opcode |= 0x40u;
         u32 input_src = (w0 & FP_INPUT_SRC_MASK) >> FP_INPUT_SRC_SHIFT;
         u32 tex_unit  = (w0 & FP_TEX_UNIT_MASK) >> FP_TEX_UNIT_SHIFT;
-        int is_branch = (w2 & FP_BRANCH) ? 1 : 0;
+        int is_flow = (opcode >= OP_BRK && opcode <= OP_RET) ? 1 : 0;
+        int perspective_corr = (w3 & FP_PERSPECTIVE_CORR) ? 1 : 0;
 
         /* Execution condition (exec_if) + condition-code write (set_cond).
          * Faithful to RPCS3 FragmentProgramDecompiler {GetRawCond, AddCodeCond,
@@ -525,17 +584,17 @@ static int rsx_fp_decompile_internal(
         char a[200], b[200], c[200];
         emit_src(
             &s0, input_src, k, has_k, buffered, constant_slot,
-            a, sizeof(a));
+            perspective_corr, texcoord_2d_mask, a, sizeof(a));
         emit_src(
             &s1, input_src, k, has_k, buffered, constant_slot,
-            b, sizeof(b));
+            perspective_corr, texcoord_2d_mask, b, sizeof(b));
         emit_src(
             &s2, input_src, k, has_k, buffered, constant_slot,
-            c, sizeof(c));
+            perspective_corr, texcoord_2d_mask, c, sizeof(c));
         if (has_k)
             constant_slot++;
 
-        if (is_branch) {
+        if (is_flow) {
             out_puts(&o, "    /* TODO: branch/flow-control op skipped */\n");
             if (w0 & FP_END) break;
             continue;
@@ -851,7 +910,8 @@ int rsx_fp_decompile_ex(const u8* ucode, u32 max_bytes, u32 ctrl,
                         u32 tex_cube_mask, char* out, u32 out_size)
 {
     return rsx_fp_decompile_internal(
-        ucode, max_bytes, ctrl, tex_cube_mask, 0, out, out_size, NULL);
+        ucode, max_bytes, ctrl, tex_cube_mask, 0u,
+        0, out, out_size, NULL);
 }
 
 int rsx_fp_decompile_buffered_ex(
@@ -859,7 +919,8 @@ int rsx_fp_decompile_buffered_ex(
     char* out, u32 out_size, u32* out_constant_count)
 {
     return rsx_fp_decompile_internal(
-        ucode, max_bytes, ctrl, tex_cube_mask, 1, out, out_size,
+        ucode, max_bytes, ctrl, tex_cube_mask, 0u,
+        1, out, out_size,
         out_constant_count);
 }
 
@@ -1034,8 +1095,10 @@ int rsx_fp_extract_consts(const u8* ucode, u32 max_bytes, float* out, int max_ou
         u32 w2 = rsx_fp_read_word(ucode + off + 8);
         u32 w3 = rsx_fp_read_word(ucode + off + 12);
         off += 16;
-        int is_branch = (w2 & FP_BRANCH) != 0;
-        int has_k = !is_branch &&
+        u32 opcode = ((w0 & FP_OPCODE_MASK) >> FP_OPCODE_SHIFT) |
+                     ((w2 & FP_OPCODE_HI) ? 0x40u : 0u);
+        int is_flow = (opcode >= OP_BRK && opcode <= OP_RET);
+        int has_k = !is_flow &&
             ((((w1 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) ||
              (((w2 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) ||
              (((w3 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST));
@@ -1080,8 +1143,10 @@ u32 rsx_fp_code_hash(const u8* ucode, u32 max_bytes)
         u32 w3 = rsx_fp_read_word(ucode + off + 12);
         for (u32 i = 0; i < 16; i++) { h ^= ucode[off + i]; h *= 16777619u; }
         off += 16;
-        int is_branch = (w2 & FP_BRANCH) != 0;
-        int has_k = !is_branch &&
+        u32 opcode = ((w0 & FP_OPCODE_MASK) >> FP_OPCODE_SHIFT) |
+                     ((w2 & FP_OPCODE_HI) ? 0x40u : 0u);
+        int is_flow = (opcode >= OP_BRK && opcode <= OP_RET);
+        int has_k = !is_flow &&
             ((((w1 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) ||
              (((w2 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST) ||
              (((w3 & FP_REG_TYPE_MASK) >> FP_REG_TYPE_SHIFT) == FP_REG_TYPE_CONST));

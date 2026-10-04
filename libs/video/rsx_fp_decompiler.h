@@ -66,6 +66,15 @@ extern unsigned long long g_rsx_fp_nonfinite_constants;
 #define RSX_FP_CTRL_AUTO 0xFFFFFFFFu
 int rsx_fp_decompile(const u8* ucode, u32 max_bytes, u32 ctrl, char* out, u32 out_size);
 
+/* Variant used by backends that track NV4097_SET_TEX_COORD_CONTROL.
+ * `texcoord_2d_mask` bit N is the bit0 state of TEX_COORD_CONTROL[N].
+ * The mask is consumed together with SRC2.perspective_corr while loading
+ * fragment inputs, matching RSX/RPCS3 semantics instead of patching the
+ * generated shader after the fact. */
+int rsx_fp_decompile_controlled(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 texcoord_2d_mask,
+    char* out, u32 out_size);
+
 /* Apply the NV4097 fixed-function alpha test to an already-decompiled pixel
  * shader. D3D12 has no fixed-function alpha test, so the comparison is
  * emitted immediately before the shader's final color return. `func` uses
