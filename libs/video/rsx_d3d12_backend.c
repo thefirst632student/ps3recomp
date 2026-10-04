@@ -8922,8 +8922,24 @@ void rsx_d3d12_backend_present(void)
      * blink. Keep the ticker present solely as the boot-time fallback (before
      * the first framed clear arrives), UNLESS this present was triggered by
      * a guest flip request (for games like White Album 2 that flip without clears). */
-    if (s_clear_presents > 0 && !is_flip_present)
-        return;
+    /* eboot_port/main.cpp drives this exported entry point only at an
+     * authoritative guest-FLIP boundary.  s_last_present_flip may already
+     * have been advanced by d3d12_clear() while the same FIFO batch still
+     * contains queued draw/offscreen work.  Treating that bookkeeping
+     * mismatch as a hard reject strands the batch: draw_count and ordered
+     * NV3089 ops then grow across frames until MAX_DISPLAY_BLIT_OPS is hit
+     * and frame time collapses.  Keep is_flip_present as a scanout hint,
+     * but never discard already-recorded GPU work here.  Empty duplicate
+     * callbacks are still deduplicated by the logic below. */
+    if (s_clear_presents > 0 && !is_flip_present &&
+        (s_d3d.draw_count > 0 || s_display_blit_count > 0)) {
+        static int s_commit_recover_log = 0;
+        if (s_commit_recover_log++ < 16)
+            fprintf(stderr,
+                    "[PRESENT-COMMIT] stale flip gate fc=%u last=%u; executing draws=%u blits=%u%c",
+                    fc, s_last_present_flip, s_d3d.draw_count,
+                    s_display_blit_count, 10);
+    }
 
     /* Same display gate as d3d12_present: a batch of offscreen pass work only
      * (render-to-texture) keeps accumulating until its composite arrives.
@@ -8997,7 +9013,7 @@ void rsx_d3d12_backend_present(void)
             if (wa2_diag_on()) fprintf(stderr, "[PRESENT-DEDUP] ticker kept previous frame (empty batch)%c", 10);
     }
 
-    if (s_d3d.initialized && (has_display || s_d3d.draw_count > 0)) {
+    if (s_d3d.initialized && (has_display || s_d3d.draw_count > 0 || s_display_blit_count > 0)) {
         { extern void rsx_reset_upload_claims(void);
           static int remap = -1;
           if (remap < 0) { const char* e = getenv("TEX_REMAP"); remap = e ? atoi(e) : 0; }
