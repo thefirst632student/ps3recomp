@@ -165,7 +165,16 @@ typedef struct {
  * references unit 0. */
 #define DRAW_DESC_WIDTH 16
 #define DRAW_SRV_BASE 32
-#define SRV_HEAP_SIZE (DRAW_SRV_BASE + MAX_DRAWS * DRAW_DESC_WIDTH)
+#define DRAW_SRV_REGION_SIZE (MAX_DRAWS * DRAW_DESC_WIDTH)
+#define SRV_HEAP_SIZE (DRAW_SRV_BASE + 2u * DRAW_SRV_REGION_SIZE)
+
+/* Per-draw SRVs are shader-visible descriptors.  D3D12 requires descriptors
+ * referenced by an in-flight command list to remain immutable until the GPU
+ * finishes that list.  The VP vertex/constant uploads already use vp_parity
+ * for exactly this reason; give SRVs the same two-frame lifetime instead of
+ * rewriting frame N descriptors while the GPU may still be sampling them. */
+#define DRAW_SRV_FRAME_BASE(parity) \
+    (DRAW_SRV_BASE + (u32)((parity) & 1) * DRAW_SRV_REGION_SIZE)
 #define VP_SMP_TABLE_WIDTH 16
 #define VP_SMP_TABLES 128 /* 128*16 = 2048, D3D12 shader-visible sampler-heap limit */
 #define VP_SMP_HEAP_SIZE (VP_SMP_TABLE_WIDTH * VP_SMP_TABLES)
@@ -5443,6 +5452,13 @@ static void render_frame(void)
 {
     double _rf0 = perf_on() ? perf_now() : 0.0;
     u32 fi = s_d3d.frame_index;
+    { static int s_srv_parity_log = 0;
+      if (s_srv_parity_log < 8 && s_d3d.draw_count) {
+          fprintf(stderr, "[SRV-PARITY] parity=%d base=%u draws=%u heap=%u%c",
+                  s_d3d.vp_parity, DRAW_SRV_FRAME_BASE(s_d3d.vp_parity), s_d3d.draw_count,
+                  (u32)SRV_HEAP_SIZE, 10);
+          s_srv_parity_log++;
+      } }
 
     /* Publish scanout-content history from the one place every present path
      * eventually reaches.  This keeps the legacy backend callback, clear-boundary
@@ -5934,7 +5950,7 @@ static void render_frame(void)
          * texture, or a null SRV. */
         double _sv0 = perf_on() ? perf_now() : 0.0;
         for (int _u = 0; _u < 4; _u++) {
-            u32 wslot = DRAW_SRV_BASE + _d * DRAW_DESC_WIDTH + (u32)_u;
+            u32 wslot = DRAW_SRV_FRAME_BASE(s_d3d.vp_parity) + _d * DRAW_DESC_WIDTH + (u32)_u;
             dr->tex_rt[_u] = -1;
             /* Only a texture that aliases an actually registered display
              * buffer may sample s_screen_copy.  Matching the display dimensions
@@ -6451,7 +6467,7 @@ static void render_frame(void)
                         off_rt_transition(rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                 }
                 D3D12_GPU_DESCRIPTOR_HANDLE gh = gh_base;
-                gh.ptr += (u64)(DRAW_SRV_BASE + d * DRAW_DESC_WIDTH) * s_d3d.srv_inc;
+                gh.ptr += (u64)(DRAW_SRV_FRAME_BASE(s_d3d.vp_parity) + d * DRAW_DESC_WIDTH) * s_d3d.srv_inc;
                 s_d3d.cmd_list->lpVtbl->SetGraphicsRootDescriptorTable(s_d3d.cmd_list, 1, gh);
                 if (s_d3d.vp_sampler_heap) {
                     int sti = vp_sampler_table_for_draw(dr);
