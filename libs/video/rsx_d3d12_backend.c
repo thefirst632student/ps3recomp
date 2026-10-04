@@ -5836,9 +5836,9 @@ static void render_frame(void)
                     if (_snow_last_frame != (u64)s_d3d.frame_count && _snow_lines++ < 180) {
                         _snow_last_frame = (u64)s_d3d.frame_count;
                         const u8* _vb = (const u8*)s_d3d.vp_vb_mapped +
-                            (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE +
+                            (u64)s_d3d.vp_parity * MAX_VERTICES * 256u +
                             dr->vb_byte_offset;
-                        u32 _vbytes = dr->vertex_count * VP_VERT_STRIDE;
+                        u32 _vbytes = dr->vertex_count * 256u;
                         u32 _vh = (_vb && _vbytes) ? tex_csum(_vb, _vbytes) : 0;
                         u32 _full = tex_csum_full(vm_base + dr->tex[_u].off, _nb);
                         fprintf(stderr,
