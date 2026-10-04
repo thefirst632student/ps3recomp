@@ -5460,6 +5460,127 @@ static void render_frame(void)
           s_srv_parity_log++;
       } }
 
+
+    /* WA2 v56 effect-flicker probe: observational only.
+     * Dump snow draw ordering vs ordered NV3089 snapshots and ATTR3 alpha. */
+    {
+        static u32 snow_diag_frames = 0;
+        static int logo_last_sig = -1;
+        static u32 logo_diag_lines = 0;
+        u32 snow_n = 0, snow_first = 0xFFFFFFFFu, snow_last = 0;
+        float snow_amin = 2.0f, snow_amax = -1.0f;
+        u32 snow_blend0 = 0, snow_rt0 = 0, snow_fp0 = 0, snow_tex0 = 0;
+        u32 logo_n = 0;
+        float logo_amin = 2.0f, logo_amax = -1.0f;
+
+        for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; ++_d) {
+            const D3D12DrawRecord* _r = &s_d3d.draws[_d];
+            const u32 _bf = _r->tex[0].fmt & 0x9Fu;
+            const int _snow_tex =
+                (_r->tex[0].raw == 0x0368E500u) ||
+                ((_r->tex[0].off & 0x0FFFFFFFu) == 0x0368E500u) ||
+                (_bf == 0x83u && _r->tex[0].w == 64u && _r->tex[0].h == 128u);
+            const int _snow_fp = ((_r->fp_addr & ~1u) == 0x01E08480u);
+            const int _logo_fp = ((_r->fp_addr & ~1u) == 0x01BF9100u);
+
+            if ((_snow_tex || _snow_fp) && !_r->is_clear) {
+                if (!snow_n) {
+                    snow_blend0 = _r->blend_key;
+                    snow_rt0 = _r->rt_off;
+                    snow_fp0 = _r->fp_addr;
+                    snow_tex0 = _r->tex[0].raw;
+                }
+                snow_n++;
+                if (_d < snow_first) snow_first = _d;
+                if (_d > snow_last) snow_last = _d;
+                if (_r->is_vp && s_d3d.vp_vb_mapped && _r->vertex_count) {
+                    const float* _v = (const float*)((const char*)s_d3d.vp_vb_mapped
+                        + (u64)s_d3d.vp_parity * MAX_VERTICES * 256u
+                        + _r->vb_byte_offset);
+                    u32 _nv = _r->vertex_count < 6u ? _r->vertex_count : 6u;
+                    for (u32 _k = 0; _k < _nv; ++_k) {
+                        float _a = _v[_k * 64u + 15u]; /* ATTR3.w */
+                        if (_a < snow_amin) snow_amin = _a;
+                        if (_a > snow_amax) snow_amax = _a;
+                    }
+                }
+            }
+
+            if (_logo_fp && _r->blend && !_r->is_clear) {
+                logo_n++;
+                if (_r->is_vp && s_d3d.vp_vb_mapped && _r->vertex_count) {
+                    const float* _v = (const float*)((const char*)s_d3d.vp_vb_mapped
+                        + (u64)s_d3d.vp_parity * MAX_VERTICES * 256u
+                        + _r->vb_byte_offset);
+                    u32 _nv = _r->vertex_count < 6u ? _r->vertex_count : 6u;
+                    for (u32 _k = 0; _k < _nv; ++_k) {
+                        float _a = _v[_k * 64u + 15u];
+                        if (_a < logo_amin) logo_amin = _a;
+                        if (_a > logo_amax) logo_amax = _a;
+                    }
+                }
+            }
+        }
+
+        if (snow_n) {
+            int _emit = (snow_diag_frames < 16u) || ((s_d3d.frame_count % 120u) == 0u);
+            if (_emit) {
+                fprintf(stderr,
+                    "[SNOWSEQ] frame=%u parity=%d draws=%u snow=%u range=%u..%u "
+                    "alpha=%.4f..%.4f rt=0x%08X fp=0x%08X tex0=0x%08X blend=0x%08X ops=%u%c",
+                    (unsigned)s_d3d.frame_count, s_d3d.vp_parity,
+                    (unsigned)s_d3d.draw_count, (unsigned)snow_n,
+                    (unsigned)snow_first, (unsigned)snow_last,
+                    (double)snow_amin, (double)snow_amax, snow_rt0, snow_fp0,
+                    snow_tex0, snow_blend0, (unsigned)s_display_blit_count, 10);
+
+                for (u32 _o = 0; _o < s_display_blit_count && _o < MAX_DISPLAY_BLIT_OPS; ++_o) {
+                    const D3D12DisplayBlitOp* _op = &s_display_blit_ops[_o];
+                    fprintf(stderr,
+                        "[SNOWSEQ_OP] frame=%u op=%u pos=%u kind=%u src=0x%08X dst=0x%08X "
+                        "logical=%ux%u store=%ux%u srcRT=%d dstRT=%d done=%d%c",
+                        (unsigned)s_d3d.frame_count, (unsigned)_o,
+                        (unsigned)_op->draw_pos, (unsigned)_op->src_kind,
+                        _op->src_raw, _op->dst_raw, _op->w, _op->h,
+                        _op->store_w, _op->store_h, _op->src_rt, _op->dst_rt,
+                        _op->done, 10);
+                }
+
+                const u32 _lo = (snow_first > 2u) ? snow_first - 2u : 0u;
+                const u32 _hi = (snow_last + 2u < s_d3d.draw_count) ? snow_last + 2u : s_d3d.draw_count - 1u;
+                for (u32 _d = _lo; _d <= _hi && _d < s_d3d.draw_count && _d < MAX_DRAWS; ++_d) {
+                    if (_d > snow_first + 2u && _d + 2u < snow_last) continue;
+                    const D3D12DrawRecord* _r = &s_d3d.draws[_d];
+                    fprintf(stderr,
+                        "[SNOWSEQ_DRAW] frame=%u d=%u clear=%d vp=%d rt=0x%08X fp=0x%08X "
+                        "blend=%d key=0x%08X tex0=0x%08X/%ux%u/fmt%02X vc=%u%c",
+                        (unsigned)s_d3d.frame_count, (unsigned)_d, _r->is_clear,
+                        _r->is_vp, _r->rt_off, _r->fp_addr, _r->blend,
+                        _r->blend_key, _r->tex[0].raw, _r->tex[0].w, _r->tex[0].h,
+                        _r->tex[0].fmt & 0xFFu, _r->vertex_count, 10);
+                }
+            }
+            snow_diag_frames++;
+        }
+
+        if (logo_n && logo_amin <= 1.1f && logo_amax >= -0.1f) {
+            int _lo = (int)(logo_amin * 255.0f + 0.5f);
+            int _hi = (int)(logo_amax * 255.0f + 0.5f);
+            if (_lo < 0) _lo = 0; if (_lo > 255) _lo = 255;
+            if (_hi < 0) _hi = 0; if (_hi > 255) _hi = 255;
+            int _sig = (_lo << 8) | _hi;
+            if (_sig != logo_last_sig && logo_diag_lines < 64u) {
+                logo_last_sig = _sig;
+                logo_diag_lines++;
+                fprintf(stderr,
+                    "[LOGOALPHA] frame=%u draws=%u alpha=%.4f..%.4f sig=%04X ops=%u%c",
+                    (unsigned)s_d3d.frame_count, (unsigned)logo_n,
+                    (double)logo_amin, (double)logo_amax, (unsigned)_sig,
+                    (unsigned)s_display_blit_count, 10);
+            }
+        }
+    }
+
     /* Publish scanout-content history from the one place every present path
      * eventually reaches.  This keeps the legacy backend callback, clear-boundary
      * presenter and ticker presenter coherent even when two of them observe the
