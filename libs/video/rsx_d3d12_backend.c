@@ -7090,7 +7090,16 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
      * and each captured frame holds only a slice of the geometry -- the floor in
      * one, a wall in the next -- which makes a single model impossible to see. */
     { static int accum = -1;
-      if (accum < 0) { const char* e = getenv("RSX_ACCUM_FRAME"); accum = e ? atoi(e) : 0; }
+      if (accum < 0) {
+          const char* e = getenv("RSX_ACCUM_FRAME");
+          /* WA2: with guest-FLIP presentation restored in eboot_port/main.cpp
+           * and the FIFO time-sliced, CLEAR_SURFACE is not a scanout boundary.
+           * Presenting here exposes partially-composed title/snow effect passes
+           * and produces flicker proportional to effect density.  Accumulate
+           * through clears by default; RSX_ACCUM_FRAME=0 restores the legacy
+           * clear-boundary heuristic for A/B testing. */
+          accum = e ? atoi(e) : 1;
+      }
       if (accum) return; }
     if (s_d3d.initialized) {
         if (blink_dbg())
