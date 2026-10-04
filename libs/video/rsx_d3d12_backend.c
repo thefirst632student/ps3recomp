@@ -4447,6 +4447,7 @@ typedef struct D3D12DisplayBlitOp {
 #define MAX_DISPLAY_BLIT_OPS 256
 static D3D12DisplayBlitOp s_display_blit_ops[MAX_DISPLAY_BLIT_OPS];
 static u32 s_display_blit_count = 0;
+static ID3D12PipelineState* s_nv3089_scale_pso = NULL;
 
 /* Ordered RSX 2D blits whose source is a GPU render target.
  *
@@ -4595,8 +4596,12 @@ int rsx_d3d12_note_nv3089_blit(u32 src_raw, u32 dst_raw,
         op->src_raw = src_raw;
         op->dst_raw = dst_raw;
         op->w = out_w; op->h = out_h;
-        op->store_w = (gpu_src == 1 && rw) ? rw : out_w;
-        op->store_h = (gpu_src == 1 && rh) ? rh : out_h;
+        /* Destination storage must have the guest-visible destination size.
+         * v52 froze RT pixels but kept scaled copies at the producer size
+         * (1280x720 for WA2's 640x360 effect buffers), which preserved value
+         * semantics but not NV3089 copy semantics.  v53 scales during replay. */
+        op->store_w = out_w;
+        op->store_h = out_h;
         op->src_kind = (u32)gpu_src;
         op->src_rt = -1;
         op->dst_rt = -1;
@@ -4948,14 +4953,139 @@ static void display_blit_seed_framebuffer(u32 fi)
                 fi, (void*)s_d3d.render_targets[fi], (void*)s_screen_copy, 10); }
 }
 
+/* Dedicated scaling path for full-image NV3089 RT->texture copies.
+ * CopyResource cannot scale.  v52 deliberately kept the destination resource at
+ * the producer size and relied on normalized sampling; that fixed lifetime but
+ * left WA2's 1280x720 -> 640x360 effect buffers with the wrong physical value.
+ * Render a fullscreen triangle into the real destination-sized RT instead. */
+static int nv3089_scale_pso_ensure(void)
+{
+    if (s_nv3089_scale_pso) return 1;
+    if (!s_d3d.device || !s_d3d.root_signature) return 0;
+
+    static const char vs[] =
+        "struct O{float4 p:SV_POSITION;float2 uv:TEXCOORD0;};\n"
+        "O main(uint id:SV_VertexID){O o;float2 uv=float2((id<<1)&2,id&2);"
+        "o.p=float4(uv*float2(2,-2)+float2(-1,1),0,1);o.uv=uv;return o;}\n";
+    static const char ps[] =
+        "Texture2D t0:register(t0);SamplerState s0:register(s0);\n"
+        "float4 main(float4 p:SV_POSITION,float2 uv:TEXCOORD0):SV_TARGET{"
+        "return t0.SampleLevel(s0,uv,0);}\n";
+
+    ID3DBlob *vb = NULL, *pb = NULL, *eb = NULL;
+    HRESULT hr = D3DCompile(vs, sizeof(vs)-1, "nv3089_scale_vs", NULL, NULL,
+                            "main", "vs_5_0", 0, 0, &vb, &eb);
+    if (FAILED(hr)) {
+        if (eb) { fprintf(stderr, "[NV3089-SCALE] VS compile failed: %s%c",
+                           (const char*)eb->lpVtbl->GetBufferPointer(eb), 10);
+                  eb->lpVtbl->Release(eb); }
+        return 0;
+    }
+    if (eb) { eb->lpVtbl->Release(eb); eb = NULL; }
+    hr = D3DCompile(ps, sizeof(ps)-1, "nv3089_scale_ps", NULL, NULL,
+                    "main", "ps_5_0", 0, 0, &pb, &eb);
+    if (FAILED(hr)) {
+        if (eb) { fprintf(stderr, "[NV3089-SCALE] PS compile failed: %s%c",
+                           (const char*)eb->lpVtbl->GetBufferPointer(eb), 10);
+                  eb->lpVtbl->Release(eb); }
+        vb->lpVtbl->Release(vb);
+        return 0;
+    }
+    if (eb) eb->lpVtbl->Release(eb);
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
+    pd.pRootSignature = s_d3d.root_signature;
+    pd.VS.pShaderBytecode = vb->lpVtbl->GetBufferPointer(vb);
+    pd.VS.BytecodeLength = vb->lpVtbl->GetBufferSize(vb);
+    pd.PS.pShaderBytecode = pb->lpVtbl->GetBufferPointer(pb);
+    pd.PS.BytecodeLength = pb->lpVtbl->GetBufferSize(pb);
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.RasterizerState.DepthClipEnable = TRUE;
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.DepthStencilState.DepthEnable = FALSE;
+    pd.DepthStencilState.StencilEnable = FALSE;
+    pd.SampleMask = UINT_MAX;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pd.SampleDesc.Count = 1;
+
+    hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
+        s_d3d.device, &pd, &IID_ID3D12PipelineState,
+        (void**)&s_nv3089_scale_pso);
+    vb->lpVtbl->Release(vb);
+    pb->lpVtbl->Release(pb);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[NV3089-SCALE] PSO creation failed 0x%08lX%c", hr, 10);
+        s_nv3089_scale_pso = NULL;
+        return 0;
+    }
+    fprintf(stderr, "[NV3089-SCALE] GPU scaler ready%c", 10);
+    return 1;
+}
+
+static int nv3089_scale_rt(int src_rt, int dst_rt)
+{
+    if (src_rt < 0 || src_rt >= MAX_OFF_RTS ||
+        dst_rt < 0 || dst_rt >= MAX_OFF_RTS || src_rt == dst_rt)
+        return 0;
+    OffRT* src = &s_d3d.off_rt[src_rt];
+    OffRT* dst = &s_d3d.off_rt[dst_rt];
+    if (!src->res || !dst->res ||
+        src->dxgi != DXGI_FORMAT_R8G8B8A8_UNORM ||
+        dst->dxgi != DXGI_FORMAT_R8G8B8A8_UNORM ||
+        !s_d3d.srv_heap || !nv3089_scale_pso_ensure())
+        return 0;
+
+    off_rt_transition(src_rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    off_rt_transition(dst_rt, D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+    ID3D12DescriptorHeap* heaps[] = { s_d3d.srv_heap };
+    s_d3d.cmd_list->lpVtbl->SetDescriptorHeaps(s_d3d.cmd_list, 1, heaps);
+    s_d3d.cmd_list->lpVtbl->SetGraphicsRootSignature(
+        s_d3d.cmd_list, s_d3d.root_signature);
+    s_d3d.cmd_list->lpVtbl->SetPipelineState(
+        s_d3d.cmd_list, s_nv3089_scale_pso);
+    s_d3d.cmd_list->lpVtbl->IASetPrimitiveTopology(
+        s_d3d.cmd_list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    D3D12_GPU_DESCRIPTOR_HANDLE gh;
+    s_d3d.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &gh);
+    gh.ptr += (u64)(RT_SRV_BASE + src_rt) * s_d3d.srv_inc;
+    s_d3d.cmd_list->lpVtbl->SetGraphicsRootDescriptorTable(s_d3d.cmd_list, 1, gh);
+
+    D3D12_CPU_DESCRIPTOR_HANDLE rh = off_rt_rtv(dst_rt);
+    s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(s_d3d.cmd_list, 1, &rh, FALSE, NULL);
+    D3D12_VIEWPORT vp = {0, 0, (float)dst->w, (float)dst->h, 0.0f, 1.0f};
+    D3D12_RECT sc = {0, 0, (LONG)dst->w, (LONG)dst->h};
+    s_d3d.cmd_list->lpVtbl->RSSetViewports(s_d3d.cmd_list, 1, &vp);
+    s_d3d.cmd_list->lpVtbl->RSSetScissorRects(s_d3d.cmd_list, 1, &sc);
+    s_d3d.cmd_list->lpVtbl->DrawInstanced(s_d3d.cmd_list, 3, 1, 0, 0);
+    off_rt_transition(dst_rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+    /* The scale draw temporarily uses the simple root signature.  Ordered blits
+     * are replayed inside the VP pass, so restore its root signature/heaps; the
+     * normal per-draw code will repopulate CBVs and descriptor tables. */
+    if (s_d3d.vp_root_sig) {
+        s_d3d.cmd_list->lpVtbl->SetGraphicsRootSignature(
+            s_d3d.cmd_list, s_d3d.vp_root_sig);
+        ID3D12DescriptorHeap* vheaps[] = { s_d3d.srv_heap, s_d3d.vp_sampler_heap };
+        s_d3d.cmd_list->lpVtbl->SetDescriptorHeaps(
+            s_d3d.cmd_list, s_d3d.vp_sampler_heap ? 2u : 1u, vheaps);
+    }
+    return 1;
+}
+
 /* Replay display-source NV3089 copies at their exact FIFO/draw boundary.  The
  * source must be the LIVE display surface after all preceding draws in this
  * batch, not s_screen_copy (which is only a persistent snapshot and therefore
  * can be one frame old).  Copying the current backbuffer gives the NV3089 op
  * value semantics: later display writes cannot mutate the destination. */
-static void display_blit_replay_until(u32 draw_pos, u32 fi)
+static int display_blit_replay_until(u32 draw_pos, u32 fi)
 {
-    if (!s_d3d.cmd_list || fi >= FRAME_COUNT || !s_d3d.render_targets[fi]) return;
+    int changed_om = 0;
+    if (!s_d3d.cmd_list || fi >= FRAME_COUNT || !s_d3d.render_targets[fi]) return 0;
     ID3D12Resource* display = s_d3d.render_targets[fi];
     for (u32 i = 0; i < s_display_blit_count; i++) {
         D3D12DisplayBlitOp* op = &s_display_blit_ops[i];
@@ -4971,8 +5101,6 @@ static void display_blit_replay_until(u32 draw_pos, u32 fi)
         if (op->src_kind == 1) {
             if (op->src_rt < 0 || op->src_rt >= MAX_OFF_RTS ||
                 !s_d3d.off_rt[op->src_rt].res ||
-                s_d3d.off_rt[op->src_rt].w != s_d3d.off_rt[op->dst_rt].w ||
-                s_d3d.off_rt[op->src_rt].h != s_d3d.off_rt[op->dst_rt].h ||
                 s_d3d.off_rt[op->src_rt].dxgi != s_d3d.off_rt[op->dst_rt].dxgi) {
                 op->done = 1;
                 off_rt_transition(op->dst_rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -4983,20 +5111,35 @@ static void display_blit_replay_until(u32 draw_pos, u32 fi)
                 off_rt_transition(op->dst_rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                 continue;
             }
-            off_rt_transition(op->src_rt, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            s_d3d.cmd_list->lpVtbl->CopyResource(
-                s_d3d.cmd_list, s_d3d.off_rt[op->dst_rt].res,
-                s_d3d.off_rt[op->src_rt].res);
-            /* Leave the producer readable.  A later draw targeting it will
-             * transition it back to RENDER_TARGET in the normal retarget path. */
-            off_rt_transition(op->src_rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-            off_rt_transition(op->dst_rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            OffRT* sr = &s_d3d.off_rt[op->src_rt];
+            OffRT* dr = &s_d3d.off_rt[op->dst_rt];
+            int scaled = (sr->w != dr->w || sr->h != dr->h);
+            if (!scaled) {
+                off_rt_transition(op->src_rt, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                s_d3d.cmd_list->lpVtbl->CopyResource(
+                    s_d3d.cmd_list, dr->res, sr->res);
+                off_rt_transition(op->src_rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                off_rt_transition(op->dst_rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            } else if (nv3089_scale_rt(op->src_rt, op->dst_rt)) {
+                changed_om = 1;
+            } else {
+                static int sf = 0;
+                if (sf++ < 12)
+                    fprintf(stderr,
+                            "[NV3089-SCALE] unsupported dst=0x%08X %ux%u <- src=0x%08X %ux%u fmt=%u%c",
+                            op->dst_raw, dr->w, dr->h, op->src_raw, sr->w, sr->h,
+                            sr->dxgi, 10);
+                op->done = 1;
+                off_rt_transition(op->dst_rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                continue;
+            }
             op->done = 1;
-            { static int rn = 0; if (rn++ < 32)
+            { static int rn = 0; if (rn++ < 48)
                 fprintf(stderr,
-                        "[NV3089-RTSNAP-REPLAY] pos=%u dst=0x%08X rt=%d <- src=0x%08X rt=%d%c",
-                        op->draw_pos, op->dst_raw, op->dst_rt,
-                        op->src_raw, op->src_rt, 10); }
+                        "[NV3089-RTSNAP-REPLAY] pos=%u dst=0x%08X rt=%d %ux%u <- src=0x%08X rt=%d %ux%u%s%c",
+                        op->draw_pos, op->dst_raw, op->dst_rt, dr->w, dr->h,
+                        op->src_raw, op->src_rt, sr->w, sr->h,
+                        scaled ? " scaled" : "", 10); }
             continue;
         }
 
@@ -5021,6 +5164,7 @@ static void display_blit_replay_until(u32 draw_pos, u32 fi)
                     op->draw_pos, op->dst_raw, op->dst_rt,
                     (void*)display, 10); }
     }
+    return changed_om;
 }
 
 
@@ -5692,9 +5836,9 @@ static void render_frame(void)
 
     /* Destination storage for ordered GPU-backed NV3089 snapshots. Creation
      * happens here (not in the FIFO parser) because off_rt_get records an init
-     * upload on the currently-open D3D12 command list.  RT-source snapshots use
-     * the producer dimensions so CopyResource is exact; consumers still address
-     * them with the logical destination dimensions from the guest texture state. */
+     * upload on the currently-open D3D12 command list.  Storage uses the logical
+     * destination dimensions; RT-source copies are scaled during ordered replay
+     * when producer and destination sizes differ. */
     for (u32 _b = 0; _b < s_display_blit_count; _b++) {
         D3D12DisplayBlitOp* op = &s_display_blit_ops[_b];
         if (op->src_kind == 1) op->src_rt = off_rt_find(op->src_raw);
@@ -6159,7 +6303,14 @@ static void render_frame(void)
                  * when the guest copies the display at that boundary, the copy
                  * must freeze the just-rendered display image, not the previous
                  * frame's snapshot. */
-                display_blit_replay_until(d, fi);
+                if (display_blit_replay_until(d, fi)) {
+                    /* A scaled NV3089 replay temporarily bound its destination
+                     * RTV. Force the normal retarget block below to restore the
+                     * guest draw's actual colour targets even if they match the
+                     * previous draw's cached cur_rt/cur_m values. */
+                    cur_rt = -2;
+                    cur_m[0] = cur_m[1] = cur_m[2] = -2;
+                }
                 /* Render-to-texture: retarget when this op's surfaces differ.
                  * Depth is a single shared buffer, so clear it per switch. */
                 int want  = dr->rt_off  ? off_rt_find(dr->rt_off)  : -1;
@@ -6394,10 +6545,10 @@ static void render_frame(void)
                             dr->vs_idx, dr->cb_slot, dr->vb_byte_offset / 256,
                             dr->cull, dr->blend, 10); } }
             }
-            display_blit_replay_until(s_d3d.draw_count, fi);
+            int replay_changed_om = display_blit_replay_until(s_d3d.draw_count, fi);
             if (perf_on()) s_perf_gpu += perf_now() - _rec0;   /* reuse: record time */
             /* Leave the backbuffer bound for the dump/present epilogue. */
-            if (cur_rt >= 0) {
+            if (cur_rt >= 0 || replay_changed_om) {
                 s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(s_d3d.cmd_list, 1, &rtv_handle, FALSE, &dsv_handle);
                 D3D12_VIEWPORT vp = {0, 0, (float)s_d3d.width, (float)s_d3d.height, 0.0f, 1.0f};
                 D3D12_RECT sc = {0, 0, (LONG)s_d3d.width, (LONG)s_d3d.height};
@@ -8893,6 +9044,7 @@ void rsx_d3d12_backend_shutdown(void)
     if (s_d3d.pipeline_state)        s_d3d.pipeline_state->lpVtbl->Release(s_d3d.pipeline_state);
     if (s_d3d.pipeline_state_lines)  s_d3d.pipeline_state_lines->lpVtbl->Release(s_d3d.pipeline_state_lines);
     if (s_d3d.pipeline_state_points) s_d3d.pipeline_state_points->lpVtbl->Release(s_d3d.pipeline_state_points);
+    if (s_nv3089_scale_pso) { s_nv3089_scale_pso->lpVtbl->Release(s_nv3089_scale_pso); s_nv3089_scale_pso = NULL; }
     if (s_d3d.depth_buffer) s_d3d.depth_buffer->lpVtbl->Release(s_d3d.depth_buffer);
     if (s_d3d.dsv_heap)     s_d3d.dsv_heap->lpVtbl->Release(s_d3d.dsv_heap);
     if (s_d3d.root_signature) s_d3d.root_signature->lpVtbl->Release(s_d3d.root_signature);
