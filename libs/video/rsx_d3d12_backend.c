@@ -4838,14 +4838,13 @@ static void off_rt_transition(int slot, D3D12_RESOURCE_STATES to)
     r->st = to;
 }
 
-/* Replay display-source NV3089 copies at their exact FIFO/draw boundary.
- * v45 isolation: use the LIVE current backbuffer as the display source, but do
- * NOT seed the new backbuffer from the previous scanout.  This isolates the
- * second behavioral half of v35 on top of the warning/logo-clean v34 baseline. */
-static void display_blit_replay_until(u32 draw_pos, u32 fi)
+/* Replay display-source NV3089 copies at their FIFO/draw boundary.  The source
+ * is the current persistent display snapshot at that point; the destination is
+ * its own OffRT resource, so later screen_copy_capture() calls cannot mutate an
+ * already-completed copy. */
+static void display_blit_replay_until(u32 draw_pos)
 {
-    if (!s_d3d.cmd_list || fi >= FRAME_COUNT || !s_d3d.render_targets[fi]) return;
-    ID3D12Resource* display = s_d3d.render_targets[fi];
+    if (!s_screen_copy || !s_d3d.cmd_list) return;
     for (u32 i = 0; i < s_display_blit_count; i++) {
         D3D12DisplayBlitOp* op = &s_display_blit_ops[i];
         if (op->done || op->draw_pos > draw_pos) continue;
@@ -4858,24 +4857,24 @@ static void display_blit_replay_until(u32 draw_pos, u32 fi)
         off_rt_transition(op->dst_rt, D3D12_RESOURCE_STATE_COPY_DEST);
         D3D12_RESOURCE_BARRIER b = {0};
         b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        b.Transition.pResource = display;
-        b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        b.Transition.pResource = s_screen_copy;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
         b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
         s_d3d.cmd_list->lpVtbl->CopyResource(
-            s_d3d.cmd_list, s_d3d.off_rt[op->dst_rt].res, display);
+            s_d3d.cmd_list, s_d3d.off_rt[op->dst_rt].res, s_screen_copy);
         b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
         off_rt_transition(op->dst_rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         op->done = 1;
 
         { static int rn = 0; if (rn++ < 32)
             fprintf(stderr,
-                    "[NV3089-REPLAY-LIVE-ONLY] pos=%u dst=0x%08X rt=%d <- live display %p%c",
+                    "[NV3089-REPLAY] pos=%u dst=0x%08X rt=%d <- snapshot %p%c",
                     op->draw_pos, op->dst_raw, op->dst_rt,
-                    (void*)display, 10); }
+                    (void*)s_screen_copy, 10); }
     }
 }
 
@@ -6009,7 +6008,7 @@ static void render_frame(void)
                  * when the guest copies the display at that boundary, the copy
                  * must freeze the just-rendered display image, not the previous
                  * frame's snapshot. */
-                display_blit_replay_until(d, fi);
+                display_blit_replay_until(d);
                 /* Render-to-texture: retarget when this op's surfaces differ.
                  * Depth is a single shared buffer, so clear it per switch. */
                 int want  = dr->rt_off  ? off_rt_find(dr->rt_off)  : -1;
@@ -6244,7 +6243,7 @@ static void render_frame(void)
                             dr->vs_idx, dr->cb_slot, dr->vb_byte_offset / 256,
                             dr->cull, dr->blend, 10); } }
             }
-            display_blit_replay_until(s_d3d.draw_count, fi);
+            display_blit_replay_until(s_d3d.draw_count);
             if (perf_on()) s_perf_gpu += perf_now() - _rec0;   /* reuse: record time */
             /* Leave the backbuffer bound for the dump/present epilogue. */
             if (cur_rt >= 0) {

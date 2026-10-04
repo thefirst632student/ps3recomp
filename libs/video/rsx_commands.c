@@ -562,16 +562,6 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
 
-    /* NV4097_SET_TEX_COORD_CONTROL[0..9]. RPCS3 treats bit 0 as the
-     * per-interpolant "2D texcoord" override: fragment TCn becomes
-     * (x,y,0,clipW) instead of consuming the vertex-program z/w lanes. */
-    if (method >= NV4097_SET_TEX_COORD_CONTROL &&
-        method < NV4097_SET_TEX_COORD_CONTROL + 10u * 4u) {
-        state->texcoord_control[(method - NV4097_SET_TEX_COORD_CONTROL) >> 2] = data;
-        state->shader_dirty = 1;
-        return 0;
-    }
-
     /* Shader programs */
     if (method == NV4097_SET_SHADER_PROGRAM) {
         /*
