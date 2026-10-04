@@ -173,8 +173,10 @@ typedef struct {
 #define VP_SMP_CPU_HEAP_SIZE (VP_SMP_CACHE_SLOTS + 1) /* slot 0 = default */
 
 /* Per-frame VP texture slot: a guest texture uploaded for this frame's VP
- * draws (re-uploaded every frame -- gcm/cube's plasma animates in guest
- * memory). SRV lives at heap index 1+slot. */
+ * draws (re-uploaded when guest bytes change). The resource is cached here;
+ * SRVs are emitted only into per-draw descriptor windows. Never create the old
+ * persistent heap[1+slot] SRV: VP_TEX_SLOTS extends beyond slot 30, so that
+ * address range overlaps DRAW_SRV_BASE and clobbers live per-draw SRVs. */
 typedef struct {
     ID3D12Resource* res;
     ID3D12Resource* up;
@@ -3124,10 +3126,10 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     return pso;
 }
 
-/* Upload the guest texture for a VP draw into a per-frame texture slot
- * (re-uploaded every frame: gcm/cube's plasma animates in guest memory).
- * Returns the slot index (SRV at heap 1+slot) or -1. Must run while the
- * command list is open, before the draw passes. */
+/* Upload the guest texture for a VP draw into a cached resource slot.
+ * Returns that resource slot or -1. Must run while the command list is open,
+ * before the draw passes. The caller writes the correctly-remapped SRV into
+ * this draw's descriptor window; no persistent SRV belongs to this cache. */
 /* NV4097 TEXTURE_CONTROL1 component remap -> D3D12 Shader4ComponentMapping.
  * The crossbar decode itself is RSX semantics and lives in
  * rsx_texture_layout.c; all that is left here is packing the four selectors
@@ -3424,7 +3426,6 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, u32 guest_pitch, i
      * re-deriving any of it. Only the DXGI mapping below is ours. */
     rsx_tex_layout tl;
     rsx_texture_layout_pitched(fmt, w, h, guest_pitch, &tl);
-    u32 basef = fmt & 0x9F;              /* still needed for the SRV remap */
     int argb = (tl.fmt == RSX_TEXFMT_R8G8B8A8);
     int dxt  = tl.compressed;
     /* Compressed rows are counted in blocks, so keep bpp at 1 for the byte
@@ -4089,26 +4090,20 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, u32 guest_pitch, i
             s_logo_tex_copy_issued = 1;
         }
     }
-    /* SRV at heap slot 1+slot */
-    D3D12_SHADER_RESOURCE_VIEW_DESC sv = {0};
-    sv.Format = dxfmt;
-    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    /* RSX B8 replicates the byte into all four channels (dbgfont's FP reads
-     * coverage from .w); DXGI R8 defaults to (r,0,0,1), so swizzle (R,R,R,R)
-     * = encoded 0x1000 (component 0 in all lanes + always-set bit). ARGB8
-     * keeps the identity mapping. */
-    sv.Shader4ComponentMapping = (basef == 0x81) ? 0x1000 : D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    sv.Texture2D.MipLevels = 1;
-    D3D12_CPU_DESCRIPTOR_HANDLE sh;
-    s_d3d.srv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &sh);
-    sh.ptr += (u64)(1 + slot) * s_d3d.srv_inc;
-    if (cube) {
-        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
-        sv.TextureCube.MipLevels = 1;
-        sv.TextureCube.MostDetailedMip = 0;
-        sv.TextureCube.ResourceMinLODClamp = 0.0f;
+    /* The VP texture cache owns resources, not shader-visible descriptors.
+     * Older code created an SRV at heap[1+slot]. Once slot reached 31 that
+     * address was heap[32], exactly DRAW_SRV_BASE, and subsequent texture
+     * uploads overwrote descriptors already prepared for earlier draws in the
+     * same frame. Particle/effect-heavy frames therefore flickered more as the
+     * number of distinct cached textures grew. The per-draw prepass below is
+     * the sole owner of shader-visible SRVs. */
+    if (slot >= (int)(DRAW_SRV_BASE - 1u)) {
+        static int overlap_prevent_log = 0;
+        if (overlap_prevent_log++ < 16)
+            fprintf(stderr,
+                    "[SRV-OVERLAP-FIX] texslot=%d legacy_heap=%u would overlap draw-SRV region; skipped%c",
+                    slot, 1u + (u32)slot, 10);
     }
-    s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, t->res, &sv, sh);
 
     t->off = off; t->key = key_off; t->w = w; t->h = h; t->fmt = fmt;
     t->guest_pitch = guest_pitch;
