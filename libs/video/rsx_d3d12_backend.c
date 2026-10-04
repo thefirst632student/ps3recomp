@@ -82,6 +82,7 @@ typedef struct {
     int fp_exp32;       /* SET_SHADER_CONTROL 32-bit-exports bit at draw time   */
     u32 alpha_ctl;      /* alpha test: enable<<16 | (func&0xFF)<<8 | ref */
     u32 begin_epoch;    /* SET_BEGIN_END generation, for batch concatenation */
+    u32 flip_ready_epoch; /* diagnostic: cellGcm_flip_request_count() at record time */
     u32 cull;           /* packed face culling: bit0 enable, bit1 cull FRONT
                          * (else BACK), bit2 front face is CCW. RSX culls back
                          * faces on most solid geometry; rendering everything
@@ -2317,6 +2318,30 @@ static int vp_get_vs(const rsx_state* st)
             }
         }
     }
+    /* v58: dump only the data-flow relevant to WA2's generic 2D sprite VP.
+     * Observation only: shader text is not modified. */
+    if (wa2_diag_on() && ((st->shader_program & ~1u) == 0x01E08480u)) {
+        static int sprite_vp_dumped = 0;
+        if (!sprite_vp_dumped) {
+            sprite_vp_dumped = 1;
+            fprintf(stderr, "[SPRITE_VP] instrs=%d start=%u hash=0x%08X%c",
+                    ni, st->transform_program_start, hash, 10);
+            const char* _ln = hlsl;
+            while (*_ln) {
+                const char* _e = strchr(_ln, '\n');
+                size_t _len = _e ? (size_t)(_e - _ln) : strlen(_ln);
+                if (_len) {
+                    char _tmp[1024]; size_t _n = _len < sizeof(_tmp)-1 ? _len : sizeof(_tmp)-1;
+                    memcpy(_tmp, _ln, _n); _tmp[_n] = 0;
+                    if (strstr(_tmp, "v[3]") || strstr(_tmp, "o[1]") ||
+                        strstr(_tmp, "Out.col0") || strstr(_tmp, "v[8]") ||
+                        strstr(_tmp, "o[7]") || strstr(_tmp, "Out.t0"))
+                        fprintf(stderr, "[SPRITE_VP] %s%c", _tmp, 10);
+                }
+                if (!_e) break; _ln = _e + 1;
+            }
+        }
+    }
     if (getenv("VP_DUMP")) { static int _d=0; if (_d++ < 4) {
         FILE* f = fopen("vp2_dump.hlsl", _d==1 ? "w" : "a");
         if (f) { fprintf(f, "/* per-draw VS hash pending, %d instrs */%s%s", ni, hlsl, "\n"); fclose(f); } } }
@@ -2920,6 +2945,31 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
             if (_lodlog++ < 8)
                 fprintf(stderr, "[FPLOD0] fp=0x%08X explicit_level0_samples=%d%c",
                         fp_addr, lod0_samples, 10);
+        }
+    }
+
+    /* v58: dump the translated generic WA2 sprite FP once.  Keep only lines
+     * that show texture sample, COLOR0 use, alpha/discard and final export. */
+    if (wa2_diag_on() && ((fp_addr & ~1u) == 0x01E08480u)) {
+        static int sprite_fp_dumped = 0;
+        if (!sprite_fp_dumped) {
+            sprite_fp_dumped = 1;
+            fprintf(stderr, "[SPRITE_FP] fp=0x%08X instrs=%d ctrl=0x%08X%c",
+                    fp_addr, n, fp_ctrl, 10);
+            const char* _ln = hlsl;
+            while (*_ln) {
+                const char* _e = strchr(_ln, '\n');
+                size_t _len = _e ? (size_t)(_e - _ln) : strlen(_ln);
+                if (_len) {
+                    char _tmp[1200]; size_t _n = _len < sizeof(_tmp)-1 ? _len : sizeof(_tmp)-1;
+                    memcpy(_tmp, _ln, _n); _tmp[_n] = 0;
+                    if (strstr(_tmp, "rsx_tex") || strstr(_tmp, "input.col0") ||
+                        strstr(_tmp, "input.tc0") || strstr(_tmp, "_po.c0") ||
+                        strstr(_tmp, "discard") || strstr(_tmp, "return"))
+                        fprintf(stderr, "[SPRITE_FP] %s%c", _tmp, 10);
+                }
+                if (!_e) break; _ln = _e + 1;
+            }
         }
     }
 
@@ -4137,9 +4187,13 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, u32 guest_pitch, i
 /* Snapshot the VP constant bank + viewport epilogue for one draw into its
  * vp_cb slot. Runs at record time so every draw keeps the constants that
  * were live when the guest issued it. */
-static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
+static void vp_record_cb(u32 slot, int vs_idx, D3D12DrawRecord* dr)
 {
     const rsx_state* st = s_d3d.current_rsx_state;
+    if (dr) {
+        extern unsigned cellGcm_flip_request_count(void);
+        dr->flip_ready_epoch = cellGcm_flip_request_count();
+    }
     if (!s_d3d.vp_cb_mapped || !st || slot >= MAX_DRAWS) return;
     /* FP texcoord scale (b1): 1/size for UNnormalized textures (fmt bit
      * 0x40 -- wave samples everything in texel space), 1.0 otherwise. */
@@ -5470,11 +5524,22 @@ static void render_frame(void)
         u32 snow_n = 0, snow_first = 0xFFFFFFFFu, snow_last = 0;
         float snow_amin = 2.0f, snow_amax = -1.0f;
         u32 snow_blend0 = 0, snow_rt0 = 0, snow_fp0 = 0, snow_tex0 = 0;
+        u32 epoch_min = 0xFFFFFFFFu, epoch_max = 0, epoch_changes = 0, epoch_prev = 0xFFFFFFFFu;
+        u32 epoch_first_change = 0xFFFFFFFFu;
         u32 logo_n = 0;
         float logo_amin = 2.0f, logo_amax = -1.0f;
 
         for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; ++_d) {
             const D3D12DrawRecord* _r = &s_d3d.draws[_d];
+            if (_r->is_vp && !_r->is_clear) {
+                u32 _ep = _r->flip_ready_epoch;
+                if (_ep < epoch_min) epoch_min = _ep;
+                if (_ep > epoch_max) epoch_max = _ep;
+                if (epoch_prev != 0xFFFFFFFFu && _ep != epoch_prev) {
+                    epoch_changes++; if (epoch_first_change == 0xFFFFFFFFu) epoch_first_change = _d;
+                }
+                epoch_prev = _ep;
+            }
             const u32 _bf = _r->tex[0].fmt & 0x9Fu;
             const int _snow_tex =
                 (_r->tex[0].raw == 0x0368E500u) ||
@@ -5527,12 +5592,15 @@ static void render_frame(void)
             if (_emit) {
                 fprintf(stderr,
                     "[SNOWSEQ] frame=%u parity=%d draws=%u snow=%u range=%u..%u "
-                    "alpha=%.4f..%.4f rt=0x%08X fp=0x%08X tex0=0x%08X blend=0x%08X ops=%u%c",
+                    "alpha=%.4f..%.4f rt=0x%08X fp=0x%08X tex0=0x%08X blend=0x%08X "
+                    "ops=%u epoch=%u..%u changes=%u firstchg=%u%c",
                     (unsigned)s_d3d.frame_count, s_d3d.vp_parity,
                     (unsigned)s_d3d.draw_count, (unsigned)snow_n,
                     (unsigned)snow_first, (unsigned)snow_last,
                     (double)snow_amin, (double)snow_amax, snow_rt0, snow_fp0,
-                    snow_tex0, snow_blend0, (unsigned)s_display_blit_count, 10);
+                    snow_tex0, snow_blend0, (unsigned)s_display_blit_count,
+                    epoch_min == 0xFFFFFFFFu ? 0u : epoch_min, epoch_max, epoch_changes,
+                    epoch_first_change == 0xFFFFFFFFu ? 0xFFFFFFFFu : epoch_first_change, 10);
 
                 for (u32 _o = 0; _o < s_display_blit_count && _o < MAX_DISPLAY_BLIT_OPS; ++_o) {
                     const D3D12DisplayBlitOp* _op = &s_display_blit_ops[_o];
@@ -5544,6 +5612,15 @@ static void render_frame(void)
                         _op->src_raw, _op->dst_raw, _op->w, _op->h,
                         _op->store_w, _op->store_h, _op->src_rt, _op->dst_rt,
                         _op->done, 10);
+                    if (_op->draw_pos > 0 && _op->draw_pos <= s_d3d.draw_count) {
+                        u32 _a = _op->draw_pos - 1u;
+                        u32 _b = (_op->draw_pos < s_d3d.draw_count) ? _op->draw_pos : _a;
+                        fprintf(stderr,
+                            "[SNOWSEQ_OP_EPOCH] frame=%u op=%u pos=%u before[d%u]=%u after[d%u]=%u%c",
+                            (unsigned)s_d3d.frame_count, (unsigned)_o, (unsigned)_op->draw_pos,
+                            _a, s_d3d.draws[_a].flip_ready_epoch,
+                            _b, s_d3d.draws[_b].flip_ready_epoch, 10);
+                    }
                 }
 
                 const u32 _lo = (snow_first > 2u) ? snow_first - 2u : 0u;
@@ -5553,11 +5630,11 @@ static void render_frame(void)
                     const D3D12DrawRecord* _r = &s_d3d.draws[_d];
                     fprintf(stderr,
                         "[SNOWSEQ_DRAW] frame=%u d=%u clear=%d vp=%d rt=0x%08X fp=0x%08X "
-                        "blend=%d key=0x%08X tex0=0x%08X/%ux%u/fmt%02X vc=%u%c",
+                        "blend=%d key=0x%08X tex0=0x%08X/%ux%u/fmt%02X vc=%u epoch=%u%c",
                         (unsigned)s_d3d.frame_count, (unsigned)_d, _r->is_clear,
                         _r->is_vp, _r->rt_off, _r->fp_addr, _r->blend,
                         _r->blend_key, _r->tex[0].raw, _r->tex[0].w, _r->tex[0].h,
-                        _r->tex[0].fmt & 0xFFu, _r->vertex_count, 10);
+                        _r->tex[0].fmt & 0xFFu, _r->vertex_count, _r->flip_ready_epoch, 10);
                 }
             }
             snow_diag_frames++;
