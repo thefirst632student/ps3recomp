@@ -189,7 +189,11 @@ typedef struct {
  * address range overlaps DRAW_SRV_BASE and clobbers live per-draw SRVs. */
 typedef struct {
     ID3D12Resource* res;
-    ID3D12Resource* up;
+    /* Upload heaps are CPU-written while the previous command list may still
+     * be consuming CopyTextureRegion from the prior frame.  Keep one staging
+     * buffer per VP parity, just like vp_vb/vp_cb/vp_fpcb, so frame N+1 never
+     * overwrites bytes still referenced by frame N on the GPU. */
+    ID3D12Resource* up[2];
     u32 off, w, h, fmt; /* current contents (resource reused when dims match) */
     u32 guest_pitch;    /* source row pitch; part of texture identity/layout */
     u32 csum;           /* sparse checksum of the source bytes last uploaded */
@@ -3682,7 +3686,9 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, u32 guest_pitch, i
      * crashes. */
     if (t->res && (t->w != w || t->h != h || t->fmt != fmt || t->guest_pitch != guest_pitch || t->cube != cube)) {
         t->res->lpVtbl->Release(t->res); t->res = NULL;
-        if (t->up) { t->up->lpVtbl->Release(t->up); t->up = NULL; }
+        for (int _p = 0; _p < 2; ++_p) {
+            if (t->up[_p]) { t->up[_p]->lpVtbl->Release(t->up[_p]); t->up[_p] = NULL; }
+        }
     }
     if (!t->res) {
         D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -3698,6 +3704,15 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, u32 guest_pitch, i
                 D3D12_RESOURCE_STATE_COPY_DEST, NULL,
                 &IID_ID3D12Resource, (void**)&t->res)))
             return -1;
+        fresh = 1;
+    }
+
+    /* Create the staging resource lazily for the parity being recorded.  The
+     * DEFAULT texture may be shared because command-queue ordering guarantees
+     * frame N samples it before frame N+1 overwrites it; the UPLOAD heap may
+     * not be shared because CPU writes are not ordered by that GPU queue. */
+    const int up_parity = s_d3d.vp_parity & 1;
+    if (!t->up[up_parity]) {
         D3D12_HEAP_PROPERTIES hu = {0}; hu.Type = D3D12_HEAP_TYPE_UPLOAD;
         D3D12_RESOURCE_DESC bd = {0};
         bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -3707,14 +3722,15 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, u32 guest_pitch, i
         if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
                 s_d3d.device, &hu, D3D12_HEAP_FLAG_NONE, &bd,
                 D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
-                &IID_ID3D12Resource, (void**)&t->up))) {
-            t->res->lpVtbl->Release(t->res); t->res = NULL; return -1;
+                &IID_ID3D12Resource, (void**)&t->up[up_parity]))) {
+            if (fresh) { t->res->lpVtbl->Release(t->res); t->res = NULL; }
+            return -1;
         }
-        fresh = 1;
     }
+    ID3D12Resource* up_res = t->up[up_parity];
 
     void* mapped = NULL; D3D12_RANGE nr = {0,0};
-    if (FAILED(t->up->lpVtbl->Map(t->up, 0, &nr, &mapped)) || !mapped) return -1;
+    if (FAILED(up_res->lpVtbl->Map(up_res, 0, &nr, &mapped)) || !mapped) return -1;
     { static int _tp=0; if (getenv("RTT_DUMP") && _tp++ < 6) {
         const u8* sp = vm_base + off;
         fprintf(stderr, "[TEXUP] off=0x%X fmt=0x%X row0:", off, fmt);
@@ -4071,7 +4087,15 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, u32 guest_pitch, i
       } }
     }   /* end per-face conversion */
     off = _off0; mapped = _map0;
-    t->up->lpVtbl->Unmap(t->up, 0, NULL);
+    { static int _uplife_n = 0;
+      if (_uplife_n < 24 && wa2_diag_on()) {
+          fprintf(stderr,
+                  "[TEX-UP-PARITY] frame=%llu slot=%d parity=%d raw=0x%08X src=0x%08X %ux%u fmt=0x%02X up=%p%c",
+                  (unsigned long long)s_d3d.frame_count, slot, up_parity, key_off, _off0,
+                  w, h, fmt & 0xFFu, (void*)up_res, 10);
+          _uplife_n++;
+      } }
+    up_res->lpVtbl->Unmap(up_res, 0, NULL);
 
     if (!fresh) {   /* reused resource: PSR -> COPY_DEST first */
         D3D12_RESOURCE_BARRIER b = {0};
@@ -4084,7 +4108,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, u32 guest_pitch, i
     }
     D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
     dst.pResource = t->res; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    src.pResource = t->up;  src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.pResource = up_res; src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     src.PlacedFootprint.Footprint.Format   = dxfmt;
     src.PlacedFootprint.Footprint.Width    = w;
     src.PlacedFootprint.Footprint.Height   = h;
