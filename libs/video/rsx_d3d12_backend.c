@@ -140,6 +140,9 @@ typedef struct {
      * (wave's debug tiles) position quads with this, not with constants --
      * forcing full-target viewports drew every tile window-sized. */
     u32 vp_x, vp_y, vp_w, vp_h;
+    /* Guest scissor at draw time. NV4097 scissor is independent from the
+     * viewport and must be intersected with the active surface. */
+    u32 sc_x, sc_y, sc_w, sc_h;
     /* Ordered clear op (offscreen surfaces only; display clears stay the
      * frame-start backbuffer clear). is_clear records also set is_vp so the
      * legacy replay pass skips them. */
@@ -6826,8 +6829,10 @@ static void render_frame(void)
                                                 dr_cube_mask(dr)) : NULL;
                 s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list,
                                                          dpso ? dpso : vpso);
-                /* Per-draw viewport: the guest rect when sane, else the
-                 * full target. Scissor tracks the same rect. */
+                /* Per-draw viewport and scissor are independent NV4097 state.
+                 * Match rsx_live_draw: intersect a real guest scissor with the
+                 * active surface. A zero-sized/unwritten scissor means full
+                 * surface. */
                 {
                     float tw = (cur_rt >= 0) ? (float)s_d3d.off_rt[cur_rt].w : (float)s_d3d.width;
                     float th = (cur_rt >= 0) ? (float)s_d3d.off_rt[cur_rt].h : (float)s_d3d.height;
@@ -6840,9 +6845,18 @@ static void render_frame(void)
                         dvp.Width    = (float)dr->vp_w;
                         dvp.Height   = (float)dr->vp_h;
                     }
-                    D3D12_RECT dsc = {(LONG)dvp.TopLeftX, (LONG)dvp.TopLeftY,
-                                      (LONG)(dvp.TopLeftX + dvp.Width),
-                                      (LONG)(dvp.TopLeftY + dvp.Height)};
+                    D3D12_RECT dsc = {0, 0, (LONG)tw, (LONG)th};
+                    if (dr->sc_w > 0 && dr->sc_h > 0) {
+                        LONG sx = (LONG)dr->sc_x, sy = (LONG)dr->sc_y;
+                        LONG sr = sx + (LONG)dr->sc_w;
+                        LONG sb = sy + (LONG)dr->sc_h;
+                        if (sx > dsc.left)   dsc.left = sx;
+                        if (sy > dsc.top)    dsc.top = sy;
+                        if (sr < dsc.right)  dsc.right = sr;
+                        if (sb < dsc.bottom) dsc.bottom = sb;
+                        if (dsc.right < dsc.left) dsc.right = dsc.left;
+                        if (dsc.bottom < dsc.top) dsc.bottom = dsc.top;
+                    }
                     dvp_x = dvp.TopLeftX; dvp_y = dvp.TopLeftY;
                     dvp_w = dvp.Width;    dvp_h = dvp.Height;
                     s_d3d.cmd_list->lpVtbl->RSSetViewports(s_d3d.cmd_list, 1, &dvp);
@@ -8536,6 +8550,20 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                     for (u32 _k = 0; _k < _nv; _k++)
                         rsx_fetch_attrib(_st, 8, first + _k, _uv[_k]);
                     const float* _s = _st->vertex_constants[467];
+                    float _sp[4][4] = {{0}};
+                    for (u32 _k = 0; _k < _nv; _k++)
+                        rsx_fetch_attrib(_st, 0, first + _k, _sp[_k]);
+                    fprintf(stderr,
+                        "[SNOWSC68] frame=%u first=%u sc=%u,%u %ux%u vp=%u,%u %ux%u "
+                        "pos0=(%.6g %.6g) pos1=(%.6g %.6g) pos2=(%.6g %.6g) pos3=(%.6g %.6g) "
+                        "mips=%u addr=0x%08X ctrl0=0x%08X filter=0x%08X%c",
+                        (unsigned)s_d3d.frame_count, first,
+                        _st->scissor_x, _st->scissor_y, _st->scissor_w, _st->scissor_h,
+                        _st->viewport_x, _st->viewport_y, _st->viewport_w, _st->viewport_h,
+                        _sp[0][0],_sp[0][1], _sp[1][0],_sp[1][1],
+                        _sp[2][0],_sp[2][1], _sp[3][0],_sp[3][1],
+                        s_d3d.cur_texs[0].mips, s_d3d.cur_texs[0].address,
+                        s_d3d.cur_texs[0].control0, s_d3d.cur_texs[0].filter, 10);
                     fprintf(stderr,
                         "[SNOWUV67] frame=%u first=%u c467=(%.9g %.9g %.9g %.9g) "
                         "uv0=(%.6g %.6g)->(%.6g %.6g) uv1=(%.6g %.6g)->(%.6g %.6g) "
@@ -8850,7 +8878,14 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                     dr->vp_y = s_d3d.current_rsx_state->viewport_y;
                     dr->vp_w = s_d3d.current_rsx_state->viewport_w;
                     dr->vp_h = s_d3d.current_rsx_state->viewport_h;
-                } else { dr->vp_x = dr->vp_y = dr->vp_w = dr->vp_h = 0; }
+                    dr->sc_x = s_d3d.current_rsx_state->scissor_x;
+                    dr->sc_y = s_d3d.current_rsx_state->scissor_y;
+                    dr->sc_w = s_d3d.current_rsx_state->scissor_w;
+                    dr->sc_h = s_d3d.current_rsx_state->scissor_h;
+                } else {
+                    dr->vp_x = dr->vp_y = dr->vp_w = dr->vp_h = 0;
+                    dr->sc_x = dr->sc_y = dr->sc_w = dr->sc_h = 0;
+                }
                 dr->cb_slot = s_d3d.draw_count;
                 vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);
                 s_d3d.draw_count++;
@@ -8972,7 +9007,14 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 dr->vp_y = s_d3d.current_rsx_state->viewport_y;
                 dr->vp_w = s_d3d.current_rsx_state->viewport_w;
                 dr->vp_h = s_d3d.current_rsx_state->viewport_h;
-            } else { dr->vp_x = dr->vp_y = dr->vp_w = dr->vp_h = 0; }
+                dr->sc_x = s_d3d.current_rsx_state->scissor_x;
+                dr->sc_y = s_d3d.current_rsx_state->scissor_y;
+                dr->sc_w = s_d3d.current_rsx_state->scissor_w;
+                dr->sc_h = s_d3d.current_rsx_state->scissor_h;
+            } else {
+                dr->vp_x = dr->vp_y = dr->vp_w = dr->vp_h = 0;
+                dr->sc_x = dr->sc_y = dr->sc_w = dr->sc_h = 0;
+            }
             dr->cb_slot = s_d3d.draw_count;
                 vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);
             s_d3d.draw_count++;
@@ -9122,7 +9164,14 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
             dr->vp_y = s_d3d.current_rsx_state->viewport_y;
             dr->vp_w = s_d3d.current_rsx_state->viewport_w;
             dr->vp_h = s_d3d.current_rsx_state->viewport_h;
-        } else { dr->vp_x = dr->vp_y = dr->vp_w = dr->vp_h = 0; }
+            dr->sc_x = s_d3d.current_rsx_state->scissor_x;
+            dr->sc_y = s_d3d.current_rsx_state->scissor_y;
+            dr->sc_w = s_d3d.current_rsx_state->scissor_w;
+            dr->sc_h = s_d3d.current_rsx_state->scissor_h;
+        } else {
+            dr->vp_x = dr->vp_y = dr->vp_w = dr->vp_h = 0;
+            dr->sc_x = dr->sc_y = dr->sc_w = dr->sc_h = 0;
+        }
         dr->cb_slot = s_d3d.draw_count;
                 vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);
         s_d3d.draw_count++;
