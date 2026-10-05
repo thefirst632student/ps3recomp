@@ -1639,6 +1639,35 @@ void vm_write64(uint64_t a, uint64_t v) {
     barrier_watch_hit((uint32_t)a + 4, (uint32_t)v,         4, __builtin_return_address(0));
     if (vm_oob((uint32_t)a,8)) return;
     v = __builtin_bswap64(v); VM_WRITE_COH(a, &v, 8); }
+
+/* Raw-byte guest store for VMX instructions. Vector registers in the lifted
+ * runtime use a raw-byte convention, so stvx/stvxl historically memcpy'd the
+ * 16 bytes straight into vm_base. That byte layout is correct, but the direct
+ * memcpy bypassed both barrier_watch_hit() and VM_WRITE_COH(), making vector
+ * writes invisible to diagnostics and reservation coherency. Keep the exact
+ * bytes while exposing each complete guest dword to the normal write watch. */
+void vm_write_raw(uint64_t a, const void* src, uint32_t n) {
+    if (!src || n == 0) return;
+    if (vm_oob((uint32_t)a, n)) return;
+#ifndef NDEBUG
+    const uint8_t* p = (const uint8_t*)src;
+    void* ra = __builtin_return_address(0);
+    uint32_t o = 0;
+    for (; o + 4u <= n; o += 4u) {
+        uint32_t raw; memcpy(&raw, p + o, 4);
+        barrier_watch_hit((uint32_t)a + o, __builtin_bswap32(raw), 4, ra);
+    }
+    if (o < n) {
+        uint32_t tail = 0;
+        const uint32_t rem = n - o;
+        if (rem == 1u) tail = p[o];
+        else if (rem == 2u) { uint16_t t; memcpy(&t, p + o, 2); tail = __builtin_bswap16(t); }
+        else { for (uint32_t i = 0; i < rem; ++i) tail = (tail << 8) | p[o + i]; }
+        barrier_watch_hit((uint32_t)a + o, tail, (int)rem, ra);
+    }
+#endif
+    VM_WRITE_COH(a, src, n);
+}
 }
 
 /* ---- malloc allocation tracker (PS3_ALLOCTAG) -------------------------------

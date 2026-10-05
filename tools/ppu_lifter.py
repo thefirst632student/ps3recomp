@@ -120,6 +120,7 @@ void     vm_write8 (uint64_t addr, uint8_t  val);
 void     vm_write16(uint64_t addr, uint16_t val);
 void     vm_write32(uint64_t addr, uint32_t val);
 void     vm_write64(uint64_t addr, uint64_t val);
+void     vm_write_raw(uint64_t addr, const void* src, uint32_t size);
 /* stwcx./stdcx. store-conditional: atomically store `val` at `addr` iff the raw
  * big-endian guest word still equals `expected` (the value the paired lwarx/ldarx
  * loaded). Returns 1 if the reservation held (store applied), 0 otherwise. This
@@ -2175,8 +2176,12 @@ class PPULifter:
             vs = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
+            # Preserve the existing raw-byte vector convention, but route the
+            # store through the runtime so write-watch diagnostics and SPU
+            # reservation coherency see VMX writes too. Direct memcpy here made
+            # stvx/stvxl invisible to every vm_write* hook.
             return (f"{{ uint64_t ea = ({_xea(ra,rb)}) & ~0xFULL; "
-                    f"memcpy(vm_base + (uint32_t)ea, &ctx->vr[{vs}], 16); }}")
+                    f"vm_write_raw(ea, &ctx->vr[{vs}], 16); }}")
 
         # Cell unaligned vector loads (CBEA / AltiVec): lvlx loads bytes
         # [EA&15 .. 15] of the aligned quadword left-justified into vD and
@@ -2224,8 +2229,7 @@ class PPULifter:
             size = {"stvebx": 1, "stvehx": 2, "stvewx": 4}[mn]
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
                     f"ea &= ~{size - 1}ULL; "
-                    f"memcpy(vm_base + (uint32_t)ea, "
-                    f"(const uint8_t*)&ctx->vr[{vs}] + (ea & 15), {size}); }}")
+                    f"vm_write_raw(ea, (const uint8_t*)&ctx->vr[{vs}] + (ea & 15), {size}); }}")
 
         if mn == "lvsl" or mn == "lvsr":
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])

@@ -55,6 +55,13 @@ void vm_write64(uint64_t addr, uint64_t v)
     memcpy(vm_base + (uint32_t)addr, &v, 8);
 }
 
+/* Raw-byte VMX store counterpart used by newly lifted stvx/stvxl/stve*. */
+void vm_write_raw(uint64_t addr, const void* src, uint32_t size)
+{
+    if (!src || !size) return;
+    memcpy(vm_base + (uint32_t)addr, src, size);
+}
+
 /* ppu_loader.cpp - out-of-line big-endian guest loads. The loader's version
  * bounds-checks against the mapped image; this host owns the whole arena. */
 uint32_t vm_read32(uint64_t addr)
