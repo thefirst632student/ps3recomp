@@ -1302,6 +1302,42 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
           }
       } }
     uint32_t v; memcpy(&v, vm_base + (uint32_t)a, 4);
+#if defined(_WIN32) && !defined(NDEBUG)
+    /* WA2 v74: read-side truth probe. v73 armed the object page read-only
+     * after zero-init, but no protection fault was observed before 0x4C528
+     * later consumed the snow UV rectangle. At the exact eight lfs source
+     * dwords, record both the bytes physically present in vm_base and the
+     * current Windows page protection. This distinguishes a lost/recommitted
+     * guard from an alias/read-semantics bug without changing guest values. */
+    {
+        const uint32_t ea74 = (uint32_t)a;
+        if (ea74 >= WA2_SNOW_OBJ73 + 0xE8u && ea74 <= WA2_SNOW_OBJ73 + 0x104u &&
+            ((ea74 - (WA2_SNOW_OBJ73 + 0xE8u)) & 3u) == 0) {
+            void* ra74 = __builtin_return_address(0);
+            const uint32_t gf74 = ppu_prof_resolve_host(ra74);
+            if (gf74 == 0x0004C528u) {
+                static int n74 = 0;
+                if (n74++ < 24) {
+                    MEMORY_BASIC_INFORMATION mbi74; memset(&mbi74, 0, sizeof(mbi74));
+                    SIZE_T q74 = VirtualQuery(vm_base + ea74, &mbi74, sizeof(mbi74));
+                    uint32_t snap74[8]; wa2_snow_uv73_read(snap74);
+                    fprintf(stderr,
+                            "[SNOWOBJ74-READ] n=%d ea=0x%08X rawLE=0x%08X guest=0x%08X "
+                            "protect=0x%08lX state=0x%08lX type=0x%08lX guardPage=%p "
+                            "uv=%08X/%08X/%08X/%08X/%08X/%08X/%08X/%08X\n",
+                            n74 - 1, ea74, v, __builtin_bswap32(v),
+                            q74 ? (unsigned long)mbi74.Protect : 0ul,
+                            q74 ? (unsigned long)mbi74.State : 0ul,
+                            q74 ? (unsigned long)mbi74.Type : 0ul,
+                            (void*)s_guard_page,
+                            snap74[0], snap74[1], snap74[2], snap74[3],
+                            snap74[4], snap74[5], snap74[6], snap74[7]);
+                    fflush(stderr);
+                }
+            }
+        }
+    }
+#endif
 #ifndef NDEBUG
     g_last_rd_addr = (uint32_t)a; g_last_rd_val = __builtin_bswap32(v);
 #ifdef _WIN32
@@ -1508,6 +1544,13 @@ static inline void wa2_snow_guard73_arm_after_store(void)
         s_wa2_guard73_armed = 1;
         ppu_guard_page(0x01087368u);
         fprintf(stderr, "[SNOWOBJ73-GUARD-ARM] object=0x01087280 uv=0x01087368..0x01087384\n");
+#if defined(_WIN32) && !defined(NDEBUG)
+        { uint32_t a74[8]; wa2_snow_uv73_read(a74); MEMORY_BASIC_INFORMATION m74; memset(&m74,0,sizeof(m74));
+          SIZE_T q74 = VirtualQuery(vm_base + WA2_SNOW_UV73_EA, &m74, sizeof(m74));
+          fprintf(stderr, "[SNOWOBJ74-ARMSTATE] protect=0x%08lX state=0x%08lX guardPage=%p uv=%08X/%08X/%08X/%08X/%08X/%08X/%08X/%08X\n",
+                  q74 ? (unsigned long)m74.Protect : 0ul, q74 ? (unsigned long)m74.State : 0ul, (void*)s_guard_page,
+                  a74[0],a74[1],a74[2],a74[3],a74[4],a74[5],a74[6],a74[7]); fflush(stderr); }
+#endif
         fflush(stderr);
     }
 #endif
