@@ -156,9 +156,10 @@ extern "C" {
 #define NV4097_SET_TRANSFORM_PROGRAM_START      0x00001EA0
 #define NV4097_SET_TRANSFORM_PROGRAM            0x00000B80
 #define NV4097_SET_TRANSFORM_CONSTANT_LOAD      0x00001EFC
-/* Vertex constants are written as up to 64 dwords (16 vec4s) per command,
- * starting at 0x1F00. Slot = transform_constant_load + (reg/4); lane = reg%4.
- * The hardware supports 512 vec4 constants total in the vertex register file. */
+/* Vertex constants occupy exactly 32 method dwords (8 vec4s) beginning at
+ * 0x1F00. SET_FREQUENCY_DIVIDER_OPERATION begins at 0x1FC0; extending the
+ * constant window into that range corrupts constants with raster state.
+ * Slot = transform_constant_load + (reg/4); lane = reg%4. */
 #define NV4097_SET_TRANSFORM_CONSTANT           0x00001F00
 #define RSX_MAX_VERTEX_CONSTANTS                512
 

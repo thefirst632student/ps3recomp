@@ -4403,6 +4403,21 @@ static void vp_record_cb(u32 slot, int vs_idx, D3D12DrawRecord* dr)
     char* dst = (char*)s_d3d.vp_cb_mapped
         + ((u64)s_d3d.vp_parity * MAX_DRAWS + slot) * VP_CB_STRIDE;
     memcpy(dst, st->vertex_constants, RSX_MAX_VERTEX_CONSTANTS * 16);
+    /* WA2_SNOW_UV_FORCE=1: diagnostic A/B only.  The snow atlas is 64x128
+     * and its guest vertices carry pixel-space UVs.  Override only the host
+     * per-draw copy of c467 so the guest constant bank remains untouched. */
+    if (dr && dr->tex[0].raw == 0x0368E500u) {
+        static int _suv_force = -1;
+        if (_suv_force < 0) { const char* e = getenv("WA2_SNOW_UV_FORCE"); _suv_force = e ? atoi(e) : 0; }
+        if (_suv_force) {
+            float* _c = (float*)dst;
+            _c[467u * 4u + 0u] = 1.0f / 64.0f;
+            _c[467u * 4u + 1u] = 1.0f / 128.0f;
+            static unsigned _n = 0;
+            if (_n++ < 8u) fprintf(stderr, "[SNOWUV67-FORCE] c467.xy=(%.9g %.9g)%c",
+                                   _c[467u*4u], _c[467u*4u+1u], 10);
+        }
+    }
     /* Automatic WA2 logo VP probe. This is observation only: no constants,
      * shaders, draw order or GPU state are modified.  The first texture probe
      * established that texture bytes and pre-VP vertices are valid, so the next
@@ -8513,6 +8528,26 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             rsx_fetch_attrib(_st, 0, first, _p);
             rsx_fetch_attrib(_st, 3, first, _c);
             rsx_fetch_attrib(_st, 8, first, _t);
+            if (_is_snow) {
+                static unsigned _uv67_n = 0;
+                if (_uv67_n++ < 64u) {
+                    float _uv[4][4] = {{0}};
+                    const u32 _nv = count < 4u ? count : 4u;
+                    for (u32 _k = 0; _k < _nv; _k++)
+                        rsx_fetch_attrib(_st, 8, first + _k, _uv[_k]);
+                    const float* _s = _st->vertex_constants[467];
+                    fprintf(stderr,
+                        "[SNOWUV67] frame=%u first=%u c467=(%.9g %.9g %.9g %.9g) "
+                        "uv0=(%.6g %.6g)->(%.6g %.6g) uv1=(%.6g %.6g)->(%.6g %.6g) "
+                        "uv2=(%.6g %.6g)->(%.6g %.6g) uv3=(%.6g %.6g)->(%.6g %.6g)%c",
+                        (unsigned)s_d3d.frame_count, first,
+                        _s[0],_s[1],_s[2],_s[3],
+                        _uv[0][0],_uv[0][1],_uv[0][0]*_s[0],_uv[0][1]*_s[1],
+                        _uv[1][0],_uv[1][1],_uv[1][0]*_s[0],_uv[1][1]*_s[1],
+                        _uv[2][0],_uv[2][1],_uv[2][0]*_s[0],_uv[2][1]*_s[1],
+                        _uv[3][0],_uv[3][1],_uv[3][0]*_s[0],_uv[3][1]*_s[1], 10);
+                }
+            }
             fprintf(stderr,
                 "[SPRITE62_RING] n=%llu frame=%u tex0=0x%08X prim=%u first=%u count=%u "
                 "wrap=%d/%d a0=0x%08X/s%u a3=0x%08X/s%u a8=0x%08X/s%u "

@@ -659,15 +659,29 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
 
-    /* NV4097_SET_TRANSFORM_CONSTANT[0..63] — up to 64 dwords (16 vec4s) per
-     * command. Each register slot writes to a lane of one vertex constant
+    /* NV4097_SET_TRANSFORM_CONSTANT[0..31] -- exactly 32 dwords (8 vec4s)
+     * in the NV4097 method window. Methods at 0x1FC0 and above are other
+     * raster/attribute registers and must never alias the constant bank.
+     * Each register slot writes to a lane of one vertex constant
      * vec4: vec_index = LOAD + (reg_offset/4), lane = reg_offset%4.
      * The data arrives as a host-endian u32; reinterpret the bits as float
      * because the game's intent is "these 32 bits are a float". The hardware
      * does NOT auto-advance LOAD between commands — games re-issue
      * SET_TRANSFORM_CONSTANT_LOAD before each block. */
+    /* These three registers sit immediately after the real 32-dword
+     * transform-constant window. Older ps3recomp code accidentally treated
+     * them as constants. RPCS3 keeps them as ordinary method registers; the
+     * current D3D12 programmable path does not otherwise consume them. */
+    if (method == 0x00001FC4u || method == 0x00001FC8u || method == 0x00001FCCu) {
+        static unsigned _am67_n = 0;
+        if (_am67_n++ < 96u)
+            fprintf(stderr, "[ATTRMAP67] method=0x%04X data=0x%08X load=%u%c",
+                    method, data, state->transform_constant_load, 10);
+        return 0;
+    }
+
     if (method >= NV4097_SET_TRANSFORM_CONSTANT &&
-        method <  NV4097_SET_TRANSFORM_CONSTANT + 64 * 4) {
+        method <  NV4097_SET_TRANSFORM_CONSTANT + 32 * 4) {
         u32 reg_offset = (method - NV4097_SET_TRANSFORM_CONSTANT) / 4;
         u32 slot = state->transform_constant_load + (reg_offset >> 2);
         u32 lane = reg_offset & 3;
