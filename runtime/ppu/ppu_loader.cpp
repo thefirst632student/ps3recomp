@@ -835,6 +835,40 @@ static volatile uint32_t  s_guard_ea   = 0;   /* guest ea being watched */
 extern "C" void ppu_guest_callstack(const char* tag);
 
 static uint32_t s_guard_pre = 0;
+
+/* WA2 v73: targeted page-guard trace for render-object slot 1. Earlier
+ * write hooks proved the object is zero-initialized through vm_write32, yet
+ * later contains the snow UV rectangle without any scalar/VMX/SPU-DMA hit.
+ * A page guard sees the remaining class of writers too: native memcpy/memmove,
+ * HLE bulk copies and any direct host store into guest memory. */
+#define WA2_SNOW_OBJ73      0x01087280u
+#define WA2_SNOW_UV73_EA    (WA2_SNOW_OBJ73 + 0xE8u)
+static const uint16_t s_wa2_uv73_offs[8] = { 0xE8, 0xEC, 0xF0, 0xF4, 0xF8, 0xFC, 0x100, 0x104 };
+static const uint32_t s_wa2_uv73_want[8] = {
+    0x00000000u, 0x42000000u, 0x00000000u, 0x42000000u,
+    0x42000000u, 0x42000000u, 0x43000000u, 0x43000000u
+};
+static PPU_THREAD_LOCAL uint32_t s_wa2_uv73_pre[8];
+static PPU_THREAD_LOCAL uint32_t s_wa2_uv73_fault_guest;
+static PPU_THREAD_LOCAL uint32_t s_wa2_uv73_fault_gfn;
+static PPU_THREAD_LOCAL uint64_t s_wa2_uv73_fault_rip;
+static PPU_THREAD_LOCAL int s_wa2_uv73_have_pre;
+static int s_wa2_uv73_change_n = 0;
+
+static inline void wa2_snow_uv73_read(uint32_t out[8])
+{
+    for (int i = 0; i < 8; ++i) {
+        uint32_t raw;
+        memcpy(&raw, vm_base + WA2_SNOW_OBJ73 + s_wa2_uv73_offs[i], 4);
+        out[i] = __builtin_bswap32(raw);
+    }
+}
+
+static inline int wa2_snow_uv73_match(const uint32_t v[8])
+{
+    for (int i = 0; i < 8; ++i) if (v[i] != s_wa2_uv73_want[i]) return 0;
+    return 1;
+}
 static LONG WINAPI ppu_guard_veh(EXCEPTION_POINTERS* ep)
 {
     /* Re-entrancy guard. The handler logs with fprintf, and if the guarded page
@@ -854,86 +888,124 @@ static LONG WINAPI ppu_guard_veh(EXCEPTION_POINTERS* ep)
         if (tgt >= s_guard_page && tgt < s_guard_page + 0x1000) {
             uint32_t guest = (uint32_t)(tgt - (uintptr_t)vm_base);
             char* mbase = (char*)GetModuleHandleA(NULL);
-            { extern uint32_t ppu_prof_resolve_host(void*);
-              uint32_t gfn = ppu_prof_resolve_host((void*)ep->ContextRecord->Rip);
-              fprintf(stderr, "[GUARD] WRITE guest=0x%08X from RIP rva=0x%llX guest-fn=0x%08X%s\n",
-                      guest, (unsigned long long)((char*)ep->ContextRecord->Rip - mbase), gfn,
-                      (guest == s_guard_ea) ? "  <<< watched addr!" : ""); }
-            /* On the watched word specifically, dump the guest call stack: with a
-             * memset-style clear the writer is always the same memcpy body, and
-             * the only useful question is WHO called it. */
-            /* Same 32-byte line, not the exact word: a dcbz-style block clear
-             * reports the LINE BASE as the faulting address, so an exact match
-             * misses precisely the writer we are hunting. */
-            if ((guest & ~31u) == (s_guard_ea & ~31u)) {
-                static int _cs = 0;
-                if (_cs++ < 6) {
-                    /* The writer's own arguments, live. The guard fires INSIDE
-                     * the writing routine, so for a memset/memcpy/arena-init
-                     * these are (dst, value/src, length) in r3/r4/r5 -- i.e. the
-                     * RANGE being written, which is usually the whole question.
-                     * This used to print only on a non-zero -> zero transition
-                     * of the watched word; a fill with any other value (-1 is
-                     * the common one) left the range invisible. */
-                    if (g_active_ctx)
-                        fprintf(stderr, "[GUARD]   live ctx r3=0x%08X r4=0x%08X r5=0x%08X"
-                                        " r6=0x%08X r30=0x%08X r31=0x%08X lr=0x%08X\n",
-                                (uint32_t)g_active_ctx->gpr[3], (uint32_t)g_active_ctx->gpr[4],
-                                (uint32_t)g_active_ctx->gpr[5], (uint32_t)g_active_ctx->gpr[6],
-                                (uint32_t)g_active_ctx->gpr[30], (uint32_t)g_active_ctx->gpr[31],
-                                (uint32_t)g_active_ctx->lr);
-                    /* On the first hit, every GPR. A bulk fill keeps its
-                     * destination and remaining count in registers the ABI
-                     * argument slots say nothing about, and those two numbers
-                     * are what identify the range. */
-                    if (_cs == 1 && g_active_ctx) {
-                        for (int r = 0; r < 32; r += 8)
-                            fprintf(stderr, "[GUARD]   r%-2d: %08X %08X %08X %08X"
-                                            " %08X %08X %08X %08X\n", r,
-                                    (uint32_t)g_active_ctx->gpr[r + 0],
-                                    (uint32_t)g_active_ctx->gpr[r + 1],
-                                    (uint32_t)g_active_ctx->gpr[r + 2],
-                                    (uint32_t)g_active_ctx->gpr[r + 3],
-                                    (uint32_t)g_active_ctx->gpr[r + 4],
-                                    (uint32_t)g_active_ctx->gpr[r + 5],
-                                    (uint32_t)g_active_ctx->gpr[r + 6],
-                                    (uint32_t)g_active_ctx->gpr[r + 7]);
+            const int wa2_snow73 = (s_guard_ea == WA2_SNOW_UV73_EA);
+            if (wa2_snow73) {
+                extern uint32_t ppu_prof_resolve_host(void*);
+                wa2_snow_uv73_read(s_wa2_uv73_pre);
+                s_wa2_uv73_fault_guest = guest;
+                s_wa2_uv73_fault_gfn = ppu_prof_resolve_host((void*)ep->ContextRecord->Rip);
+                s_wa2_uv73_fault_rip = (uint64_t)((char*)ep->ContextRecord->Rip - mbase);
+                s_wa2_uv73_have_pre = 1;
+            } else {
+                { extern uint32_t ppu_prof_resolve_host(void*);
+                  uint32_t gfn = ppu_prof_resolve_host((void*)ep->ContextRecord->Rip);
+                  fprintf(stderr, "[GUARD] WRITE guest=0x%08X from RIP rva=0x%llX guest-fn=0x%08X%s\n",
+                          guest, (unsigned long long)((char*)ep->ContextRecord->Rip - mbase), gfn,
+                          (guest == s_guard_ea) ? "  <<< watched addr!" : ""); }
+                /* On the watched word specifically, dump the guest call stack: with a
+                 * memset-style clear the writer is always the same memcpy body, and
+                 * the only useful question is WHO called it. */
+                /* Same 32-byte line, not the exact word: a dcbz-style block clear
+                 * reports the LINE BASE as the faulting address, so an exact match
+                 * misses precisely the writer we are hunting. */
+                if ((guest & ~31u) == (s_guard_ea & ~31u)) {
+                    static int _cs = 0;
+                    if (_cs++ < 6) {
+                        if (g_active_ctx)
+                            fprintf(stderr, "[GUARD]   live ctx r3=0x%08X r4=0x%08X r5=0x%08X"
+                                            " r6=0x%08X r30=0x%08X r31=0x%08X lr=0x%08X\n",
+                                    (uint32_t)g_active_ctx->gpr[3], (uint32_t)g_active_ctx->gpr[4],
+                                    (uint32_t)g_active_ctx->gpr[5], (uint32_t)g_active_ctx->gpr[6],
+                                    (uint32_t)g_active_ctx->gpr[30], (uint32_t)g_active_ctx->gpr[31],
+                                    (uint32_t)g_active_ctx->lr);
+                        if (_cs == 1 && g_active_ctx) {
+                            for (int r = 0; r < 32; r += 8)
+                                fprintf(stderr, "[GUARD]   r%-2d: %08X %08X %08X %08X"
+                                                " %08X %08X %08X %08X\n", r,
+                                        (uint32_t)g_active_ctx->gpr[r + 0],
+                                        (uint32_t)g_active_ctx->gpr[r + 1],
+                                        (uint32_t)g_active_ctx->gpr[r + 2],
+                                        (uint32_t)g_active_ctx->gpr[r + 3],
+                                        (uint32_t)g_active_ctx->gpr[r + 4],
+                                        (uint32_t)g_active_ctx->gpr[r + 5],
+                                        (uint32_t)g_active_ctx->gpr[r + 6],
+                                        (uint32_t)g_active_ctx->gpr[r + 7]);
+                        }
+                        ppu_guest_callstack("guard-clear");
                     }
-                    ppu_guest_callstack("guard-clear");
                 }
+                fflush(stderr);
+                /* Remember the watched word before letting the write through, so the
+                 * single-step below can report a non-zero -> zero transition. */
+                s_guard_pre = __builtin_bswap32(*(volatile uint32_t*)(vm_base + s_guard_ea));
             }
-            fflush(stderr);
-            /* Remember the watched word before letting the write through, so the
-             * single-step below can report a non-zero -> zero transition and name
-             * exactly who cleared it. */
-            s_guard_pre = __builtin_bswap32(*(volatile uint32_t*)(vm_base + s_guard_ea));
             DWORD old; VirtualProtect((void*)s_guard_page, 0x1000, PAGE_READWRITE, &old);
             ep->ContextRecord->EFlags |= 0x100;   /* single-step to re-arm after the write */
             return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
     if (code == EXCEPTION_SINGLE_STEP && s_guard_page) {
-        { uint32_t nowv = __builtin_bswap32(*(volatile uint32_t*)(vm_base + s_guard_ea));
-          if (s_guard_pre && !nowv) {
-              static int _z = 0;
-              if (_z++ < 3) {
-                  fprintf(stderr, "[GUARD] CLEARED 0x%08X: 0x%08X -> 0\n",
-                          s_guard_ea, s_guard_pre);
-                  /* The guard fires INSIDE the clearing routine, so the live guest
-                   * context still holds its arguments: for a memset that is
-                   * (dst, value, length) in r3/r4/r5. That is the range being
-                   * zeroed, which is the whole question here. */
-                  if (g_active_ctx) {
-                      fprintf(stderr, "[GUARD]   live ctx r3=0x%08X r4=0x%08X r5=0x%08X"
-                                      " r6=0x%08X r30=0x%08X r31=0x%08X\n",
-                              (uint32_t)g_active_ctx->gpr[3], (uint32_t)g_active_ctx->gpr[4],
-                              (uint32_t)g_active_ctx->gpr[5], (uint32_t)g_active_ctx->gpr[6],
-                              (uint32_t)g_active_ctx->gpr[30], (uint32_t)g_active_ctx->gpr[31]);
+        if (s_guard_ea == WA2_SNOW_UV73_EA && s_wa2_uv73_have_pre) {
+            uint32_t post[8];
+            wa2_snow_uv73_read(post);
+            int changed = 0;
+            for (int i = 0; i < 8; ++i) if (post[i] != s_wa2_uv73_pre[i]) { changed = 1; break; }
+            if (changed && s_wa2_uv73_change_n < 64) {
+                const int n = s_wa2_uv73_change_n++;
+                fprintf(stderr,
+                        "[SNOWOBJ73-GUARD] n=%d fault=0x%08X rip-rva=0x%llX guest-fn=0x%08X "
+                        "pre=%08X/%08X/%08X/%08X/%08X/%08X/%08X/%08X "
+                        "post=%08X/%08X/%08X/%08X/%08X/%08X/%08X/%08X\n",
+                        n, s_wa2_uv73_fault_guest, (unsigned long long)s_wa2_uv73_fault_rip,
+                        s_wa2_uv73_fault_gfn,
+                        s_wa2_uv73_pre[0], s_wa2_uv73_pre[1], s_wa2_uv73_pre[2], s_wa2_uv73_pre[3],
+                        s_wa2_uv73_pre[4], s_wa2_uv73_pre[5], s_wa2_uv73_pre[6], s_wa2_uv73_pre[7],
+                        post[0], post[1], post[2], post[3], post[4], post[5], post[6], post[7]);
+                if (g_active_ctx) {
+                    fprintf(stderr,
+                            "[SNOWOBJ73-GUARD]   ctx r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X "
+                            "r30=0x%08X r31=0x%08X lr=0x%08X\n",
+                            (uint32_t)g_active_ctx->gpr[3], (uint32_t)g_active_ctx->gpr[4],
+                            (uint32_t)g_active_ctx->gpr[5], (uint32_t)g_active_ctx->gpr[6],
+                            (uint32_t)g_active_ctx->gpr[30], (uint32_t)g_active_ctx->gpr[31],
+                            (uint32_t)g_active_ctx->lr);
+                    if (n < 6) ppu_guest_callstack("snowobj73");
+                }
+                fflush(stderr);
+            }
+            s_wa2_uv73_have_pre = 0;
+            if (wa2_snow_uv73_match(post)) {
+                fprintf(stderr,
+                        "[SNOWOBJ73-COMPLETE] fault=0x%08X rip-rva=0x%llX guest-fn=0x%08X "
+                        "uv=0,32/32,32/0,128/32,128 -- page guard disarmed\n",
+                        s_wa2_uv73_fault_guest, (unsigned long long)s_wa2_uv73_fault_rip,
+                        s_wa2_uv73_fault_gfn);
+                fflush(stderr);
+                DWORD old;
+                VirtualProtect((void*)s_guard_page, 0x1000, PAGE_READWRITE, &old);
+                s_guard_page = 0;
+                ep->ContextRecord->EFlags &= ~0x100u;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        } else {
+            { uint32_t nowv = __builtin_bswap32(*(volatile uint32_t*)(vm_base + s_guard_ea));
+              if (s_guard_pre && !nowv) {
+                  static int _z = 0;
+                  if (_z++ < 3) {
+                      fprintf(stderr, "[GUARD] CLEARED 0x%08X: 0x%08X -> 0\n",
+                              s_guard_ea, s_guard_pre);
+                      if (g_active_ctx) {
+                          fprintf(stderr, "[GUARD]   live ctx r3=0x%08X r4=0x%08X r5=0x%08X"
+                                          " r6=0x%08X r30=0x%08X r31=0x%08X\n",
+                                  (uint32_t)g_active_ctx->gpr[3], (uint32_t)g_active_ctx->gpr[4],
+                                  (uint32_t)g_active_ctx->gpr[5], (uint32_t)g_active_ctx->gpr[6],
+                                  (uint32_t)g_active_ctx->gpr[30], (uint32_t)g_active_ctx->gpr[31]);
+                      }
+                      fflush(stderr);
+                      ppu_guest_callstack("guard-zeroed");
                   }
-                  fflush(stderr);
-                  ppu_guest_callstack("guard-zeroed");
-              }
-          } }
+              } }
+        }
         DWORD old; VirtualProtect((void*)s_guard_page, 0x1000, PAGE_READONLY, &old);
         ep->ContextRecord->EFlags &= ~0x100u;
         return EXCEPTION_CONTINUE_EXECUTION;
@@ -1425,6 +1497,22 @@ static inline void wa2_uv_probe_hit(uint32_t a, uint32_t v, int width, void* ra)
 #endif
 }
 
+static int s_wa2_guard73_pending = 0;
+static int s_wa2_guard73_armed = 0;
+
+static inline void wa2_snow_guard73_arm_after_store(void)
+{
+#ifndef NDEBUG
+    if (s_wa2_guard73_pending && !s_wa2_guard73_armed) {
+        s_wa2_guard73_pending = 0;
+        s_wa2_guard73_armed = 1;
+        ppu_guard_page(0x01087368u);
+        fprintf(stderr, "[SNOWOBJ73-GUARD-ARM] object=0x01087280 uv=0x01087368..0x01087384\n");
+        fflush(stderr);
+    }
+#endif
+}
+
 static inline void wa2_snow_object_uv_hit(uint32_t a, uint32_t v, int width, void* ra)
 {
 #ifndef NDEBUG
@@ -1452,6 +1540,15 @@ static inline void wa2_snow_object_uv_hit(uint32_t a, uint32_t v, int width, voi
     vals[slot] = v;
     writers[slot] = ppu_prof_resolve_host(ra);
     seen = (uint8_t)(seen | (uint8_t)(1u << slot));
+
+    /* Arm the page guard only after the initial eight zero stores have fully
+     * committed. vm_write32 calls wa2_snow_guard73_arm_after_store() at its
+     * tail, avoiding a fault on the zeroing store that triggered the arm. */
+    if (!s_wa2_guard73_armed && !s_wa2_guard73_pending && seen == 0xFFu) {
+        int all_zero = 1;
+        for (int i = 0; i < 8; ++i) if (vals[i] != 0) { all_zero = 0; break; }
+        if (all_zero) s_wa2_guard73_pending = 1;
+    }
 
     if (trace_n < 48) {
         float f; memcpy(&f, &v, 4);
@@ -1628,7 +1725,8 @@ void vm_write32(uint64_t a, uint32_t v) { barrier_watch_hit((uint32_t)a, v, 4, _
       /* Raw SPU problem state: run control, mailboxes and signal notification
        * have side effects. The plain store above still happens -- the registers
        * are guest memory and the PPU reads most of them straight back. */
-      if (spu_raw_is_reg((uint32_t)a)) spu_raw_reg_store((uint32_t)a, _v, 4); } }
+      if (spu_raw_is_reg((uint32_t)a)) spu_raw_reg_store((uint32_t)a, _v, 4);
+      wa2_snow_guard73_arm_after_store(); } }
 void vm_write64(uint64_t a, uint64_t v) {
     /* PPU_WWATCH covers the 64-bit store too. It did not, which made the watch
      * blind to exactly the code that matters most for it: every bignum and
