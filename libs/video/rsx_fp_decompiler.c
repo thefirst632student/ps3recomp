@@ -336,8 +336,12 @@ static const char* input_expr(u32 input_src)
         "input.tc4", "input.tc5", "input.tc6", "input.tc7" };
     switch (input_src) {
     case 0x0: return "input.position"; /* WPOS */
-    case 0x1: return "input.col0";     /* COL0 */
-    case 0x2: return "input.col1";     /* COL1 */
+    /* NV_fragment_program2 / RSX semantics: fragment input COLOR0/COLOR1
+     * are clamped to [0,1] when read. RPCS3 applies the same clamp at source
+     * load time. Leaving these interpolants unclamped makes additive/crossfade
+     * programs amplify interpolation overshoot across long transitions. */
+    case 0x1: return "saturate(input.col0)"; /* COL0 */
+    case 0x2: return "saturate(input.col1)"; /* COL1 */
     case 0x3: return "input.fog";      /* FOGC */
     default:
         if (input_src >= 0x4 && input_src <= 0xB) return tc[input_src - 0x4]; /* TC0..7 */

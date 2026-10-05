@@ -2952,6 +2952,36 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
         }
     }
 
+    /* v61: the RSX clamps fragment COLOR0/COLOR1 inputs on read.  The shared
+     * FP decompiler now mirrors that hardware rule.  Dump this title's generic
+     * crossfade/sprite FP once without requiring WA2_WARN_DIAG so the test log
+     * proves both that v61 is active and what final HLSL the live program uses. */
+    if ((fp_addr & ~1u) == 0x01E08480u) {
+        static int sprite61_fp_dumped = 0;
+        if (!sprite61_fp_dumped) {
+            sprite61_fp_dumped = 1;
+            fprintf(stderr, "[FP-COLOR-SAT] fp=0x%08X instrs=%d ctrl=0x%08X COL0/COL1=saturate%c",
+                    fp_addr, n, fp_ctrl, 10);
+            const char* _ln = hlsl;
+            while (*_ln) {
+                const char* _e = strchr(_ln, '\n');
+                size_t _len = _e ? (size_t)(_e - _ln) : strlen(_ln);
+                if (_len) {
+                    char _tmp[1200];
+                    size_t _n = _len < sizeof(_tmp)-1 ? _len : sizeof(_tmp)-1;
+                    memcpy(_tmp, _ln, _n); _tmp[_n] = 0;
+                    if (strstr(_tmp, "saturate(input.col0)") ||
+                        strstr(_tmp, "saturate(input.col1)") ||
+                        strstr(_tmp, "rsx_tex") || strstr(_tmp, "_po.c0") ||
+                        strstr(_tmp, "discard") || strstr(_tmp, "return"))
+                        fprintf(stderr, "[FP-COLOR-SAT] %s%c", _tmp, 10);
+                }
+                if (!_e) break;
+                _ln = _e + 1;
+            }
+        }
+    }
+
     /* v58: dump the translated generic WA2 sprite FP once.  Keep only lines
      * that show texture sample, COLOR0 use, alpha/discard and final export. */
     if (wa2_diag_on() && ((fp_addr & ~1u) == 0x01E08480u)) {
