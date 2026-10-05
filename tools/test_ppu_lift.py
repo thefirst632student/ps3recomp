@@ -907,6 +907,11 @@ extern "C" uint32_t vm_read32(uint64_t a) { uint32_t v; memcpy(&v, g_vm_stub + V
 extern "C" void vm_write32(uint64_t a, uint32_t v) { v = CONF_BSWAP32(v); memcpy(g_vm_stub + VMOFF(a), &v, 4); }
 extern "C" uint64_t vm_read64(uint64_t a) { uint64_t v; memcpy(&v, g_vm_stub + VMOFF(a), 8); return CONF_BSWAP64(v); }
 extern "C" void vm_write64(uint64_t a, uint64_t v) { v = CONF_BSWAP64(v); memcpy(g_vm_stub + VMOFF(a), &v, 8); }
+/* Raw byte store used by VMX stvx/stvxl/stve* lowering.  Unlike the scalar
+ * helpers above it performs no endian conversion; vector register bytes are
+ * already in guest memory order.  Keep this stub byte-for-byte equivalent to
+ * the runtime helper so conformance executes the same lifted statements. */
+extern "C" void vm_write_raw(uint64_t a, const void* src, uint32_t n) { memcpy(g_vm_stub + VMOFF(a), src, n); }
 """)
     out.append("int main(void) {")
     out.append("    ppu_context* ctx = &g_ctx;")
