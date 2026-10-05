@@ -5001,7 +5001,14 @@ static void display_blit_seed_framebuffer(u32 fi)
     static int persist = -1;
     if (persist < 0) {
         const char* e = getenv("RSX_DISPLAY_PERSIST");
-        persist = (e && *e == '0') ? 0 : 1;
+        /* v57 made previous-display seeding unconditional by default, but
+         * v57..v59 did not change the effect-linked flicker.  Make the
+         * history seed opt-in so we can A/B the remaining temporal path
+         * without touching ordered NV3089 live copies or screen snapshots.
+         * RSX_DISPLAY_PERSIST=1 restores the exact v59 seed behavior. */
+        persist = (e && *e != '0') ? 1 : 0;
+        fprintf(stderr, "[DISPLAY-SEED-MODE] %s%s%c",
+                persist ? "ON" : "OFF", e ? " (env)" : " (default)", 10);
     }
     if (!persist || !s_screen_copy || !s_d3d.cmd_list || fi >= FRAME_COUNT ||
         !s_d3d.render_targets[fi])
