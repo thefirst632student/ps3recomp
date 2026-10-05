@@ -8470,6 +8470,7 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
         const rsx_state* _st = s_d3d.current_rsx_state;
         const rsx_vertex_attrib* _a0 = &_st->vertex_attribs[0];
         const rsx_vertex_attrib* _a3 = &_st->vertex_attribs[3];
+        const rsx_vertex_attrib* _a4 = &_st->vertex_attribs[4];
         const rsx_vertex_attrib* _a8 = &_st->vertex_attribs[8];
         const u32 _o0 = _a0->offset & 0x7FFFFFFFu;
         const u32 _o3 = _a3->offset & 0x7FFFFFFFu;
@@ -8496,9 +8497,10 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             u32 _al0 = _o0 + _vlast * _a0->stride;
             u32 _ea0 = _a0->enabled ? cellGcmResolveLocated((_a0->offset & 0x80000000u) ? 0 : 1, _ao0) : 0;
             u32 _eal = _a0->enabled ? cellGcmResolveLocated((_a0->offset & 0x80000000u) ? 0 : 1, _al0) : 0;
-            float _p[4]={0}, _c[4]={0}, _t[4]={0};
+            float _p[4]={0}, _c[4]={0}, _b[4]={0}, _t[4]={0};
             rsx_fetch_attrib(_st, 0, first, _p);
             rsx_fetch_attrib(_st, 3, first, _c);
+            rsx_fetch_attrib(_st, 4, first, _b);
             rsx_fetch_attrib(_st, 8, first, _t);
             fprintf(stderr,
                 "[SPRITE62_RING] n=%llu frame=%u tex0=0x%08X prim=%u first=%u count=%u "
@@ -8514,6 +8516,34 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 _c[0],_c[1],_c[2],_c[3], _t[0],_t[1],_t[2],_t[3],
                 (_st->blend_sfactor & 0xFFFFu) | ((_st->blend_dfactor & 0xFFFFu) << 16),
                 _st->alpha_test_enable, _st->alpha_func, _st->alpha_ref, 10);
+            /* v65: this VP copies ATTR4 directly to COLOR1, and FP 0x01E08481
+             * computes tex*COLOR0 + COLOR1.  ATTR4 is normally a current/register
+             * attribute (array disabled), so trace both the register and fetched
+             * value.  Emit on changes/wraps plus sparse samples after startup. */
+            {
+                static u32 _a4_lines = 0;
+                static float _last4[4];
+                static int _last4_have = 0;
+                int _a4_changed = !_last4_have ||
+                    memcmp(_last4, _st->vertex_data4f[4], sizeof(_last4)) != 0;
+                int _a4_emit = _a4_lines < 32u || _a4_changed ||
+                    _first_wrap || _base_wrap || ((_sn % 5000u) == 0u);
+                if (_a4_emit && _a4_lines < 160u) {
+                    fprintf(stderr,
+                        "[SPRITE65_ATTR4] n=%llu frame=%u tex0=0x%08X enabled=%d "
+                        "off=0x%08X stride=%u size=%u type=%u "
+                        "reg=(%.6g %.6g %.6g %.6g) fetch=(%.6g %.6g %.6g %.6g) changed=%d%c",
+                        (unsigned long long)_sn, (unsigned)s_d3d.frame_count,
+                        s_d3d.cur_texs[0].raw, _a4->enabled, _a4->offset,
+                        _a4->stride, _a4->size, _a4->type,
+                        _st->vertex_data4f[4][0], _st->vertex_data4f[4][1],
+                        _st->vertex_data4f[4][2], _st->vertex_data4f[4][3],
+                        _b[0], _b[1], _b[2], _b[3], _a4_changed, 10);
+                    _a4_lines++;
+                }
+                memcpy(_last4, _st->vertex_data4f[4], sizeof(_last4));
+                _last4_have = 1;
+            }
             if (_is_fade) _fade_lines++;
             if (_is_snow) _snow_lines++;
             if (_first_wrap || _base_wrap) _wrap_lines++;
