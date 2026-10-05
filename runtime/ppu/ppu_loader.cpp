@@ -1425,9 +1425,72 @@ static inline void wa2_uv_probe_hit(uint32_t a, uint32_t v, int width, void* ra)
 #endif
 }
 
+static inline void wa2_snow_object_uv_hit(uint32_t a, uint32_t v, int width, void* ra)
+{
+#ifndef NDEBUG
+    if (width != 4) return;
+    /* v70 proved the snow draw object is slot 1 of the 264-byte render-object
+     * table: 0x01087178 + 1 * 264 = 0x01087280. 0x4C528 loads its four UV
+     * pairs directly from +E8..+104 before copying them to the vertex ring. */
+    const uint32_t obj = 0x01087280u;
+    static const uint16_t offs[8] = { 0xE8, 0xEC, 0xF0, 0xF4, 0xF8, 0xFC, 0x100, 0x104 };
+    static const uint32_t want[8] = {
+        0x00000000u, 0x42000000u, 0x00000000u, 0x42000000u,
+        0x42000000u, 0x42000000u, 0x43000000u, 0x43000000u
+    };
+    int slot = -1;
+    for (int i = 0; i < 8; ++i) {
+        if (a == obj + offs[i]) { slot = i; break; }
+    }
+    if (slot < 0) return;
+
+    static uint32_t vals[8] = {};
+    static uint32_t writers[8] = {};
+    static uint8_t seen = 0;
+    static int trace_n = 0;
+    static int complete_logged = 0;
+    vals[slot] = v;
+    writers[slot] = ppu_prof_resolve_host(ra);
+    seen = (uint8_t)(seen | (uint8_t)(1u << slot));
+
+    if (trace_n < 48) {
+        float f; memcpy(&f, &v, 4);
+        extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+        const uint32_t lr = g_active_ctx ? (uint32_t)g_active_ctx->lr : 0;
+        const uint32_t r3 = g_active_ctx ? (uint32_t)g_active_ctx->gpr[3] : 0;
+        const uint32_t r31 = g_active_ctx ? (uint32_t)g_active_ctx->gpr[31] : 0;
+        fprintf(stderr,
+                "[SNOWOBJ71] n=%d off=0x%03X raw=0x%08X f=%.9g guest-fn=0x%08X lr=0x%08X r3=0x%08X r31=0x%08X\n",
+                trace_n++, (unsigned)offs[slot], v, f, writers[slot], lr, r3, r31);
+    }
+
+    if (!complete_logged && seen == 0xFFu) {
+        int match = 1;
+        for (int i = 0; i < 8; ++i) if (vals[i] != want[i]) { match = 0; break; }
+        if (match) {
+            complete_logged = 1;
+            fprintf(stderr,
+                    "[SNOWOBJ71-COMPLETE] obj=0x%08X uv=(%.9g %.9g)(%.9g %.9g)(%.9g %.9g)(%.9g %.9g) "
+                    "writers=%08X/%08X/%08X/%08X/%08X/%08X/%08X/%08X\n",
+                    obj,
+                    0.0, 32.0, 32.0, 32.0, 0.0, 128.0, 32.0, 128.0,
+                    writers[0], writers[4], writers[1], writers[5],
+                    writers[2], writers[6], writers[3], writers[7]);
+            extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+            extern void ppu_dump_guest_stack(ppu_context*, const char*);
+            if (g_active_ctx) ppu_dump_guest_stack(g_active_ctx, "snowobj71");
+            fflush(stderr);
+        }
+    }
+#else
+    (void)a; (void)v; (void)width; (void)ra;
+#endif
+}
+
 static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra)
 {
     wa2_uv_probe_hit(a, v, width, ra);
+    wa2_snow_object_uv_hit(a, v, width, ra);
 #ifdef NDEBUG
     (void)a; (void)v; (void)width; (void)ra;
 #else
