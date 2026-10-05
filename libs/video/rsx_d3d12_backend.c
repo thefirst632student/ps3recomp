@@ -8540,6 +8540,24 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                     }
                     const float* _s = _st->vertex_constants[467];
                     {
+                        static int _uvwatch_armed = 0;
+                        if (!_uvwatch_armed) {
+                            extern void ps3_wa2_arm_uv_probe(void);
+                            ps3_wa2_arm_uv_probe();
+                            _uvwatch_armed = 1;
+                        }
+                        {
+                            const rsx_vertex_attrib* _a0 = &_st->vertex_attribs[0];
+                            const rsx_vertex_attrib* _a8 = &_st->vertex_attribs[8];
+                            static int _vtx70 = 0;
+                            if (_vtx70++ < 96)
+                                fprintf(stderr,
+                                    "[SNOWVTX70] frame=%u first=%u a0fmt=0x%08X freq=%u stride=%u "
+                                    "a8fmt=0x%08X freq=%u stride=%u divop=0x%08X baseoff=0x%08X baseidx=0x%08X%c",
+                                    (unsigned)s_d3d.frame_count, first, _a0->format, _a0->frequency, _a0->stride,
+                                    _a8->format, _a8->frequency, _a8->stride, _st->frequency_divider_op,
+                                    _st->vertex_data_base_offset, _st->vertex_data_base_index, 10);
+                        }
                         const rsx_texture_state* _tx = &_st->textures[0];
                         u8 _rm[4] = {0};
                         rsx_texture_component_remap(_tx->control1, s_d3d.cur_texs[0].fmt, _rm);

@@ -1388,8 +1388,46 @@ static void ww_arm_inline_window(uint32_t ww)
     g_ww_hi = (ww & ~15u) + len;
 #endif
 }
+extern "C" volatile uint32_t g_wa2_uv_probe_armed = 0;
+extern "C" void ps3_wa2_arm_uv_probe(void)
+{
+#ifndef NDEBUG
+    if (!g_wa2_uv_probe_armed) {
+        g_wa2_uv_probe_armed = 1;
+        fprintf(stderr, "[SNOWUV-WATCH70] armed ring=0x40800000..0x40900000 stride=24 uvlanes=16/20\n");
+        fflush(stderr);
+    }
+#endif
+}
+
+static inline void wa2_uv_probe_hit(uint32_t a, uint32_t v, int width, void* ra)
+{
+#ifndef NDEBUG
+    if (!g_wa2_uv_probe_armed || width != 4) return;
+    if (a < 0x40800000u || a >= 0x40900000u) return;
+    const uint32_t lane = (a - 0x40800000u) % 24u;
+    if (lane != 16u && lane != 20u) return;
+    static int n = 0;
+    if (n >= 96) return;
+    float f; memcpy(&f, &v, 4);
+    const uint32_t fn = ppu_prof_resolve_host(ra);
+    fprintf(stderr, "[SNOWUV-WRITER70] n=%d addr=0x%08X lane=%u raw=0x%08X f=%.9g guest-fn=0x%08X\n",
+            n, a, lane, v, f, fn);
+    if (n < 3) {
+        extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+        extern void ppu_dump_guest_stack(ppu_context*, const char*);
+        if (g_active_ctx) ppu_dump_guest_stack(g_active_ctx, "snowuv70");
+    }
+    ++n;
+    fflush(stderr);
+#else
+    (void)a; (void)v; (void)width; (void)ra;
+#endif
+}
+
 static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra)
 {
+    wa2_uv_probe_hit(a, v, width, ra);
 #ifdef NDEBUG
     (void)a; (void)v; (void)width; (void)ra;
 #else

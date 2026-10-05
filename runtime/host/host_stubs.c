@@ -122,5 +122,6 @@ uint32_t g_spu_image_src_ea = 0;
 uint32_t g_spu_image_ls_start = 0;
 uint32_t g_spu_image_span = 0;
 void ppu_dump_bctrl_ring(uint32_t a, const char* tag) { (void)a; (void)tag; }
+void ps3_wa2_arm_uv_probe(void) {}
 uint32_t ps3_spu_image_source_ea(uint32_t img_ea) { return img_ea; }
 
