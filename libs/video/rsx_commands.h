@@ -126,6 +126,9 @@ extern "C" {
  * Its low 20 bits are the row pitch of a linear texture and the rest is the
  * depth of a 3D one. */
 #define NV4097_SET_TEXTURE_CONTROL3             0x00001840
+/* Fragment input texcoord dimensionality override: 10 registers, one per
+ * TEX0..TEX9. Bit 0 marks the input as a 2D coordinate on NV4097. */
+#define NV4097_SET_TEX_COORD_CONTROL            0x00000B40
 
 /* Vertex textures: four units of eight words at 0x0900 + unit*0x20. The block
  * is laid out like a fragment unit's with one substitution -- CONTROL3 sits
@@ -300,6 +303,11 @@ typedef struct rsx_state {
      * reads as the identity crossbar -- lets a backend resolve, upload and
      * cache both kinds through one path. */
     rsx_texture_state vertex_textures[RSX_MAX_VERTEX_TEXTURES];
+    /* NV4097_SET_TEX_COORD_CONTROL[0..9]. RPCS3 treats bit 0 as the
+     * per-fragment-program 2D texcoord override mask. Keep the raw words
+     * even before the HLSL path consumes them so titles cannot silently
+     * lose this piece of sampler/shader state. */
+    u32 tex_coord_control[10];
 
     /* Vertex attributes */
     rsx_vertex_attrib vertex_attribs[RSX_MAX_VERTEX_ATTRIBS];

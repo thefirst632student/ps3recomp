@@ -381,6 +381,18 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     if (method >= 0x1A00 && method < 0x1A00 + RSX_MAX_TEXTURES * 0x20)
         return process_texture_method(state, method, data);
 
+    /* NV4097_SET_TEX_COORD_CONTROL[0..9] (0x0B40..0x0B64). Bit 0 is
+     * the fragment-input 2D override used by RPCS3's texcoord_control_mask.
+     * The D3D12 shader path does not consume it yet, but tracking it here
+     * prevents the register from disappearing as an unknown method and lets
+     * diagnostics correlate it with the exact draw that uses it. */
+    if (method >= NV4097_SET_TEX_COORD_CONTROL &&
+        method < NV4097_SET_TEX_COORD_CONTROL + 10u * 4u) {
+        const u32 unit = (method - NV4097_SET_TEX_COORD_CONTROL) / 4u;
+        state->tex_coord_control[unit] = data;
+        return 0;
+    }
+
     /* Texture CONTROL3: 0x1840..0x187C */
     if (method >= NV4097_SET_TEXTURE_CONTROL3 &&
         method < NV4097_SET_TEXTURE_CONTROL3 + RSX_MAX_TEXTURES * 4)
