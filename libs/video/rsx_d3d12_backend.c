@@ -7883,16 +7883,28 @@ void rsx_vtx_pos_dbg(const rsx_state* state, const float* v, u32 n);
 /* Fill all 16 attribute slots for one vertex. The per-attribute work lives in
  * rsx_vertex_fetch.c so the Metal and null backends read guest vertices the
  * same way this one does, rather than each porting the logic again. */
-static void read_vp_vertex(const rsx_state* state, u32 vi, VPSlot* out16)
+static void read_vp_vertex_impl(const rsx_state* state, u32 vi,
+                                int indexed, VPSlot* out16)
 {
     for (int i = 0; i < 16; i++) {
-        rsx_fetch_attrib(state, i, vi, out16[i].v);
+        if (indexed) rsx_fetch_attrib_indexed(state, i, vi, out16[i].v);
+        else         rsx_fetch_attrib(state, i, vi, out16[i].v);
         if (i == 0) {
             const rsx_vertex_attrib* a = &state->vertex_attribs[0];
             u32 n = a->size ? a->size : 4; if (n > 4) n = 4;
             rsx_vtx_pos_dbg(state, out16[0].v, n);
         }
     }
+}
+
+static void read_vp_vertex(const rsx_state* state, u32 vi, VPSlot* out16)
+{
+    read_vp_vertex_impl(state, vi, 0, out16);
+}
+
+static void read_vp_vertex_indexed(const rsx_state* state, u32 vi, VPSlot* out16)
+{
+    read_vp_vertex_impl(state, vi, 1, out16);
 }
 
 /* VTX_POS=<N>: print the first fetched position of the first N draws. A guest
@@ -8175,7 +8187,7 @@ static u32 upload_quads_vp_indexed(const rsx_state* state, u32 first, u32 count)
     for (u32 q = 0; q < quads; q++) {
         VPSlot c[4][16];
         for (u32 k = 0; k < 4; k++)
-            read_vp_vertex(state, read_guest_index(state, first + q*4 + k), c[k]);
+            read_vp_vertex_indexed(state, read_guest_index(state, first + q*4 + k), c[k]);
         static const int idx[6] = {0,1,2, 0,2,3};
         for (int t = 0; t < 6; t++) { memcpy(&out[o*16], c[idx[t]], sizeof(c[0])); o++; }
         if (getenv("VTX_DUMP")) { static int _n=0; if (_n++ < 6) {
@@ -8218,7 +8230,7 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
         + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
     { double _tv = perf_on() ? perf_now() : 0.0;
       for (u32 k = 0; k < count; k++)
-          read_vp_vertex(state, read_guest_index(state, first + k), &out[k*16]);
+          read_vp_vertex_indexed(state, read_guest_index(state, first + k), &out[k*16]);
       if (perf_on()) { s_perf_vtx += perf_now() - _tv; s_perf_nverts += count; } }
     /* IDXDBG=<hex shader_program>: index range for that program's draws. An
      * index past the vertex array reads unmapped guest memory as zero, which
@@ -8432,9 +8444,9 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
     u32 o = 0;
     for (u32 t = 0; t < tris; t++) {
         u32 i0 = fan ? 0 : t;
-        read_vp_vertex(state, read_guest_index(state, first + i0),    &out[o*16]); o++;
-        read_vp_vertex(state, read_guest_index(state, first + t + 1), &out[o*16]); o++;
-        read_vp_vertex(state, read_guest_index(state, first + t + 2), &out[o*16]); o++;
+        read_vp_vertex_indexed(state, read_guest_index(state, first + i0),    &out[o*16]); o++;
+        read_vp_vertex_indexed(state, read_guest_index(state, first + t + 1), &out[o*16]); o++;
+        read_vp_vertex_indexed(state, read_guest_index(state, first + t + 2), &out[o*16]); o++;
     }
     s_d3d.vp_vb_offset += o * VP_VERT_STRIDE;
     return o;
@@ -8470,7 +8482,6 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
         const rsx_state* _st = s_d3d.current_rsx_state;
         const rsx_vertex_attrib* _a0 = &_st->vertex_attribs[0];
         const rsx_vertex_attrib* _a3 = &_st->vertex_attribs[3];
-        const rsx_vertex_attrib* _a4 = &_st->vertex_attribs[4];
         const rsx_vertex_attrib* _a8 = &_st->vertex_attribs[8];
         const u32 _o0 = _a0->offset & 0x7FFFFFFFu;
         const u32 _o3 = _a3->offset & 0x7FFFFFFFu;
@@ -8493,14 +8504,14 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
             extern uint8_t* vm_base;
             extern u32 cellGcmResolveLocated(int, u32);
             u32 _vlast = count ? first + count - 1u : first;
-            u32 _ao0 = _o0 + first * _a0->stride;
-            u32 _al0 = _o0 + _vlast * _a0->stride;
+            u32 _ab0 = (_st->vertex_data_base_offset + _o0) & 0x0FFFFFFFu;
+            u32 _ao0 = _ab0 + first * _a0->stride;
+            u32 _al0 = _ab0 + _vlast * _a0->stride;
             u32 _ea0 = _a0->enabled ? cellGcmResolveLocated((_a0->offset & 0x80000000u) ? 0 : 1, _ao0) : 0;
             u32 _eal = _a0->enabled ? cellGcmResolveLocated((_a0->offset & 0x80000000u) ? 0 : 1, _al0) : 0;
-            float _p[4]={0}, _c[4]={0}, _b[4]={0}, _t[4]={0};
+            float _p[4]={0}, _c[4]={0}, _t[4]={0};
             rsx_fetch_attrib(_st, 0, first, _p);
             rsx_fetch_attrib(_st, 3, first, _c);
-            rsx_fetch_attrib(_st, 4, first, _b);
             rsx_fetch_attrib(_st, 8, first, _t);
             fprintf(stderr,
                 "[SPRITE62_RING] n=%llu frame=%u tex0=0x%08X prim=%u first=%u count=%u "
@@ -8516,34 +8527,6 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                 _c[0],_c[1],_c[2],_c[3], _t[0],_t[1],_t[2],_t[3],
                 (_st->blend_sfactor & 0xFFFFu) | ((_st->blend_dfactor & 0xFFFFu) << 16),
                 _st->alpha_test_enable, _st->alpha_func, _st->alpha_ref, 10);
-            /* v65: this VP copies ATTR4 directly to COLOR1, and FP 0x01E08481
-             * computes tex*COLOR0 + COLOR1.  ATTR4 is normally a current/register
-             * attribute (array disabled), so trace both the register and fetched
-             * value.  Emit on changes/wraps plus sparse samples after startup. */
-            {
-                static u32 _a4_lines = 0;
-                static float _last4[4];
-                static int _last4_have = 0;
-                int _a4_changed = !_last4_have ||
-                    memcmp(_last4, _st->vertex_data4f[4], sizeof(_last4)) != 0;
-                int _a4_emit = _a4_lines < 32u || _a4_changed ||
-                    _first_wrap || _base_wrap || ((_sn % 5000u) == 0u);
-                if (_a4_emit && _a4_lines < 160u) {
-                    fprintf(stderr,
-                        "[SPRITE65_ATTR4] n=%llu frame=%u tex0=0x%08X enabled=%d "
-                        "off=0x%08X stride=%u size=%u type=%u "
-                        "reg=(%.6g %.6g %.6g %.6g) fetch=(%.6g %.6g %.6g %.6g) changed=%d%c",
-                        (unsigned long long)_sn, (unsigned)s_d3d.frame_count,
-                        s_d3d.cur_texs[0].raw, _a4->enabled, _a4->offset,
-                        _a4->stride, _a4->size, _a4->type,
-                        _st->vertex_data4f[4][0], _st->vertex_data4f[4][1],
-                        _st->vertex_data4f[4][2], _st->vertex_data4f[4][3],
-                        _b[0], _b[1], _b[2], _b[3], _a4_changed, 10);
-                    _a4_lines++;
-                }
-                memcpy(_last4, _st->vertex_data4f[4], sizeof(_last4));
-                _last4_have = 1;
-            }
             if (_is_fade) _fade_lines++;
             if (_is_snow) _snow_lines++;
             if (_first_wrap || _base_wrap) _wrap_lines++;

@@ -391,6 +391,24 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         method < NV4097_SET_VERTEX_TEXTURE_OFFSET + RSX_MAX_VERTEX_TEXTURES * 0x20)
         return process_vertex_texture_method(state, method, data);
 
+    /* Vertex-array global bases. These participate in address generation;
+     * the legacy rsx_state path previously ignored them even though the
+     * newer rsx_dispatch/live renderer already models both registers. */
+    if (method == NV4097_SET_VERTEX_DATA_BASE_OFFSET) {
+        state->vertex_data_base_offset = data;
+        state->vertex_dirty = 1;
+        { static u32 n = 0; if (n++ < 96u)
+            fprintf(stderr, "[VBASE66] offset=0x%08X%c", data, 10); }
+        return 0;
+    }
+    if (method == NV4097_SET_VERTEX_DATA_BASE_INDEX) {
+        state->vertex_data_base_index = data;
+        state->vertex_dirty = 1;
+        { static u32 n = 0; if (n++ < 96u)
+            fprintf(stderr, "[VBASE66] index=0x%08X%c", data, 10); }
+        return 0;
+    }
+
     /* Vertex attribute FORMAT: 0x1740..0x177C */
     if (method >= 0x1740 && method < 0x1740 + RSX_MAX_VERTEX_ATTRIBS * 4)
         return process_vertex_attrib_method(state, method, data);
@@ -612,117 +630,25 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         state->vertex_attrib_output_mask = data;
         return 0;
     }
-    /* v65: NV4097 constant/current vertex attributes.  RSX exposes several
-     * encodings of the same 16 current-attribute registers.  A disabled vertex
-     * array consumes these values, so ignoring any encoding can silently feed a
-     * stale/default varying into the vertex program.  RPCS3 implements the same
-     * families: SCALED4S(0x0A80), 3F(0x1500), 2F(0x1880), 2S(0x1900),
-     * 4UB(0x1940), 4S(0x1980), 4F(0x1C00), and 1F(0x1E40).
+    /* NV4097_SET_VERTEX_DATA4F_M (0x1C00): the constant/"current" value for each
+     * vertex attribute, 16 attributes x 4 floats. The hardware feeds this to
+     * every vertex when the attribute's ARRAY is disabled -- it is not zero.
      *
-     * rsx_fetch_attrib() stores current attributes as host floats, so decode the
-     * packed register forms here into the same semantic values used by array
-     * fetch: UB is normalized [0,1], SCALED4S is signed normalized, and 2S/4S
-     * are signed 16-bit integer values. */
-    if (method >= 0x0A80u && method < 0x0A80u + RSX_MAX_VERTEX_ATTRIBS * 8u) {
-        u32 r = (method - 0x0A80u) >> 2;
-        u32 idx = r >> 1, pair = r & 1u;
-        s16 a = (s16)(data & 0xFFFFu), b = (s16)(data >> 16);
-        state->vertex_data4f[idx][pair * 2u + 0u] = (float)a / 32767.0f;
-        state->vertex_data4f[idx][pair * 2u + 1u] = (float)b / 32767.0f;
-        if (idx == 4u) { static u32 n; if (n++ < 64u)
-            fprintf(stderr, "[VDATA65] fmt=SCALED4S attr=4 pair=%u raw=%08X v=(%.6g %.6g %.6g %.6g)%c",
-                pair, data, state->vertex_data4f[4][0], state->vertex_data4f[4][1],
-                state->vertex_data4f[4][2], state->vertex_data4f[4][3], 10); }
-        return 0;
-    }
-    if (method >= 0x1500u && method < 0x1500u + RSX_MAX_VERTEX_ATTRIBS * 16u) {
-        u32 r = (method - 0x1500u) >> 2;
-        u32 idx = r >> 2, lane = r & 3u;
-        if (lane < 3u) {
-            float f; memcpy(&f, &data, 4);
-            state->vertex_data4f[idx][lane] = f;
-        }
-        state->vertex_data4f[idx][3] = 1.0f;
-        if (idx == 4u) { static u32 n; if (n++ < 64u)
-            fprintf(stderr, "[VDATA65] fmt=3F attr=4 lane=%u raw=%08X v=(%.6g %.6g %.6g %.6g)%c",
-                lane, data, state->vertex_data4f[4][0], state->vertex_data4f[4][1],
-                state->vertex_data4f[4][2], state->vertex_data4f[4][3], 10); }
-        return 0;
-    }
-    if (method >= 0x1880u && method < 0x1880u + RSX_MAX_VERTEX_ATTRIBS * 8u) {
-        u32 r = (method - 0x1880u) >> 2;
-        u32 idx = r >> 1, lane = r & 1u;
-        float f; memcpy(&f, &data, 4);
-        state->vertex_data4f[idx][lane] = f;
-        state->vertex_data4f[idx][2] = 0.0f;
-        state->vertex_data4f[idx][3] = 1.0f;
-        if (idx == 4u) { static u32 n; if (n++ < 64u)
-            fprintf(stderr, "[VDATA65] fmt=2F attr=4 lane=%u raw=%08X v=(%.6g %.6g %.6g %.6g)%c",
-                lane, data, state->vertex_data4f[4][0], state->vertex_data4f[4][1],
-                state->vertex_data4f[4][2], state->vertex_data4f[4][3], 10); }
-        return 0;
-    }
-    if (method >= 0x1900u && method < 0x1900u + RSX_MAX_VERTEX_ATTRIBS * 4u) {
-        u32 idx = (method - 0x1900u) >> 2;
-        state->vertex_data4f[idx][0] = (float)(s16)(data & 0xFFFFu);
-        state->vertex_data4f[idx][1] = (float)(s16)(data >> 16);
-        state->vertex_data4f[idx][2] = 0.0f;
-        state->vertex_data4f[idx][3] = 1.0f;
-        if (idx == 4u) { static u32 n; if (n++ < 64u)
-            fprintf(stderr, "[VDATA65] fmt=2S attr=4 raw=%08X v=(%.6g %.6g %.6g %.6g)%c",
-                data, state->vertex_data4f[4][0], state->vertex_data4f[4][1],
-                state->vertex_data4f[4][2], state->vertex_data4f[4][3], 10); }
-        return 0;
-    }
-    if (method >= 0x1940u && method < 0x1940u + RSX_MAX_VERTEX_ATTRIBS * 4u) {
-        u32 idx = (method - 0x1940u) >> 2;
-        state->vertex_data4f[idx][0] = (float)((data      ) & 0xFFu) / 255.0f;
-        state->vertex_data4f[idx][1] = (float)((data >>  8) & 0xFFu) / 255.0f;
-        state->vertex_data4f[idx][2] = (float)((data >> 16) & 0xFFu) / 255.0f;
-        state->vertex_data4f[idx][3] = (float)((data >> 24) & 0xFFu) / 255.0f;
-        if (idx == 4u) { static u32 n; if (n++ < 64u)
-            fprintf(stderr, "[VDATA65] fmt=4UB attr=4 raw=%08X v=(%.6g %.6g %.6g %.6g)%c",
-                data, state->vertex_data4f[4][0], state->vertex_data4f[4][1],
-                state->vertex_data4f[4][2], state->vertex_data4f[4][3], 10); }
-        return 0;
-    }
-    if (method >= 0x1980u && method < 0x1980u + RSX_MAX_VERTEX_ATTRIBS * 8u) {
-        u32 r = (method - 0x1980u) >> 2;
-        u32 idx = r >> 1, pair = r & 1u;
-        state->vertex_data4f[idx][pair * 2u + 0u] = (float)(s16)(data & 0xFFFFu);
-        state->vertex_data4f[idx][pair * 2u + 1u] = (float)(s16)(data >> 16);
-        if (idx == 4u) { static u32 n; if (n++ < 64u)
-            fprintf(stderr, "[VDATA65] fmt=4S attr=4 pair=%u raw=%08X v=(%.6g %.6g %.6g %.6g)%c",
-                pair, data, state->vertex_data4f[4][0], state->vertex_data4f[4][1],
-                state->vertex_data4f[4][2], state->vertex_data4f[4][3], 10); }
-        return 0;
-    }
+     * Rubber Ducky leaves attribute 3 (diffuse colour) disabled and sets it here
+     * instead; its duck shader computes (lighting * col0) * texture + spec, so a
+     * zero col0 multiplies the texture away and the ducks rendered as a dim grey
+     * specular term only -- present in the framebuffer, invisible on screen.
+     * SET_VERTEX_DATA2F/4UB/2S/4S are the other encodings of the same register
+     * file; add them if a title needs them. */
     if (method >= 0x1C00u && method < 0x1C00u + RSX_MAX_VERTEX_ATTRIBS * 16u) {
-        u32 idx  = (method - 0x1C00u) >> 4;
-        u32 lane = ((method - 0x1C00u) >> 2) & 3u;
+        u32 idx  = (method - 0x1C00u) >> 4;         /* attribute */
+        u32 lane = ((method - 0x1C00u) >> 2) & 3;   /* x/y/z/w   */
         float f; memcpy(&f, &data, 4);
         state->vertex_data4f[idx][lane] = f;
         { static int _d = -1; if (_d < 0) _d = getenv("VDATA_DBG") ? 1 : 0;
           static int _n = 0;
           if (_d && _n < 400) { _n++;
             fprintf(stderr, "[VDATA4F] attr=%u lane=%u = %.4f%c", idx, lane, f, 10); } }
-        if (idx == 4u) { static u32 n; if (n++ < 64u)
-            fprintf(stderr, "[VDATA65] fmt=4F attr=4 lane=%u raw=%08X v=(%.6g %.6g %.6g %.6g)%c",
-                lane, data, state->vertex_data4f[4][0], state->vertex_data4f[4][1],
-                state->vertex_data4f[4][2], state->vertex_data4f[4][3], 10); }
-        return 0;
-    }
-    if (method >= 0x1E40u && method < 0x1E40u + RSX_MAX_VERTEX_ATTRIBS * 4u) {
-        u32 idx = (method - 0x1E40u) >> 2;
-        float f; memcpy(&f, &data, 4);
-        state->vertex_data4f[idx][0] = f;
-        state->vertex_data4f[idx][1] = 0.0f;
-        state->vertex_data4f[idx][2] = 0.0f;
-        state->vertex_data4f[idx][3] = 1.0f;
-        if (idx == 4u) { static u32 n; if (n++ < 64u)
-            fprintf(stderr, "[VDATA65] fmt=1F attr=4 raw=%08X v=(%.6g %.6g %.6g %.6g)%c",
-                data, state->vertex_data4f[4][0], state->vertex_data4f[4][1],
-                state->vertex_data4f[4][2], state->vertex_data4f[4][3], 10); }
         return 0;
     }
 

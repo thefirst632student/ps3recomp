@@ -109,6 +109,8 @@ extern "C" {
 /* Vertex attributes */
 #define NV4097_SET_VERTEX_DATA_ARRAY_FORMAT     0x00001740
 #define NV4097_SET_VERTEX_DATA_ARRAY_OFFSET     0x00001680
+#define NV4097_SET_VERTEX_DATA_BASE_OFFSET      0x00001738
+#define NV4097_SET_VERTEX_DATA_BASE_INDEX       0x0000173C
 
 /* Texture */
 #define NV4097_SET_TEXTURE_OFFSET               0x00001A00
@@ -300,6 +302,11 @@ typedef struct rsx_state {
 
     /* Vertex attributes */
     rsx_vertex_attrib vertex_attribs[RSX_MAX_VERTEX_ATTRIBS];
+    /* NV4097_SET_VERTEX_DATA_BASE_OFFSET / BASE_INDEX. RSX adds the
+     * byte base to every array offset (then masks to 28 bits), while the
+     * element base applies only to indexed vertex IDs (20-bit domain). */
+    u32 vertex_data_base_offset;
+    u32 vertex_data_base_index;
     /* Constant ("current") vertex attributes -- NV4097_SET_VERTEX_DATA4F_M and
      * friends. When an attribute array is DISABLED, the hardware feeds every
      * vertex this register rather than zero, exactly like glColor4f with the
