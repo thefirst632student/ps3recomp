@@ -2346,6 +2346,50 @@ static int vp_get_vs(const rsx_state* st)
             }
         }
     }
+
+    /* v62: dump the complete generic-sprite VP and its raw microcode once,
+     * without requiring WA2_WARN_DIAG.  v61 proved the FP translation is live
+     * but did not prove what produces COLOR0/COLOR1/TEXCOORD0.  This is
+     * observational only. */
+    if (((st->shader_program & ~1u) == 0x01E08480u)) {
+        static int sprite62_vp_dumped = 0;
+        if (!sprite62_vp_dumped) {
+            sprite62_vp_dumped = 1;
+            fprintf(stderr,
+                "[SPRITE62_VP] instrs=%d start=%u hash=0x%08X vstart=0x%X vlen=%u%c",
+                ni, st->transform_program_start, hash, vstart, vlen, 10);
+            const char* _ln = hlsl;
+            while (*_ln) {
+                const char* _e = strchr(_ln, '\n');
+                size_t _len = _e ? (size_t)(_e - _ln) : strlen(_ln);
+                if (_len) {
+                    char _tmp[1400];
+                    size_t _n = _len < sizeof(_tmp)-1 ? _len : sizeof(_tmp)-1;
+                    memcpy(_tmp, _ln, _n); _tmp[_n] = 0;
+                    if (strstr(_tmp, "float4 v[") || strstr(_tmp, "float4 o[") ||
+                        strstr(_tmp, "v[") || strstr(_tmp, "o[") ||
+                        strstr(_tmp, "Out.pos") || strstr(_tmp, "Out.col0") ||
+                        strstr(_tmp, "Out.col1") || strstr(_tmp, "Out.t0") ||
+                        strstr(_tmp, "return Out"))
+                        fprintf(stderr, "[SPRITE62_VP] %s%c", _tmp, 10);
+                }
+                if (!_e) break;
+                _ln = _e + 1;
+            }
+            {
+                u32 _nraw = (u32)ni;
+                if (_nraw > 16u) _nraw = 16u;
+                for (u32 _i = 0; _i < _nraw && _i * 16u + 16u <= vlen; ++_i) {
+                    const u8* _q = vuc + _i * 16u;
+                    fprintf(stderr,
+                        "[SPRITE62_VP_RAW] i=%u %02X%02X%02X%02X %02X%02X%02X%02X "
+                        "%02X%02X%02X%02X %02X%02X%02X%02X%c",
+                        _i, _q[0],_q[1],_q[2],_q[3], _q[4],_q[5],_q[6],_q[7],
+                        _q[8],_q[9],_q[10],_q[11], _q[12],_q[13],_q[14],_q[15], 10);
+                }
+            }
+        }
+    }
     if (getenv("VP_DUMP")) { static int _d=0; if (_d++ < 4) {
         FILE* f = fopen("vp2_dump.hlsl", _d==1 ? "w" : "a");
         if (f) { fprintf(f, "/* per-draw VS hash pending, %d instrs */%s%s", ni, hlsl, "\n"); fclose(f); } } }
@@ -2757,6 +2801,41 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     const u32 fp_ctrl = exp32 ? 0x40u : 0u;
     int n = rsx_fp_decompile(vm_base + off, 4096, fp_ctrl, hlsl, sizeof(hlsl));
     if (n <= 0) { static int _e=0; if(_e++<16) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr); return NULL; }
+
+
+    /* v62: raw words for the same three-instruction sprite/crossfade FP.
+     * The translated HLSL alone cannot reveal a decode-field mistake. */
+    if ((fp_addr & ~1u) == 0x01E08480u) {
+        static int sprite62_fp_raw_dumped = 0;
+        if (!sprite62_fp_raw_dumped) {
+            sprite62_fp_raw_dumped = 1;
+            u32 _psz = rsx_fp_program_size(vm_base + off, 4096);
+            fprintf(stderr,
+                "[SPRITE62_FP_RAW] fp=0x%08X off=0x%08X bytes=%u instrs=%d ctrl=0x%08X%c",
+                fp_addr, off, _psz, n, fp_ctrl, 10);
+            u32 _ro = 0, _ri = 0;
+            while (_ro + 16u <= _psz && _ri < 16u) {
+                const u8* _q = vm_base + off + _ro;
+                u32 _w0 = rsx_fp_read_word(_q + 0);
+                u32 _w1 = rsx_fp_read_word(_q + 4);
+                u32 _w2 = rsx_fp_read_word(_q + 8);
+                u32 _w3 = rsx_fp_read_word(_q + 12);
+                u32 _oplo = (_w0 >> 24) & 0x3Fu;
+                u32 _ophi = (_w2 >> 31) & 1u;
+                fprintf(stderr,
+                    "[SPRITE62_FP_RAW] i=%u w=%08X/%08X/%08X/%08X op=0x%02X attr=%u "
+                    "dstmask=0x%X sat=%u prec=%u scale=%u end=%u%c",
+                    _ri, _w0,_w1,_w2,_w3, _oplo | (_ophi << 6),
+                    (_w0 >> 13) & 0xFu, (_w0 >> 9) & 0xFu,
+                    (_w0 >> 8) & 1u, (_w0 >> 7) & 1u, (_w0 >> 5) & 3u, _w0 & 1u, 10);
+                _ro += 16u;
+                if (((_w1 & 3u) == 2u) || ((_w2 & 3u) == 2u) || ((_w3 & 3u) == 2u))
+                    _ro += 16u;
+                _ri++;
+                if (_w0 & 1u) break;
+            }
+        }
+    }
 
     /* WA2 warning-2 FP raw probe.  Dump the exact guest microcode for
      * 0x01BF9101 once, using the same resolved address and byte order consumed
@@ -8335,6 +8414,73 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
                (unsigned long long)s_total, primitive, first, count);
     }
     s_total++;
+
+    /* v62: trace the actual guest vertex-ring inputs used by the generic WA2
+     * sprite/crossfade FP.  Short fades now survive while >1 s fades and dense
+     * snow still flicker; a ring/base wrap is one mechanism whose frequency
+     * naturally scales with sprite traffic.  Keep the probe bounded and log
+     * every detected first/base wrap even after the initial samples. */
+    if (s_d3d.current_rsx_state &&
+        ((s_d3d.current_rsx_state->shader_program & ~1u) == 0x01E08480u)) {
+        const rsx_state* _st = s_d3d.current_rsx_state;
+        const rsx_vertex_attrib* _a0 = &_st->vertex_attribs[0];
+        const rsx_vertex_attrib* _a3 = &_st->vertex_attribs[3];
+        const rsx_vertex_attrib* _a8 = &_st->vertex_attribs[8];
+        const u32 _o0 = _a0->offset & 0x7FFFFFFFu;
+        const u32 _o3 = _a3->offset & 0x7FFFFFFFu;
+        const u32 _o8 = _a8->offset & 0x7FFFFFFFu;
+        static u64 _sn = 0;
+        static u32 _last_first = 0, _last_o0 = 0, _last_raw0 = 0, _last_stride0 = 0;
+        static int _have = 0;
+        static u32 _fade_lines = 0, _snow_lines = 0, _wrap_lines = 0;
+        const int _same_stream = _have && _last_o0 == _o0 && _last_stride0 == _a0->stride;
+        const int _first_wrap = _same_stream && first < _last_first;
+        const int _base_wrap = _have && _a0->stride == _last_stride0 &&
+                               ((_a0->offset ^ _last_raw0) & 0x80000000u) == 0 &&
+                               _o0 < _last_o0;
+        const int _is_fade = (s_d3d.cur_texs[0].raw == 0x01CA3E00u);
+        const int _is_snow = (s_d3d.cur_texs[0].raw == 0x0368E500u);
+        const int _emit = (_is_fade && _fade_lines < 180u) ||
+                          (_is_snow && _snow_lines < 24u) ||
+                          ((_first_wrap || _base_wrap) && _wrap_lines < 64u);
+        if (_emit) {
+            extern uint8_t* vm_base;
+            extern u32 cellGcmResolveLocated(int, u32);
+            u32 _vlast = count ? first + count - 1u : first;
+            u32 _ao0 = _o0 + first * _a0->stride;
+            u32 _al0 = _o0 + _vlast * _a0->stride;
+            u32 _ea0 = _a0->enabled ? cellGcmResolveLocated((_a0->offset & 0x80000000u) ? 0 : 1, _ao0) : 0;
+            u32 _eal = _a0->enabled ? cellGcmResolveLocated((_a0->offset & 0x80000000u) ? 0 : 1, _al0) : 0;
+            float _p[4]={0}, _c[4]={0}, _t[4]={0};
+            rsx_fetch_attrib(_st, 0, first, _p);
+            rsx_fetch_attrib(_st, 3, first, _c);
+            rsx_fetch_attrib(_st, 8, first, _t);
+            fprintf(stderr,
+                "[SPRITE62_RING] n=%llu frame=%u tex0=0x%08X prim=%u first=%u count=%u "
+                "wrap=%d/%d a0=0x%08X/s%u a3=0x%08X/s%u a8=0x%08X/s%u "
+                "ea0=0x%08X..0x%08X pos=(%.5g %.5g %.5g %.5g) "
+                "col=(%.5g %.5g %.5g %.5g) uv=(%.5g %.5g %.5g %.5g) "
+                "blend=0x%08X alphaTest=%d func=0x%X ref=%u%c",
+                (unsigned long long)_sn, (unsigned)s_d3d.frame_count,
+                s_d3d.cur_texs[0].raw, primitive, first, count,
+                _first_wrap, _base_wrap, _a0->offset, _a0->stride,
+                _a3->offset, _a3->stride, _a8->offset, _a8->stride,
+                _ea0, _eal, _p[0],_p[1],_p[2],_p[3],
+                _c[0],_c[1],_c[2],_c[3], _t[0],_t[1],_t[2],_t[3],
+                (_st->blend_sfactor & 0xFFFFu) | ((_st->blend_dfactor & 0xFFFFu) << 16),
+                _st->alpha_test_enable, _st->alpha_func, _st->alpha_ref, 10);
+            if (_is_fade) _fade_lines++;
+            if (_is_snow) _snow_lines++;
+            if (_first_wrap || _base_wrap) _wrap_lines++;
+            (void)vm_base;
+        }
+        _last_first = first;
+        _last_o0 = _o0;
+        _last_raw0 = _a0->offset;
+        _last_stride0 = _a0->stride;
+        _have = 1;
+        _sn++;
+    }
 
     /* WA2 warning-2 composition probe.  The screen is built from four
      * consecutive draws.  Log each pass once, including post-fetch vertex
