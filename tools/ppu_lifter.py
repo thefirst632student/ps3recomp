@@ -121,6 +121,9 @@ void     vm_write16(uint64_t addr, uint16_t val);
 void     vm_write32(uint64_t addr, uint32_t val);
 void     vm_write64(uint64_t addr, uint64_t val);
 void     vm_write_raw(uint64_t addr, const void* src, uint32_t size);
+/* WA2 v75 diagnostic: emitted only at the eight known lfs instructions in
+ * func_0004C528 that consume the render object's UV rectangle. */
+void     ppu_wa2_lfs_trace75(uint32_t pc, uint64_t ea, uint32_t guest_bits, ppu_context* ctx);
 /* stwcx./stdcx. store-conditional: atomically store `val` at `addr` iff the raw
  * big-endian guest word still equals `expected` (the value the paired lwarx/ldarx
  * loaded). Returns 1 if the reservation held (store applied), 0 otherwise. This
@@ -1615,8 +1618,23 @@ class PPULifter:
             disp, base = _disp_base(ops[1])
             if disp is not None:
                 if mn in ("lfs", "lfsu"):
-                    line = (f"{{ uint32_t tmp = vm_read32(ctx->gpr[{base}] + {disp}); "
-                            f"float ftmp; memcpy(&ftmp, &tmp, 4); ctx->fpr[{frd}] = ftmp; }}")
+                    # WA2 v75: trace the eight exact object-UV reads in func_0004C528
+                    # at the generated call site. v74 tried to identify these reads
+                    # from vm_read32's host return address; that proved unreliable in
+                    # the optimized title build even though the same helper is used.
+                    # Literal guest PCs make this diagnostic independent of host codegen.
+                    _wa2_uv_lfs75 = {
+                        0x0004D0D4, 0x0004D0D8, 0x0004D104, 0x0004D108,
+                        0x0004D134, 0x0004D138, 0x0004D164, 0x0004D168,
+                    }
+                    if addr in _wa2_uv_lfs75:
+                        line = (f"{{ uint64_t wa2ea = ctx->gpr[{base}] + {disp}; "
+                                f"uint32_t tmp = vm_read32(wa2ea); "
+                                f"ppu_wa2_lfs_trace75(0x{addr:08X}u, wa2ea, tmp, ctx); "
+                                f"float ftmp; memcpy(&ftmp, &tmp, 4); ctx->fpr[{frd}] = ftmp; }}")
+                    else:
+                        line = (f"{{ uint32_t tmp = vm_read32(ctx->gpr[{base}] + {disp}); "
+                                f"float ftmp; memcpy(&ftmp, &tmp, 4); ctx->fpr[{frd}] = ftmp; }}")
                 else:
                     line = (f"{{ uint64_t tmp = vm_read64(ctx->gpr[{base}] + {disp}); "
                             f"memcpy(&ctx->fpr[{frd}], &tmp, 8); }}")

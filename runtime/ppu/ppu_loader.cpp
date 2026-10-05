@@ -1255,6 +1255,38 @@ uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; ppu_rwatch
       if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD16] spinning on 0x%08X\n", (uint32_t)a); n=0; } } else { last=(uint32_t)a; n=0; } }
 #endif
     return __builtin_bswap16(v); }
+/* WA2 v75: call-site truth probe for the eight lfs instructions at
+ * 0x4D0D4..0x4D168 in func_0004C528. The lifter emits this call with the
+ * literal guest PC, avoiding v74's dependence on resolving a host return
+ * address from inside vm_read32. It is observational only. */
+extern "C" void ppu_wa2_lfs_trace75(uint32_t pc, uint64_t ea64, uint32_t guest_bits, ppu_context* ctx)
+{
+#if defined(_WIN32) && !defined(NDEBUG)
+    static int n75 = 0;
+    if (n75++ >= 48) return;
+    const uint32_t ea = (uint32_t)ea64;
+    uint32_t raw_le = 0;
+    if (!vm_oob(ea, 4)) memcpy(&raw_le, vm_base + ea, 4);
+    MEMORY_BASIC_INFORMATION mbi75; memset(&mbi75, 0, sizeof(mbi75));
+    SIZE_T q75 = (!vm_oob(ea, 1)) ? VirtualQuery(vm_base + ea, &mbi75, sizeof(mbi75)) : 0;
+    uint32_t snap75[8]; wa2_snow_uv73_read(snap75);
+    fprintf(stderr,
+            "[SNOWOBJ75-LFS] n=%d pc=0x%08X ea=0x%08X r31=0x%08X "
+            "guest=0x%08X rawLE=0x%08X protect=0x%08lX state=0x%08lX type=0x%08lX "
+            "uv=%08X/%08X/%08X/%08X/%08X/%08X/%08X/%08X\n",
+            n75 - 1, pc, ea, ctx ? (uint32_t)ctx->gpr[31] : 0u,
+            guest_bits, raw_le,
+            q75 ? (unsigned long)mbi75.Protect : 0ul,
+            q75 ? (unsigned long)mbi75.State : 0ul,
+            q75 ? (unsigned long)mbi75.Type : 0ul,
+            snap75[0], snap75[1], snap75[2], snap75[3],
+            snap75[4], snap75[5], snap75[6], snap75[7]);
+    fflush(stderr);
+#else
+    (void)pc; (void)ea64; (void)guest_bits; (void)ctx;
+#endif
+}
+
 uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch_hit((uint32_t)a, 4, __builtin_return_address(0));
     /* Raw SPU problem state: reading the outbound mailbox POPS it, so that one
      * cannot be served out of memory. Everything else in the window the SPU
