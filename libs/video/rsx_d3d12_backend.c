@@ -478,14 +478,17 @@ static u64 s_req_verts = 0, s_req_draws = 0, s_drop_draws = 0;
  * overwhelmingly yellow, avg 243,191,23). VRAM offsets move between runs, so a
  * hard-coded offset in a filter silently matches nothing and the run looks like
  * "renders nothing" -- which cost real time. DRAW_KEEP_TEX=duck resolves here. */
-/* Copy of the last completed frame, bound wherever a draw samples a
- * DISPLAY-SIZED texture. On RSX this title renders its reflection into a corner
- * of the render surface and then samples that surface as a texture; our backend
- * renders into a D3D backbuffer, so the guest memory behind that sampler is
- * never written and it reads empty -- which is why the water had no reflection.
- * Feeding it the previous frame costs one frame of latency, which for a water
- * reflection is not visible. */
+/* Mutable display snapshot bound wherever a draw samples the registered
+ * display surface as a texture.  It may be refreshed at an exact mid-frame
+ * boundary so screen-as-texture/NV3089 sees the pixels that existed there; it
+ * therefore must NOT also serve as inter-frame persistence. */
 static ID3D12Resource* s_screen_copy = NULL;
+/* Previous COMPLETED scanout.  Keep this separate from s_screen_copy: the
+ * latter is a mutable mid-frame/effect snapshot used by screen-as-texture and
+ * ordered NV3089 copies, while guest display memory persistence must advance
+ * only when a batch is actually presented. */
+static ID3D12Resource* s_display_history = NULL;
+static int s_display_history_valid = 0;
 
 /* A display-sized texture is not automatically the scanout surface.  WA2 (and
  * plenty of other titles) uses ordinary 1280x720 textures for post effects.
@@ -5089,43 +5092,101 @@ static void off_rt_transition(int slot, D3D12_RESOURCE_STATES to)
  * s_display_blit_count made alpha-only frames (logo fades) and occasional
  * snow batches with ops=0 blend against the host clear instead of persistent
  * guest display memory, producing density-dependent flicker. */
-static void display_blit_seed_framebuffer(u32 fi)
+static int display_history_ensure(void)
 {
-    static int persist = -1;
-    if (persist < 0) {
-        const char* e = getenv("RSX_DISPLAY_PERSIST");
-        persist = (e && *e == '0') ? 0 : 1;
+    if (s_display_history) return 1;
+    if (!s_d3d.device) return 0;
+
+    D3D12_HEAP_PROPERTIES hp = {0};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC td = {0};
+    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = s_d3d.width; td.Height = s_d3d.height;
+    td.DepthOrArraySize = 1; td.MipLevels = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
+            s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &td,
+            D3D12_RESOURCE_STATE_COPY_SOURCE, NULL,
+            &IID_ID3D12Resource, (void**)&s_display_history))) {
+        s_display_history = NULL;
+        return 0;
     }
-    if (!persist || !s_screen_copy || !s_d3d.cmd_list || fi >= FRAME_COUNT ||
-        !s_d3d.render_targets[fi])
+    return 1;
+}
+
+/* Capture the just-finished display image into immutable inter-frame history.
+ * The caller invokes this only for batches that are actually going to Present.
+ * Queue ordering makes this copy complete before the next frame can seed from
+ * it; no CPU wait is needed. */
+static void display_history_capture(u32 fi)
+{
+    if (!s_d3d.cmd_list || fi >= FRAME_COUNT || !s_d3d.render_targets[fi] ||
+        !display_history_ensure())
         return;
 
     D3D12_RESOURCE_BARRIER b[2] = {0};
     b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     b[0].Transition.pResource = s_d3d.render_targets[fi];
     b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     b[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     b[1] = b[0];
-    b[1].Transition.pResource = s_screen_copy;
-    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b[1].Transition.pResource = s_display_history;
+    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
     s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 2, b);
 
     s_d3d.cmd_list->lpVtbl->CopyResource(
-        s_d3d.cmd_list, s_d3d.render_targets[fi], s_screen_copy);
+        s_d3d.cmd_list, s_display_history, s_d3d.render_targets[fi]);
 
-    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
     b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 2, b);
+
+    s_display_history_valid = 1;
+    { static int hn = 0; if (hn++ < 32)
+        fprintf(stderr,
+                "[DISPLAY87-HISTORY-CAP] frame=%u history=%p <- backbuffer=%p%c",
+                fi, (void*)s_display_history, (void*)s_d3d.render_targets[fi], 10); }
+}
+
+static void display_blit_seed_framebuffer(u32 fi)
+{
+    static int persist = -1;
+    if (persist < 0) {
+        const char* e = getenv("RSX_DISPLAY_PERSIST");
+        persist = (e && *e == '0') ? 0 : 1;
+        fprintf(stderr, "[DISPLAY87-SEED-MODE] %s%c",
+                persist ? "ON(separate-present-history)" : "OFF", 10);
+    }
+    if (!persist || !s_display_history_valid || !s_display_history ||
+        !s_d3d.cmd_list || fi >= FRAME_COUNT || !s_d3d.render_targets[fi])
+        return;
+
+    D3D12_RESOURCE_BARRIER b = {0};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = s_d3d.render_targets[fi];
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
+
+    s_d3d.cmd_list->lpVtbl->CopyResource(
+        s_d3d.cmd_list, s_d3d.render_targets[fi], s_display_history);
+
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &b);
 
     { static int sn = 0; if (sn++ < 32)
         fprintf(stderr,
-                "[DISPLAY-PERSIST] frame=%u ops=%u backbuffer=%p <- previous display %p%c",
+                "[DISPLAY87-HISTORY-SEED] frame=%u ops=%u backbuffer=%p <- history=%p%c",
                 fi, s_display_blit_count, (void*)s_d3d.render_targets[fi],
-                (void*)s_screen_copy, 10); }
+                (void*)s_display_history, 10); }
 }
 
 /* Dedicated scaling path for full-image NV3089 RT->texture copies.
@@ -7102,6 +7163,13 @@ skip_dump_consider: ;
                            s_every = e ? atoi(e) : 0; }
         if (s_every > 1) s_d3d.dump_skip_left = s_every - 1;
     }
+    /* v87: publish inter-frame persistence only from a batch that is
+     * actually about to Present.  Offscreen-only/effect snapshot batches may
+     * still mutate s_screen_copy, but can no longer poison the next frame's
+     * guest display-memory seed. */
+    if (s_present_this_frame)
+        display_history_capture(fi);
+
     if (dumping || logo_fb_probe) {
         /* RT -> COPY_SOURCE, copy into the readback buffer, then -> PRESENT. */
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -9501,6 +9569,9 @@ void rsx_d3d12_backend_shutdown(void)
     if (s_logo_occ_readback) { s_logo_occ_readback->lpVtbl->Release(s_logo_occ_readback); s_logo_occ_readback = NULL; }
     if (s_logo_occ_heap) { s_logo_occ_heap->lpVtbl->Release(s_logo_occ_heap); s_logo_occ_heap = NULL; }
     if (s_logo_tex_readback) { s_logo_tex_readback->lpVtbl->Release(s_logo_tex_readback); s_logo_tex_readback = NULL; }
+    if (s_screen_copy) { s_screen_copy->lpVtbl->Release(s_screen_copy); s_screen_copy = NULL; }
+    if (s_display_history) { s_display_history->lpVtbl->Release(s_display_history); s_display_history = NULL; }
+    s_display_history_valid = 0;
     s_logo_tex_copy_issued = 0; s_logo_tex_readback_pitch = 0;
     if (s_d3d.fence) s_d3d.fence->lpVtbl->Release(s_d3d.fence);
     if (s_d3d.fence_event) CloseHandle(s_d3d.fence_event);
