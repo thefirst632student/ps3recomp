@@ -8392,6 +8392,93 @@ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
     }
     s_total++;
 
+    /* v86: the v85 probe proved that the snow atlas address resolution and
+     * A4R4G4B4/Morton decode are byte-for-byte RPCS3-equivalent.  Snapshot the
+     * *post-upload* state that can still change composition: raw RSX blend
+     * factors/equations, render-target format/write mask, and sampler state.
+     * This is diagnostic only; it does not modify guest or D3D12 state. */
+    if (s_d3d.current_rsx_state) {
+        const rsx_state* _e86 = s_d3d.current_rsx_state;
+        const u32 _e86_fp = _e86->shader_program & ~1u;
+        const u32 _e86_raw = s_d3d.cur_texs[0].raw;
+        static u32 _e86_seen = 0;
+        u32 _e86_tag = 0;
+        const char* _e86_name = NULL;
+
+        /* Exact snow atlas draw. */
+        if (_e86_fp == 0x01E08480u && _e86_raw == 0x0368E500u &&
+            s_d3d.cur_texs[0].w == 64u && s_d3d.cur_texs[0].h == 128u &&
+            s_d3d.cur_texs[0].fmt == 0x83u) {
+            _e86_tag = 1u;
+            _e86_name = "SNOW";
+        }
+        /* The long fade uses the same live FP/blend path but a tiny 4x4 fmt85
+         * texture, giving us a second symptom with independent texture data. */
+        else if (_e86_fp == 0x01E08480u && s_d3d.cur_texs[0].w == 4u &&
+                 s_d3d.cur_texs[0].h == 4u && s_d3d.cur_texs[0].fmt == 0x85u &&
+                 _e86->blend_enable) {
+            _e86_tag = 2u;
+            _e86_name = "FADE";
+        }
+
+        if (_e86_tag && !(_e86_seen & _e86_tag)) {
+            _e86_seen |= _e86_tag;
+            const u32 _e86_bk = rsx_blend_key(_e86, _e86->blend_enable);
+            u32 _e86_cm = 0xFu;
+            const u32 _e86_cmraw = _e86->color_mask;
+            _e86_cm = ((_e86_cmraw & 0x00010000u) ? 1u : 0u)
+                      | ((_e86_cmraw & 0x00000100u) ? 2u : 0u)
+                      | ((_e86_cmraw & 0x00000001u) ? 4u : 0u)
+                      | ((_e86_cmraw & 0x01000000u) ? 8u : 0u);
+            const u32 _e86_sf = _e86->blend_sfactor;
+            const u32 _e86_df = _e86->blend_dfactor;
+            const u32 _e86_eq = _e86->blend_equation;
+            const u32 _e86_fmt = _e86->surface_format & 0x1Fu;
+            const char* _e86_fmt_name =
+                (_e86_fmt == 8u) ? "A8R8G8B8" :
+                (_e86_fmt == 4u) ? "X8R8G8B8_Z" :
+                (_e86_fmt == 5u) ? "X8R8G8B8_O" : "OTHER";
+
+            fprintf(stderr,
+                    "[EFFECT86-STATE] kind=%s frame=%llu prim=%u first=%u count=%u fp=0x%08X "
+                    "tex0=0x%08X/%ux%u/fmt%02X surfaceFmt=0x%02X(%s) target=0x%X "
+                    "rt0=0x%08X clip=%ux%u cmaskRaw=0x%08X cmaskD3D=0x%X%c",
+                    _e86_name, (unsigned long long)s_d3d.frame_count,
+                    primitive, first, count, _e86->shader_program,
+                    _e86_raw, s_d3d.cur_texs[0].w, s_d3d.cur_texs[0].h,
+                    s_d3d.cur_texs[0].fmt, _e86_fmt, _e86_fmt_name,
+                    _e86->color_target, _e86->surface_color_offset[0],
+                    _e86->surface_clip_w, _e86->surface_clip_h,
+                    _e86_cmraw, _e86_cm, 10);
+
+            fprintf(stderr,
+                    "[EFFECT86-BLEND] kind=%s en=%d sf=0x%08X rgb=0x%04X a=0x%04X "
+                    "df=0x%08X rgb=0x%04X a=0x%04X eq=0x%08X rgb=0x%04X a=0x%04X "
+                    "key=0x%08X d3d(srcRGB=%u dstRGB=%u opRGB=%u srcA=%u dstA=%u opA=%u) "
+                    "alphaTest=%d func=0x%X ref=%u%c",
+                    _e86_name, _e86->blend_enable,
+                    _e86_sf, _e86_sf & 0xFFFFu, (_e86_sf >> 16) & 0xFFFFu,
+                    _e86_df, _e86_df & 0xFFFFu, (_e86_df >> 16) & 0xFFFFu,
+                    _e86_eq, _e86_eq & 0xFFFFu, (_e86_eq >> 16) & 0xFFFFu,
+                    _e86_bk,
+                    (_e86_bk >> 1) & 0x1Fu, (_e86_bk >> 6) & 0x1Fu,
+                    (_e86_bk >> 21) & 0x7u, (_e86_bk >> 11) & 0x1Fu,
+                    (_e86_bk >> 16) & 0x1Fu, (_e86_bk >> 24) & 0x7u,
+                    _e86->alpha_test_enable, _e86->alpha_func,
+                    _e86->alpha_ref, 10);
+
+            fprintf(stderr,
+                    "[EFFECT86-SAMPLER] kind=%s raw=0x%08X ea=0x%08X address=0x%08X "
+                    "control0=0x%08X filter=0x%08X ctrl1=0x%08X border=0x%08X "
+                    "pitch=%u mips=%u cube=%d%c",
+                    _e86_name, _e86_raw, s_d3d.cur_texs[0].off,
+                    s_d3d.cur_texs[0].address, s_d3d.cur_texs[0].control0,
+                    s_d3d.cur_texs[0].filter, s_d3d.cur_texs[0].ctrl1,
+                    s_d3d.cur_texs[0].border, s_d3d.cur_texs[0].pitch,
+                    s_d3d.cur_texs[0].mips, s_d3d.cur_texs[0].cube, 10);
+        }
+    }
+
     /* WA2 warning-2 composition probe.  The screen is built from four
      * consecutive draws.  Log each pass once, including post-fetch vertex
      * attributes and blend/texture state.  This is diagnostic only and does
