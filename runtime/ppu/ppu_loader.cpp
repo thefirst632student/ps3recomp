@@ -1417,11 +1417,11 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
                 fflush(stderr);
             }
             /* The selector read at 0x4C284 happens before 0x4C280 repurposes
-             * r30/r31, so r4/r30 still identify the caller's draw descriptor.
+             * r30/r31, so r4/r30 still identify the caller's clip descriptor.
              * Its prologue has already done stdu r1,-0x80; recover old SP to
              * fetch the four stack-passed input-array pointers. */
             if (guest79 == 0u && lr == 0x0004CFF8u && r31 == 0x01087280u &&
-                r4 == 0x4001C520u && g_active_ctx) {
+                r4 == 0x01062778u && g_active_ctx) {
                 wa2_snow_uv80_state &t = g_wa2_snow_uv80;
                 memset(&t, 0, sizeof(t));
                 t.active = 1u;
@@ -1440,12 +1440,12 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
                 for (int i = 0; i < 4; ++i) t.in_bits[k++] = wa2_snow80_be32(t.p[3] + (uint32_t)i * 4u);
                 if (t.seq <= 64u) {
                     fprintf(stderr,
-                            "[SNOWUV80-ENTRY] seq=%u obj=0x%08X desc=0x%08X sp=0x%08X oldsp=0x%08X clip=(%d,%d) "
+                            "[SNOWUV81-ENTRY] seq=%u obj=0x%08X desc=0x%08X sp=0x%08X oldsp=0x%08X clip=(%d,%d) "
                             "p=%08X/%08X/%08X/%08X\n",
                             t.seq, t.obj, t.desc, sp, t.old_sp, (int)t.clip_x, (int)t.clip_y,
                             t.p[0], t.p[1], t.p[2], t.p[3]);
                     fprintf(stderr,
-                            "[SNOWUV80-IN] seq=%u A=(%.9g,%.9g) B=(%.9g,%.9g) "
+                            "[SNOWUV81-IN] seq=%u A=(%.9g,%.9g) B=(%.9g,%.9g) "
                             "C=(%.9g,%.9g,%.9g,%.9g) D=(%.9g,%.9g,%.9g,%.9g)\n",
                             t.seq,
                             wa2_snow80_f32(t.in_bits[0]), wa2_snow80_f32(t.in_bits[1]),
@@ -1922,7 +1922,7 @@ static inline void wa2_snow_uv80_write_hit(uint32_t a, uint32_t v, int width)
     o[15] = v;
     if (t.seq <= 64u) {
         fprintf(stderr,
-                "[SNOWUV80-RECT] seq=%u desc=0x%08X clip=(%d,%d) "
+                "[SNOWUV81-RECT] seq=%u desc=0x%08X clip=(%d,%d) "
                 "uv=(%.9g,%.9g)(%.9g,%.9g) alt=(%.9g,%.9g,%.9g,%.9g) "
                 "posX=(%.9g,%.9g,%.9g,%.9g) posY=(%.9g,%.9g,%.9g,%.9g)\n",
                 t.seq, t.desc, (int)t.clip_x, (int)t.clip_y,
@@ -1936,7 +1936,7 @@ static inline void wa2_snow_uv80_write_hit(uint32_t a, uint32_t v, int width)
                 wa2_snow80_f32(o[14]), wa2_snow80_f32(o[15]));
         if (o[0] == 0x00000000u && o[2] == 0x42000000u &&
             o[4] == 0x42000000u && o[6] == 0x43000000u) {
-            fprintf(stderr, "[SNOWUV80-TARGET] seq=%u exact vertex UV rectangle 0,32/32,32/0,128/32,128\n", t.seq);
+            fprintf(stderr, "[SNOWUV81-TARGET] seq=%u exact vertex UV rectangle 0,32/32,32/0,128/32,128\n", t.seq);
             extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
             extern void ppu_dump_guest_stack(ppu_context*, const char*);
             if (g_active_ctx) ppu_dump_guest_stack(g_active_ctx, "snowuv80-target");
