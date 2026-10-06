@@ -631,6 +631,65 @@ static int wa2_diag_on(void)
     if (v < 0) { const char* e = getenv("WA2_WARN_DIAG"); v = e ? atoi(e) : 0; }
     return v;
 }
+
+/* v91: snow scanout parity probe.  State/texture/VP/FP/blend/depth probes have
+ * all converged, so distinguish a bad rendered image from a bad Present/DWM
+ * path.  Samples are sparse (first few snow presents, then every 15th) because
+ * each one intentionally waits for GPU completion and reads the backbuffer. */
+typedef struct Effect91PreStat {
+    u32 valid, sample, frame, hash;
+    u64 sum_r, sum_g, sum_b;
+    u32 w, h;
+    u8 center[3];
+} Effect91PreStat;
+static Effect91PreStat s_effect91_pre;
+
+static u32 effect91_hash_rgb_d3d(const u8* p, u32 pitch, u32 w, u32 h,
+                                 u64* sr, u64* sg, u64* sb, u8 center[3])
+{
+    u32 hsh = 2166136261u;
+    u64 rsum = 0, gsum = 0, bsum = 0;
+    for (u32 y = 0; y < h; y++) {
+        const u8* row = p + (u64)y * pitch;
+        for (u32 x = 0; x < w; x++) {
+            const u8* q = row + (u64)x * 4u; /* readback = R,G,B,A */
+            rsum += q[0]; gsum += q[1]; bsum += q[2];
+            hsh = (hsh ^ q[0]) * 16777619u;
+            hsh = (hsh ^ q[1]) * 16777619u;
+            hsh = (hsh ^ q[2]) * 16777619u;
+        }
+    }
+    if (w && h) {
+        const u8* c = p + (u64)(h / 2u) * pitch + (u64)(w / 2u) * 4u;
+        center[0] = c[0]; center[1] = c[1]; center[2] = c[2];
+    }
+    *sr = rsum; *sg = gsum; *sb = bsum;
+    return hsh;
+}
+
+static u32 effect91_hash_rgb_bgra(const u8* p, u32 pitch, u32 w, u32 h,
+                                  u64* sr, u64* sg, u64* sb, u8 center[3])
+{
+    u32 hsh = 2166136261u;
+    u64 rsum = 0, gsum = 0, bsum = 0;
+    for (u32 y = 0; y < h; y++) {
+        const u8* row = p + (u64)y * pitch;
+        for (u32 x = 0; x < w; x++) {
+            const u8* q = row + (u64)x * 4u; /* DIB = B,G,R,x */
+            const u8 r = q[2], g = q[1], bl = q[0];
+            rsum += r; gsum += g; bsum += bl;
+            hsh = (hsh ^ r) * 16777619u;
+            hsh = (hsh ^ g) * 16777619u;
+            hsh = (hsh ^ bl) * 16777619u;
+        }
+    }
+    if (w && h) {
+        const u8* c = p + ((u64)(h / 2u) * w + (u64)(w / 2u)) * 4u;
+        center[0] = c[2]; center[1] = c[1]; center[2] = c[0];
+    }
+    *sr = rsum; *sg = gsum; *sb = bsum;
+    return hsh;
+}
 /* DBG_LOCK: running clip-space centroid of the tracked mesh (RSX_DBG_VTX's
  * texture), so the debug camera can follow it. The ducks are driven by the
  * physics sim and drift every frame, so a fixed DBG_CENTER loses them as soon
@@ -674,6 +733,78 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProcA(hwnd, msg, wp, lp);
 }
 
+
+/* v91 post-Present half of the snow probe.  Hash RGB only: DIB alpha is not
+ * defined for a composited window and must not be compared with the swapchain
+ * alpha channel. */
+static void effect91_probe_composited_window(u32 frame, u32 sample, UINT bb_before,
+                                              UINT bb_after, UINT present_count, HRESULT phr)
+{
+    if (!s_effect91_pre.valid || s_effect91_pre.sample != sample || !s_d3d.hwnd) return;
+
+    HMODULE dwm = LoadLibraryA("dwmapi.dll");
+    if (dwm) {
+        typedef HRESULT (WINAPI *PFN_DwmFlush)(void);
+        PFN_DwmFlush fn = (PFN_DwmFlush)GetProcAddress(dwm, "DwmFlush");
+        if (fn) (void)fn();
+        FreeLibrary(dwm);
+    }
+
+    RECT rc;
+    if (!GetClientRect(s_d3d.hwnd, &rc)) return;
+    const int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    if (w <= 0 || h <= 0) return;
+    POINT pt = {0, 0}; ClientToScreen(s_d3d.hwnd, &pt);
+
+    BITMAPINFO bi; memset(&bi, 0, sizeof(bi));
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    HDC screen = GetDC(NULL);
+    HDC mem = screen ? CreateCompatibleDC(screen) : NULL;
+    void* bits = NULL;
+    HBITMAP bmp = (screen && mem) ? CreateDIBSection(screen, &bi, DIB_RGB_COLORS,
+                                                     &bits, NULL, 0) : NULL;
+    HGDIOBJ old = (bmp && mem) ? SelectObject(mem, bmp) : NULL;
+    BOOL ok = FALSE;
+    if (bmp && bits) ok = BitBlt(mem, 0, 0, w, h, screen, pt.x, pt.y, SRCCOPY | CAPTUREBLT);
+
+    if (ok) {
+        u64 sr=0, sg=0, sb=0; u8 c[3] = {0,0,0};
+        u32 ph = effect91_hash_rgb_bgra((const u8*)bits, (u32)w * 4u,
+                                        (u32)w, (u32)h, &sr, &sg, &sb, c);
+        u64 npre = (u64)s_effect91_pre.w * s_effect91_pre.h;
+        u64 npost = (u64)(u32)w * (u32)h;
+        int same_dims = ((u32)w == s_effect91_pre.w && (u32)h == s_effect91_pre.h);
+        int exact = same_dims && ph == s_effect91_pre.hash;
+        fprintf(stderr,
+            "[EFFECT91-SCANOUT] sample=%u frame=%u present_hr=0x%08lX bb=%u->%u pc=%u "
+            "pre=%ux%u hash=%08X mean=(%llu,%llu,%llu) center=(%u,%u,%u) "
+            "post=%dx%d hash=%08X mean=(%llu,%llu,%llu) center=(%u,%u,%u) "
+            "dims=%d exactRGB=%d visible=%d iconic=%d fg=%d\n",
+            sample, frame, (unsigned long)phr, bb_before, bb_after, present_count,
+            s_effect91_pre.w, s_effect91_pre.h, s_effect91_pre.hash,
+            npre ? (unsigned long long)(s_effect91_pre.sum_r / npre) : 0ull,
+            npre ? (unsigned long long)(s_effect91_pre.sum_g / npre) : 0ull,
+            npre ? (unsigned long long)(s_effect91_pre.sum_b / npre) : 0ull,
+            s_effect91_pre.center[0], s_effect91_pre.center[1], s_effect91_pre.center[2],
+            w, h, ph,
+            npost ? (unsigned long long)(sr / npost) : 0ull,
+            npost ? (unsigned long long)(sg / npost) : 0ull,
+            npost ? (unsigned long long)(sb / npost) : 0ull, c[0], c[1], c[2],
+            same_dims, exact, IsWindowVisible(s_d3d.hwnd) ? 1 : 0,
+            IsIconic(s_d3d.hwnd) ? 1 : 0, GetForegroundWindow() == s_d3d.hwnd ? 1 : 0);
+    } else {
+        fprintf(stderr, "[EFFECT91-SCANOUT] sample=%u frame=%u DWM_CAPTURE_FAILED bb=%u->%u pc=%u\n",
+                sample, frame, bb_before, bb_after, present_count);
+    }
+    if (old && mem) SelectObject(mem, old);
+    if (bmp) DeleteObject(bmp);
+    if (mem) DeleteDC(mem);
+    if (screen) ReleaseDC(NULL, screen);
+    s_effect91_pre.valid = 0;
+}
 
 /* WA2 warning post-Present probe.  The D3D12 readback probes characterize the
  * swapchain resource before Present; this one samples what Win32/DWM exposes
@@ -6076,6 +6207,26 @@ static void render_frame(void)
      * boot-logo texture. This is diagnostic only; it does not alter draw state.
      * Keep the flag alive until after command submission so we can read back the
      * final swapchain image and answer whether pixels survived rasterization. */
+    int effect91_probe_batch = 0;
+    u32 effect91_sample = 0;
+    if (s_present_this_frame) {
+        int _snow91 = 0;
+        for (u32 _e91 = 0; _e91 < s_d3d.draw_count && _e91 < MAX_DRAWS; _e91++) {
+            const D3D12DrawRecord* _dr91 = &s_d3d.draws[_e91];
+            if (!_dr91->is_clear && _dr91->tex[0].raw == 0x0368E500u) { _snow91 = 1; break; }
+        }
+        if (_snow91) {
+            static u32 _snow91_seen = 0, _snow91_samples = 0;
+            _snow91_seen++;
+            if (_snow91_samples < 40u && (_snow91_seen <= 4u || (_snow91_seen % 15u) == 0u)) {
+                effect91_probe_batch = 1;
+                effect91_sample = ++_snow91_samples;
+                fprintf(stderr, "[EFFECT91-ARM] sample=%u snowPresent=%u frame=%u draws=%u\n",
+                        effect91_sample, _snow91_seen, (u32)s_d3d.frame_count, s_d3d.draw_count);
+            }
+        }
+    }
+
     int logo_probe_batch = 0;
     if (wa2_diag_on()) for (u32 _lp = 0; _lp < s_d3d.draw_count && _lp < MAX_DRAWS; _lp++) {
         const D3D12DrawRecord* _dr = &s_d3d.draws[_lp];
@@ -6189,7 +6340,7 @@ static void render_frame(void)
 
     /* Lazily create the readback buffer the first time a dump is requested, or
      * for the one-shot logo stage probe. */
-    if ((s_d3d.dump_frames_left > 0 || logo_probe_batch) && !s_d3d.readback_buf) {
+    if ((s_d3d.dump_frames_left > 0 || logo_probe_batch || effect91_probe_batch) && !s_d3d.readback_buf) {
         s_d3d.readback_pitch = (s_d3d.width * 4 + 255) & ~255u;
         D3D12_HEAP_PROPERTIES hp = {0};
         hp.Type = D3D12_HEAP_TYPE_READBACK;
@@ -7391,7 +7542,7 @@ skip_dump_consider: ;
     if (s_present_this_frame)
         display_history_capture(fi);
 
-    if (dumping || logo_fb_probe) {
+    if (dumping || logo_fb_probe || effect91_probe_batch) {
         /* RT -> COPY_SOURCE, copy into the readback buffer, then -> PRESENT. */
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         barrier.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
@@ -7459,6 +7610,34 @@ skip_dump_consider: ;
             fflush(stderr);
         }
       } }
+
+    if (effect91_probe_batch && s_d3d.readback_buf) {
+        wait_for_gpu();
+        void* _p91 = NULL;
+        D3D12_RANGE _r91 = {0, (SIZE_T)s_d3d.readback_pitch * s_d3d.height};
+        if (SUCCEEDED(s_d3d.readback_buf->lpVtbl->Map(s_d3d.readback_buf, 0, &_r91, &_p91)) && _p91) {
+            memset(&s_effect91_pre, 0, sizeof(s_effect91_pre));
+            s_effect91_pre.valid = 1; s_effect91_pre.sample = effect91_sample;
+            s_effect91_pre.frame = (u32)s_d3d.frame_count;
+            s_effect91_pre.w = s_d3d.width; s_effect91_pre.h = s_d3d.height;
+            s_effect91_pre.hash = effect91_hash_rgb_d3d((const u8*)_p91, s_d3d.readback_pitch,
+                s_d3d.width, s_d3d.height, &s_effect91_pre.sum_r, &s_effect91_pre.sum_g,
+                &s_effect91_pre.sum_b, s_effect91_pre.center);
+            D3D12_RANGE _w91 = {0,0};
+            s_d3d.readback_buf->lpVtbl->Unmap(s_d3d.readback_buf, 0, &_w91);
+            u64 _n91 = (u64)s_d3d.width * s_d3d.height;
+            fprintf(stderr,
+                "[EFFECT91-PRE] sample=%u frame=%u hash=%08X mean=(%llu,%llu,%llu) center=(%u,%u,%u)\n",
+                effect91_sample, (u32)s_d3d.frame_count, s_effect91_pre.hash,
+                _n91 ? (unsigned long long)(s_effect91_pre.sum_r/_n91) : 0ull,
+                _n91 ? (unsigned long long)(s_effect91_pre.sum_g/_n91) : 0ull,
+                _n91 ? (unsigned long long)(s_effect91_pre.sum_b/_n91) : 0ull,
+                s_effect91_pre.center[0], s_effect91_pre.center[1], s_effect91_pre.center[2]);
+        } else {
+            fprintf(stderr, "[EFFECT91-PRE] sample=%u frame=%u MAP_FAILED\n",
+                    effect91_sample, (u32)s_d3d.frame_count);
+        }
+    }
 
     if (logo_fb_probe) {
         /* The copy above is ordered on the graphics queue; wait once, map, and
@@ -7691,6 +7870,13 @@ skip_dump_consider: ;
         }
         if (s_present_this_frame)
             phr = s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 1, 0); /* vsync */
+        if (effect91_probe_batch && s_present_this_frame) {
+            UINT _bb91 = s_d3d.swap_chain->lpVtbl->GetCurrentBackBufferIndex(s_d3d.swap_chain);
+            UINT _pc91 = 0;
+            (void)s_d3d.swap_chain->lpVtbl->GetLastPresentCount(s_d3d.swap_chain, &_pc91);
+            effect91_probe_composited_window((u32)s_d3d.frame_count, effect91_sample,
+                                              bb_before, _bb91, _pc91, phr);
+        }
         if (scanout_probe) {
             UINT bb_after = s_d3d.swap_chain->lpVtbl->GetCurrentBackBufferIndex(s_d3d.swap_chain);
             UINT pc = 0;
