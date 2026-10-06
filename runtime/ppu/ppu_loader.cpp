@@ -1143,6 +1143,36 @@ extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;  /* fwd decl (defined bel
 #ifndef NDEBUG
 static PPU_THREAD_LOCAL uint32_t g_last_rd_addr = 0;
 static PPU_THREAD_LOCAL uint32_t g_last_rd_val  = 0;
+
+/* WA2 v80: 0x4C280 is the clipping/remap producer for 0x4C528's default
+ * UV path.  v79 proved the shared BSS rectangle is written by 0x4C280, but
+ * its 64-store cap expired before the snow draw.  Track only the descriptor
+ * used by the bad snow draw (r30/r4 = 0x4001C520) and snapshot the complete
+ * call inputs plus all six output vectors.  This is diagnostic only. */
+struct wa2_snow_uv80_state {
+    uint32_t active, seq, desc, obj, old_sp;
+    int16_t clip_x, clip_y;
+    uint32_t p[4];
+    uint32_t in_bits[12];
+};
+static PPU_THREAD_LOCAL wa2_snow_uv80_state g_wa2_snow_uv80 = {};
+static PPU_THREAD_LOCAL uint32_t g_wa2_snow_uv80_seq = 0;
+static inline uint32_t wa2_snow80_be32(uint32_t ea)
+{
+    if (vm_oob(ea, 4)) return 0;
+    uint32_t raw = 0; memcpy(&raw, vm_base + ea, 4);
+    return __builtin_bswap32(raw);
+}
+static inline uint16_t wa2_snow80_be16(uint32_t ea)
+{
+    if (vm_oob(ea, 2)) return 0;
+    uint16_t raw = 0; memcpy(&raw, vm_base + ea, 2);
+    return __builtin_bswap16(raw);
+}
+static inline float wa2_snow80_f32(uint32_t bits)
+{
+    float f = 0.0f; memcpy(&f, &bits, 4); return f;
+}
 #endif
 /* PT=<hex>: persistent high-byte truncation detector. A write8 that turns the word
  * at some addr into <hex> (e.g. a heap ptr 0x471057A0 zeroed to 0x001057A0) is BENIGN
@@ -1374,14 +1404,58 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
         const uint32_t guest79 = __builtin_bswap32(v);
         if (ea79 == 0x01087364u) {
             static int n79m = 0;
-            if (n79m++ < 16) {
-                extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
-                const uint32_t r31 = g_active_ctx ? (uint32_t)g_active_ctx->gpr[31] : 0u;
-                const uint32_t lr  = g_active_ctx ? (uint32_t)g_active_ctx->lr : 0u;
+            extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+            const uint32_t r31 = g_active_ctx ? (uint32_t)g_active_ctx->gpr[31] : 0u;
+            const uint32_t r30 = g_active_ctx ? (uint32_t)g_active_ctx->gpr[30] : 0u;
+            const uint32_t r4  = g_active_ctx ? (uint32_t)g_active_ctx->gpr[4]  : 0u;
+            const uint32_t sp  = g_active_ctx ? (uint32_t)g_active_ctx->gpr[1]  : 0u;
+            const uint32_t lr  = g_active_ctx ? (uint32_t)g_active_ctx->lr : 0u;
+            if (n79m++ < 32) {
                 fprintf(stderr,
-                        "[SNOWUV79-MODE] n=%d ea=0x%08X guest=0x%08X r31=0x%08X lr=0x%08X\n",
-                        n79m - 1, ea79, guest79, r31, lr);
+                        "[SNOWUV79-MODE] n=%d ea=0x%08X guest=0x%08X r31=0x%08X r30=0x%08X r4=0x%08X lr=0x%08X\n",
+                        n79m - 1, ea79, guest79, r31, r30, r4, lr);
                 fflush(stderr);
+            }
+            /* The selector read at 0x4C284 happens before 0x4C280 repurposes
+             * r30/r31, so r4/r30 still identify the caller's draw descriptor.
+             * Its prologue has already done stdu r1,-0x80; recover old SP to
+             * fetch the four stack-passed input-array pointers. */
+            if (guest79 == 0u && lr == 0x0004CFF8u && r31 == 0x01087280u &&
+                r4 == 0x4001C520u && g_active_ctx) {
+                wa2_snow_uv80_state &t = g_wa2_snow_uv80;
+                memset(&t, 0, sizeof(t));
+                t.active = 1u;
+                t.seq = ++g_wa2_snow_uv80_seq;
+                t.desc = r4; t.obj = r31; t.old_sp = sp + 0x80u;
+                t.clip_x = (int16_t)wa2_snow80_be16(r4 + 0x5Cu);
+                t.clip_y = (int16_t)wa2_snow80_be16(r4 + 0x5Eu);
+                t.p[0] = wa2_snow80_be32(t.old_sp + 0x74u);
+                t.p[1] = wa2_snow80_be32(t.old_sp + 0x7Cu);
+                t.p[2] = wa2_snow80_be32(t.old_sp + 0x84u);
+                t.p[3] = wa2_snow80_be32(t.old_sp + 0x8Cu);
+                int k = 0;
+                for (int i = 0; i < 2; ++i) t.in_bits[k++] = wa2_snow80_be32(t.p[0] + (uint32_t)i * 4u);
+                for (int i = 0; i < 2; ++i) t.in_bits[k++] = wa2_snow80_be32(t.p[1] + (uint32_t)i * 4u);
+                for (int i = 0; i < 4; ++i) t.in_bits[k++] = wa2_snow80_be32(t.p[2] + (uint32_t)i * 4u);
+                for (int i = 0; i < 4; ++i) t.in_bits[k++] = wa2_snow80_be32(t.p[3] + (uint32_t)i * 4u);
+                if (t.seq <= 64u) {
+                    fprintf(stderr,
+                            "[SNOWUV80-ENTRY] seq=%u obj=0x%08X desc=0x%08X sp=0x%08X oldsp=0x%08X clip=(%d,%d) "
+                            "p=%08X/%08X/%08X/%08X\n",
+                            t.seq, t.obj, t.desc, sp, t.old_sp, (int)t.clip_x, (int)t.clip_y,
+                            t.p[0], t.p[1], t.p[2], t.p[3]);
+                    fprintf(stderr,
+                            "[SNOWUV80-IN] seq=%u A=(%.9g,%.9g) B=(%.9g,%.9g) "
+                            "C=(%.9g,%.9g,%.9g,%.9g) D=(%.9g,%.9g,%.9g,%.9g)\n",
+                            t.seq,
+                            wa2_snow80_f32(t.in_bits[0]), wa2_snow80_f32(t.in_bits[1]),
+                            wa2_snow80_f32(t.in_bits[2]), wa2_snow80_f32(t.in_bits[3]),
+                            wa2_snow80_f32(t.in_bits[4]), wa2_snow80_f32(t.in_bits[5]),
+                            wa2_snow80_f32(t.in_bits[6]), wa2_snow80_f32(t.in_bits[7]),
+                            wa2_snow80_f32(t.in_bits[8]), wa2_snow80_f32(t.in_bits[9]),
+                            wa2_snow80_f32(t.in_bits[10]), wa2_snow80_f32(t.in_bits[11]));
+                    fflush(stderr);
+                }
             }
         }
         static const uint32_t uv79ea[4] = {
@@ -1833,11 +1907,54 @@ static inline void wa2_snow_default_uv79_hit(uint32_t a, uint32_t v, int width, 
 #endif
 }
 
+static inline void wa2_snow_uv80_write_hit(uint32_t a, uint32_t v, int width)
+{
+#ifndef NDEBUG
+    wa2_snow_uv80_state &t = g_wa2_snow_uv80;
+    if (!t.active || width != 4) return;
+    if (a < 0x0110B200u || a > 0x0110B23Cu || ((a - 0x0110B200u) & 3u)) return;
+    /* +0x23C is the last stfs in 0x4C280's output sequence. barrier_watch_hit
+     * runs before the store commits, so substitute the incoming value for that
+     * one dword while reading the already-committed preceding outputs. */
+    if (a != 0x0110B23Cu) return;
+    uint32_t o[16];
+    for (int i = 0; i < 16; ++i) o[i] = wa2_snow80_be32(0x0110B200u + (uint32_t)i * 4u);
+    o[15] = v;
+    if (t.seq <= 64u) {
+        fprintf(stderr,
+                "[SNOWUV80-RECT] seq=%u desc=0x%08X clip=(%d,%d) "
+                "uv=(%.9g,%.9g)(%.9g,%.9g) alt=(%.9g,%.9g,%.9g,%.9g) "
+                "posX=(%.9g,%.9g,%.9g,%.9g) posY=(%.9g,%.9g,%.9g,%.9g)\n",
+                t.seq, t.desc, (int)t.clip_x, (int)t.clip_y,
+                wa2_snow80_f32(o[0]), wa2_snow80_f32(o[4]),
+                wa2_snow80_f32(o[2]), wa2_snow80_f32(o[6]),
+                wa2_snow80_f32(o[1]), wa2_snow80_f32(o[3]),
+                wa2_snow80_f32(o[5]), wa2_snow80_f32(o[7]),
+                wa2_snow80_f32(o[8]), wa2_snow80_f32(o[9]),
+                wa2_snow80_f32(o[10]), wa2_snow80_f32(o[11]),
+                wa2_snow80_f32(o[12]), wa2_snow80_f32(o[13]),
+                wa2_snow80_f32(o[14]), wa2_snow80_f32(o[15]));
+        if (o[0] == 0x00000000u && o[2] == 0x42000000u &&
+            o[4] == 0x42000000u && o[6] == 0x43000000u) {
+            fprintf(stderr, "[SNOWUV80-TARGET] seq=%u exact vertex UV rectangle 0,32/32,32/0,128/32,128\n", t.seq);
+            extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+            extern void ppu_dump_guest_stack(ppu_context*, const char*);
+            if (g_active_ctx) ppu_dump_guest_stack(g_active_ctx, "snowuv80-target");
+        }
+        fflush(stderr);
+    }
+    t.active = 0u;
+#else
+    (void)a; (void)v; (void)width;
+#endif
+}
+
 static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra)
 {
     wa2_uv_probe_hit(a, v, width, ra);
     wa2_snow_object_uv_hit(a, v, width, ra);
     wa2_snow_default_uv79_hit(a, v, width, ra);
+    wa2_snow_uv80_write_hit(a, v, width);
 #ifdef NDEBUG
     (void)a; (void)v; (void)width; (void)ra;
 #else
