@@ -6118,6 +6118,66 @@ static void render_frame(void)
         }
 
         if (snow_n) {
+            /* v92: detect two complete WA2 snow/effect frame groups being
+             * recorded into one host render batch.  The normal visible group
+             * has one background composite (0x052ECA00), N snow sprites
+             * (0x0368E500), then one each of the three tail overlays.  A
+             * duplicate delimiter set inside one draw_count is strong evidence
+             * that two guest frames were blended before one Present. */
+            u32 _g_bg = 0, _g_snow = 0, _g_ta = 0, _g_tb = 0, _g_tc = 0;
+            u32 _g_first_bg = 0xFFFFFFFFu, _g_second_bg = 0xFFFFFFFFu;
+            u32 _g_first_tc = 0xFFFFFFFFu, _g_second_tc = 0xFFFFFFFFu;
+            for (u32 _q = 0; _q < s_d3d.draw_count && _q < MAX_DRAWS; ++_q) {
+                const D3D12DrawRecord* _r = &s_d3d.draws[_q];
+                const u32 _t = _r->tex[0].raw;
+                if (_t == 0x052ECA00u) {
+                    if (!_g_bg) _g_first_bg = _q; else if (_g_bg == 1u) _g_second_bg = _q;
+                    _g_bg++;
+                }
+                if (_t == 0x0368E500u) _g_snow++;
+                if (_t == 0x0571AA00u) _g_ta++;
+                if (_t == 0x01CA4380u) _g_tb++;
+                if (_t == 0x01CEA280u) {
+                    if (!_g_tc) _g_first_tc = _q; else if (_g_tc == 1u) _g_second_tc = _q;
+                    _g_tc++;
+                }
+            }
+            const int _g_dup = (_g_bg > 1u || _g_ta > 1u || _g_tb > 1u || _g_tc > 1u);
+            const int _g_sample = (snow_diag_frames < 8u) || ((snow_diag_frames % 15u) == 0u) || _g_dup;
+            if (_g_sample) {
+                extern unsigned cellGcm_flip_request_count(void);
+                fprintf(stderr,
+                    "[SNOW92-GROUP] frame=%u draws=%u bg=%u snowtex=%u tail=%u/%u/%u "
+                    "bgidx=%u/%u tcidx=%u/%u fc=%u lastflip=%u origin=%d dup=%d%c",
+                    (unsigned)s_d3d.frame_count, (unsigned)s_d3d.draw_count,
+                    _g_bg, _g_snow, _g_ta, _g_tb, _g_tc,
+                    _g_first_bg, _g_second_bg, _g_first_tc, _g_second_tc,
+                    cellGcm_flip_request_count(), s_last_present_flip, s_present_origin, _g_dup, 10);
+            }
+            if (_g_dup) {
+                fprintf(stderr, "[SNOW92-DUP-BEGIN] frame=%u draws=%u%c",
+                        (unsigned)s_d3d.frame_count, (unsigned)s_d3d.draw_count, 10);
+                for (u32 _q = 0; _q < s_d3d.draw_count && _q < MAX_DRAWS; ++_q) {
+                    const D3D12DrawRecord* _r = &s_d3d.draws[_q];
+                    float _a = -1.0f;
+                    float _x = 0.0f, _y = 0.0f;
+                    if (_r->is_vp && !_r->is_clear && _r->vertex_count && s_d3d.vp_vb_mapped) {
+                        const float* _v = (const float*)((const char*)s_d3d.vp_vb_mapped
+                            + (u64)s_d3d.vp_parity * MAX_VERTICES * 256u
+                            + _r->vb_byte_offset);
+                        _x = _v[0]; _y = _v[1]; _a = _v[15];
+                    }
+                    fprintf(stderr,
+                        "[SNOW92-DRAW] d=%u clr=%d rt=%08X fp=%08X tex=%08X vc=%u "
+                        "epoch=%u begin=%u p0=(%.3f,%.3f) a=%.6f%c",
+                        _q, _r->is_clear, _r->rt_off, _r->fp_addr, _r->tex[0].raw,
+                        _r->vertex_count, _r->flip_ready_epoch, _r->begin_epoch,
+                        (double)_x, (double)_y, (double)_a, 10);
+                }
+                fprintf(stderr, "[SNOW92-DUP-END] frame=%u%c",
+                        (unsigned)s_d3d.frame_count, 10);
+            }
+
             int _emit = (snow_diag_frames < 16u) || ((s_d3d.frame_count % 120u) == 0u);
             if (_emit) {
                 fprintf(stderr,
