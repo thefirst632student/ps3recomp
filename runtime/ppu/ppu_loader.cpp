@@ -1962,12 +1962,59 @@ static inline void wa2_snow_uv80_write_hit(uint32_t a, uint32_t v, int width)
 #endif
 }
 
+static inline void wa2_snow_uv83_target_state_hit(uint32_t a, uint32_t v, int width, void* ra)
+{
+#ifndef NDEBUG
+    if (width != 4) return;
+    static const uint32_t ea83[4] = {
+        0x0110B200u, 0x0110B208u, 0x0110B210u, 0x0110B218u
+    };
+    int slot = -1;
+    for (int i = 0; i < 4; ++i) if (a == ea83[i]) { slot = i; break; }
+    if (slot < 0) return;
+
+    /* barrier_watch_hit runs before the store commits. Read the other three
+     * dwords from guest memory and substitute the incoming value for this one.
+     * This catches the exact transition into the snow rectangle regardless of
+     * which guest function produced it. */
+    uint32_t q[4];
+    for (int i = 0; i < 4; ++i) q[i] = wa2_snow80_be32(ea83[i]);
+    q[slot] = v;
+    if (q[0] != 0x00000000u || q[1] != 0x42000000u ||
+        q[2] != 0x42000000u || q[3] != 0x43000000u) return;
+
+    static unsigned hit = 0;
+    if (hit >= 8u) return;
+    const unsigned n = hit++;
+    const uint32_t fn = ppu_prof_resolve_host(ra);
+    extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+    const uint32_t lr  = g_active_ctx ? (uint32_t)g_active_ctx->lr : 0u;
+    const uint32_t r3  = g_active_ctx ? (uint32_t)g_active_ctx->gpr[3] : 0u;
+    const uint32_t r4  = g_active_ctx ? (uint32_t)g_active_ctx->gpr[4] : 0u;
+    const uint32_t r30 = g_active_ctx ? (uint32_t)g_active_ctx->gpr[30] : 0u;
+    const uint32_t r31 = g_active_ctx ? (uint32_t)g_active_ctx->gpr[31] : 0u;
+    fprintf(stderr,
+            "[SNOWUV83-TARGET-STATE] hit=%u slot=%d ea=0x%08X incoming=0x%08X "
+            "uv=%08X/%08X/%08X/%08X guest-fn=0x%08X lr=0x%08X "
+            "r3=0x%08X r4=0x%08X r30=0x%08X r31=0x%08X\n",
+            n, slot, a, v, q[0], q[1], q[2], q[3], fn, lr, r3, r4, r30, r31);
+    if (g_active_ctx) {
+        extern void ppu_dump_guest_stack(ppu_context*, const char*);
+        ppu_dump_guest_stack(g_active_ctx, "snowuv83-target-state");
+    }
+    fflush(stderr);
+#else
+    (void)a; (void)v; (void)width; (void)ra;
+#endif
+}
+
 static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra)
 {
     wa2_uv_probe_hit(a, v, width, ra);
     wa2_snow_object_uv_hit(a, v, width, ra);
     wa2_snow_default_uv79_hit(a, v, width, ra);
     wa2_snow_uv80_write_hit(a, v, width);
+    wa2_snow_uv83_target_state_hit(a, v, width, ra);
 #ifdef NDEBUG
     (void)a; (void)v; (void)width; (void)ra;
 #else
