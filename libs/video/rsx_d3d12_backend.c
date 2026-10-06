@@ -4760,6 +4760,9 @@ typedef struct D3D12DisplayBlitOp {
     u32 w, h;              /* logical destination dimensions */
     u32 store_w, store_h;  /* physical snapshot dimensions */
     u32 src_kind;          /* 1 = offscreen RT, 2 = live display */
+    u32 origin;            /* NV3089 IMAGE_IN_FORMAT bits 16..23 */
+    u32 interp;            /* 0 = ZOH/nearest, 1 = FOH/linear */
+    u32 ds_dx, dt_dy;      /* RSX 20.12 source step */
     int src_rt;
     int dst_rt;
     int done;
@@ -4768,7 +4771,8 @@ typedef struct D3D12DisplayBlitOp {
 #define MAX_DISPLAY_BLIT_OPS 256
 static D3D12DisplayBlitOp s_display_blit_ops[MAX_DISPLAY_BLIT_OPS];
 static u32 s_display_blit_count = 0;
-static ID3D12PipelineState* s_nv3089_scale_pso = NULL;
+static ID3D12PipelineState* s_nv3089_scale_pso = NULL;       /* FOH/linear */
+static ID3D12PipelineState* s_nv3089_scale_point_pso = NULL; /* ZOH/nearest */
 
 /* Ordered RSX 2D blits whose source is a GPU render target.
  *
@@ -4831,9 +4835,11 @@ int rsx_d3d12_note_nv3089_blit(u32 src_raw, u32 dst_raw,
                                u32 out_x, u32 out_y,
                                u32 out_w, u32 out_h,
                                u32 in_uv, u32 ds_dx, u32 dt_dy,
-                               u32 fmt)
+                               u32 in_fmt, u32 fmt)
 {
     if (!src_raw || !dst_raw || !out_w || !out_h) return 0;
+    const u32 nv90_origin = (in_fmt >> 16) & 0xFFu;
+    const u32 nv90_interp = (in_fmt >> 24) & 0xFFu;
 
     /* Any later CPU-backed write to the same destination invalidates an older
      * GPU alias.  Re-add it below only when this exact source is GPU-backed. */
@@ -4861,6 +4867,14 @@ int rsx_d3d12_note_nv3089_blit(u32 src_raw, u32 dst_raw,
                   dst_raw, src_raw, in_w, in_h, out_w, out_h, out_x, out_y,
                   in_uv, ds_dx, dt_dy, gpu_src, rw, rh, fmt, 10); }
     if (!gpu_src) return 0;
+
+    { static int nv90_n = 0;
+      if (nv90_n++ < 48)
+          fprintf(stderr,
+                  "[NV3089-INTERP90] src=0x%08X dst=0x%08X inFmt=0x%08X pitch=%u origin=%u interp=%u(%s) in=%ux%u out=%ux%u scale=%08X/%08X gpu=%d%c",
+                  src_raw, dst_raw, in_fmt, in_fmt & 0xFFFFu, nv90_origin,
+                  nv90_interp, nv90_interp == 0 ? "ZOH" : (nv90_interp == 1 ? "FOH" : "UNKNOWN"),
+                  in_w, in_h, out_w, out_h, ds_dx, dt_dy, gpu_src, 10); }
 
     /* Direct normalized sampling is equivalent to a full-image scale only.
      * Subrect/atlas blits still need the CPU path (or a future explicit GPU
@@ -4924,6 +4938,10 @@ int rsx_d3d12_note_nv3089_blit(u32 src_raw, u32 dst_raw,
         op->store_w = out_w;
         op->store_h = out_h;
         op->src_kind = (u32)gpu_src;
+        op->origin = nv90_origin;
+        op->interp = nv90_interp;
+        op->ds_dx = ds_dx;
+        op->dt_dy = dt_dy;
         op->src_rt = -1;
         op->dst_rt = -1;
         op->done = 0;
@@ -5339,35 +5357,60 @@ static void display_blit_seed_framebuffer(u32 fi)
  * Render a fullscreen triangle into the real destination-sized RT instead. */
 static int nv3089_scale_pso_ensure(void)
 {
-    if (s_nv3089_scale_pso) return 1;
+    if (s_nv3089_scale_pso && s_nv3089_scale_point_pso) return 1;
     if (!s_d3d.device || !s_d3d.root_signature) return 0;
 
+    /* b0 is vertex-visible in the simple root signature.  p0.xy is a UV bias
+     * and p0.zw is a UV scale.  FOH uses (0,0,1,1).  ZOH uses the guest's
+     * fixed-point ds/dx,dt/dy so Texture2D.Load addresses the exact source
+     * texel selected by NV3089 rather than the pixel-centre shifted texel that
+     * a normalized point sample would select during a 2:1 downscale. */
     static const char vs[] =
+        "cbuffer S:register(b0){float4 p0;float4 p1;float4 p2;float4 p3;}\n"
         "struct O{float4 p:SV_POSITION;float2 uv:TEXCOORD0;};\n"
         "O main(uint id:SV_VertexID){O o;float2 uv=float2((id<<1)&2,id&2);"
-        "o.p=float4(uv*float2(2,-2)+float2(-1,1),0,1);o.uv=uv;return o;}\n";
-    static const char ps[] =
+        "o.p=float4(uv*float2(2,-2)+float2(-1,1),0,1);"
+        "o.uv=uv*p0.zw+p0.xy;return o;}\n";
+    static const char ps_linear[] =
         "Texture2D t0:register(t0);SamplerState s0:register(s0);\n"
         "float4 main(float4 p:SV_POSITION,float2 uv:TEXCOORD0):SV_TARGET{"
         "return t0.SampleLevel(s0,uv,0);}\n";
+    static const char ps_point[] =
+        "Texture2D t0:register(t0);\n"
+        "float4 main(float4 p:SV_POSITION,float2 uv:TEXCOORD0):SV_TARGET{"
+        "uint w,h;t0.GetDimensions(w,h);"
+        "int2 q=int2(floor(uv*float2(w,h)));"
+        "q=clamp(q,int2(0,0),int2((int)w-1,(int)h-1));"
+        "return t0.Load(int3(q,0));}\n";
 
-    ID3DBlob *vb = NULL, *pb = NULL, *eb = NULL;
+    ID3DBlob *vb = NULL, *pl = NULL, *pp = NULL, *eb = NULL;
     HRESULT hr = D3DCompile(vs, sizeof(vs)-1, "nv3089_scale_vs", NULL, NULL,
                             "main", "vs_5_0", 0, 0, &vb, &eb);
     if (FAILED(hr)) {
-        if (eb) { fprintf(stderr, "[NV3089-SCALE] VS compile failed: %s%c",
+        if (eb) { fprintf(stderr, "[NV3089-SCALE90] VS compile failed: %s%c",
                            (const char*)eb->lpVtbl->GetBufferPointer(eb), 10);
                   eb->lpVtbl->Release(eb); }
         return 0;
     }
     if (eb) { eb->lpVtbl->Release(eb); eb = NULL; }
-    hr = D3DCompile(ps, sizeof(ps)-1, "nv3089_scale_ps", NULL, NULL,
-                    "main", "ps_5_0", 0, 0, &pb, &eb);
+    hr = D3DCompile(ps_linear, sizeof(ps_linear)-1, "nv3089_scale_foh_ps", NULL, NULL,
+                    "main", "ps_5_0", 0, 0, &pl, &eb);
     if (FAILED(hr)) {
-        if (eb) { fprintf(stderr, "[NV3089-SCALE] PS compile failed: %s%c",
+        if (eb) { fprintf(stderr, "[NV3089-SCALE90] FOH PS compile failed: %s%c",
                            (const char*)eb->lpVtbl->GetBufferPointer(eb), 10);
                   eb->lpVtbl->Release(eb); }
         vb->lpVtbl->Release(vb);
+        return 0;
+    }
+    if (eb) { eb->lpVtbl->Release(eb); eb = NULL; }
+    hr = D3DCompile(ps_point, sizeof(ps_point)-1, "nv3089_scale_zoh_ps", NULL, NULL,
+                    "main", "ps_5_0", 0, 0, &pp, &eb);
+    if (FAILED(hr)) {
+        if (eb) { fprintf(stderr, "[NV3089-SCALE90] ZOH PS compile failed: %s%c",
+                           (const char*)eb->lpVtbl->GetBufferPointer(eb), 10);
+                  eb->lpVtbl->Release(eb); }
+        vb->lpVtbl->Release(vb);
+        pl->lpVtbl->Release(pl);
         return 0;
     }
     if (eb) eb->lpVtbl->Release(eb);
@@ -5376,8 +5419,6 @@ static int nv3089_scale_pso_ensure(void)
     pd.pRootSignature = s_d3d.root_signature;
     pd.VS.pShaderBytecode = vb->lpVtbl->GetBufferPointer(vb);
     pd.VS.BytecodeLength = vb->lpVtbl->GetBufferSize(vb);
-    pd.PS.pShaderBytecode = pb->lpVtbl->GetBufferPointer(pb);
-    pd.PS.BytecodeLength = pb->lpVtbl->GetBufferSize(pb);
     pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     pd.RasterizerState.DepthClipEnable = TRUE;
@@ -5390,21 +5431,35 @@ static int nv3089_scale_pso_ensure(void)
     pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     pd.SampleDesc.Count = 1;
 
+    pd.PS.pShaderBytecode = pl->lpVtbl->GetBufferPointer(pl);
+    pd.PS.BytecodeLength = pl->lpVtbl->GetBufferSize(pl);
     hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
         s_d3d.device, &pd, &IID_ID3D12PipelineState,
         (void**)&s_nv3089_scale_pso);
-    vb->lpVtbl->Release(vb);
-    pb->lpVtbl->Release(pb);
     if (FAILED(hr)) {
-        fprintf(stderr, "[NV3089-SCALE] PSO creation failed 0x%08lX%c", hr, 10);
+        fprintf(stderr, "[NV3089-SCALE90] FOH PSO creation failed 0x%08lX%c", hr, 10);
         s_nv3089_scale_pso = NULL;
-        return 0;
     }
-    fprintf(stderr, "[NV3089-SCALE] GPU scaler ready%c", 10);
+
+    pd.PS.pShaderBytecode = pp->lpVtbl->GetBufferPointer(pp);
+    pd.PS.BytecodeLength = pp->lpVtbl->GetBufferSize(pp);
+    hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
+        s_d3d.device, &pd, &IID_ID3D12PipelineState,
+        (void**)&s_nv3089_scale_point_pso);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[NV3089-SCALE90] ZOH PSO creation failed 0x%08lX%c", hr, 10);
+        s_nv3089_scale_point_pso = NULL;
+    }
+
+    vb->lpVtbl->Release(vb);
+    pl->lpVtbl->Release(pl);
+    pp->lpVtbl->Release(pp);
+    if (!s_nv3089_scale_pso || !s_nv3089_scale_point_pso) return 0;
+    fprintf(stderr, "[NV3089-SCALE90] GPU scaler ready (ZOH+FOH)%c", 10);
     return 1;
 }
 
-static int nv3089_scale_rt(int src_rt, int dst_rt)
+static int nv3089_scale_rt(int src_rt, int dst_rt, u32 interp, u32 ds_dx, u32 dt_dy)
 {
     if (src_rt < 0 || src_rt >= MAX_OFF_RTS ||
         dst_rt < 0 || dst_rt >= MAX_OFF_RTS || src_rt == dst_rt)
@@ -5417,6 +5472,10 @@ static int nv3089_scale_rt(int src_rt, int dst_rt)
         !s_d3d.srv_heap || !nv3089_scale_pso_ensure())
         return 0;
 
+    const int zoh = (interp == 0u);
+    /* Unknown values stay on the old FOH/linear path rather than guessing. */
+    ID3D12PipelineState* scale_pso = zoh ? s_nv3089_scale_point_pso : s_nv3089_scale_pso;
+
     off_rt_transition(src_rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     off_rt_transition(dst_rt, D3D12_RESOURCE_STATE_RENDER_TARGET);
 
@@ -5424,10 +5483,28 @@ static int nv3089_scale_rt(int src_rt, int dst_rt)
     s_d3d.cmd_list->lpVtbl->SetDescriptorHeaps(s_d3d.cmd_list, 1, heaps);
     s_d3d.cmd_list->lpVtbl->SetGraphicsRootSignature(
         s_d3d.cmd_list, s_d3d.root_signature);
-    s_d3d.cmd_list->lpVtbl->SetPipelineState(
-        s_d3d.cmd_list, s_nv3089_scale_pso);
+    s_d3d.cmd_list->lpVtbl->SetPipelineState(s_d3d.cmd_list, scale_pso);
     s_d3d.cmd_list->lpVtbl->IASetPrimitiveTopology(
         s_d3d.cmd_list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    float p0[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
+    if (zoh && src->w && src->h && dst->w && dst->h) {
+        const float step_x = (float)ds_dx / 1048576.0f;
+        const float step_y = (float)dt_dy / 1048576.0f;
+        p0[2] = step_x * (float)dst->w / (float)src->w;
+        p0[3] = step_y * (float)dst->h / (float)src->h;
+        p0[0] = -0.5f * step_x / (float)src->w;
+        p0[1] = -0.5f * step_y / (float)src->h;
+    }
+    s_d3d.cmd_list->lpVtbl->SetGraphicsRoot32BitConstants(
+        s_d3d.cmd_list, 0, 4, p0, 0);
+
+    { static int nv90_s = 0; if (nv90_s++ < 64)
+        fprintf(stderr,
+                "[NV3089-SCALE90] src=%ux%u dst=%ux%u interp=%u(%s) step=%08X/%08X uvbias=%g,%g uvscale=%g,%g%c",
+                src->w, src->h, dst->w, dst->h, interp,
+                zoh ? "ZOH" : (interp == 1u ? "FOH" : "UNKNOWN->FOH"),
+                ds_dx, dt_dy, p0[0], p0[1], p0[2], p0[3], 10); }
 
     D3D12_GPU_DESCRIPTOR_HANDLE gh;
     s_d3d.srv_heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_d3d.srv_heap, &gh);
@@ -5499,7 +5576,8 @@ static int display_blit_replay_until(u32 draw_pos, u32 fi)
                     s_d3d.cmd_list, dr->res, sr->res);
                 off_rt_transition(op->src_rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                 off_rt_transition(op->dst_rt, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-            } else if (nv3089_scale_rt(op->src_rt, op->dst_rt)) {
+            } else if (nv3089_scale_rt(op->src_rt, op->dst_rt,
+                                         op->interp, op->ds_dx, op->dt_dy)) {
                 changed_om = 1;
             } else {
                 static int sf = 0;
@@ -9756,6 +9834,7 @@ void rsx_d3d12_backend_shutdown(void)
     if (s_d3d.pipeline_state_lines)  s_d3d.pipeline_state_lines->lpVtbl->Release(s_d3d.pipeline_state_lines);
     if (s_d3d.pipeline_state_points) s_d3d.pipeline_state_points->lpVtbl->Release(s_d3d.pipeline_state_points);
     if (s_nv3089_scale_pso) { s_nv3089_scale_pso->lpVtbl->Release(s_nv3089_scale_pso); s_nv3089_scale_pso = NULL; }
+    if (s_nv3089_scale_point_pso) { s_nv3089_scale_point_pso->lpVtbl->Release(s_nv3089_scale_point_pso); s_nv3089_scale_point_pso = NULL; }
     if (s_d3d.depth_buffer) s_d3d.depth_buffer->lpVtbl->Release(s_d3d.depth_buffer);
     if (s_d3d.dsv_heap)     s_d3d.dsv_heap->lpVtbl->Release(s_d3d.dsv_heap);
     if (s_d3d.root_signature) s_d3d.root_signature->lpVtbl->Release(s_d3d.root_signature);
@@ -10015,11 +10094,11 @@ int rsx_d3d12_note_nv3089_blit(u32 src_raw, u32 dst_raw,
                                u32 out_x, u32 out_y,
                                u32 out_w, u32 out_h,
                                u32 in_uv, u32 ds_dx, u32 dt_dy,
-                               u32 fmt)
+                               u32 in_fmt, u32 fmt)
 {
     (void)src_raw; (void)dst_raw; (void)in_w; (void)in_h;
     (void)out_x; (void)out_y; (void)out_w; (void)out_h;
-    (void)in_uv; (void)ds_dx; (void)dt_dy; (void)fmt;
+    (void)in_uv; (void)ds_dx; (void)dt_dy; (void)in_fmt; (void)fmt;
     return 0;
 }
 

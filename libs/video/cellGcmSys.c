@@ -928,7 +928,7 @@ extern int rsx_d3d12_note_nv3089_blit(u32 src_raw, u32 dst_raw,
                                       u32 out_x, u32 out_y,
                                       u32 out_w, u32 out_h,
                                       u32 in_uv, u32 ds_dx, u32 dt_dy,
-                                      u32 fmt);
+                                      u32 in_fmt, u32 fmt);
 
 static struct {
     u32 dst_dma;      /* NV3062 0x0188 SET_CONTEXT_DMA_IMAGE_DESTIN */
@@ -1077,7 +1077,15 @@ static void nv3089_blit(void)
         if (rsx_d3d12_note_nv3089_blit(s_nv3089.in_off, s_gcm2d.dst_offset,
                                        in_w, in_h, out_x, out_y, out_w, out_h,
                                        s_nv3089.in_uv, s_nv3089.ds_dx,
-                                       s_nv3089.dt_dy, f)) {
+                                       s_nv3089.dt_dy, s_nv3089.in_fmt, f)) {
+            { static int nv90_in = 0; if (nv90_in++ < 48)
+                fprintf(stderr,
+                        "[NV3089-IN90] inFmt=0x%08X pitch=%u origin=%u interp=%u in=%ux%u out=%ux%u scale=%08X/%08X%c",
+                        s_nv3089.in_fmt, s_nv3089.in_fmt & 0xFFFFu,
+                        (s_nv3089.in_fmt >> 16) & 0xFFu,
+                        (s_nv3089.in_fmt >> 24) & 0xFFu,
+                        in_w, in_h, out_w, out_h,
+                        s_nv3089.ds_dx, s_nv3089.dt_dy, 10); }
             return;
         }
     }
