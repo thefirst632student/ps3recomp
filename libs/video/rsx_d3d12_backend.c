@@ -5772,6 +5772,7 @@ static int s_present_seen_content = 0;
 /* Diagnostic provenance for render_frame().  Multiple host paths can drive a
  * frame; keeping the origin lets scanout probes distinguish an authoritative
  * flip-boundary present from a clear-boundary or legacy callback. */
+static unsigned s_last_present_flip = 0;
 static int s_present_origin = 0; /* 1=legacy callback, 2=clear boundary, 3=ticker */
 
 /* Resolve a DRAW_*_TEX value: a hex raw offset, or the literal "duck" for the
@@ -8005,7 +8006,6 @@ static void d3d12_end_frame(void* ud)
 
 static u32 s_dbg_clears_since_present = 0;   /* CELLMARK_BLINKDBG */
 static u32 s_clear_presents = 0;   /* presents issued at clear (frame boundary) */
-static unsigned s_last_present_flip = 0;
 
 /* FRAME_BUDGET=1: how much geometry a guest frame actually asks for, versus
  * what the per-frame vertex buffer can hold. A frame that overflows is silently
