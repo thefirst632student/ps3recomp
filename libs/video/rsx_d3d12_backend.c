@@ -3464,7 +3464,7 @@ static int vp_sampler_table_for_draw(const D3D12DrawRecord* dr)
     return (int)idx;
 }
 
-static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, u32 guest_pitch, int cube, u32 mips)
+static int vp_upload_tex_slot(u32 off, u32 raw_off, u32 w, u32 h, u32 fmt, u32 guest_pitch, int cube, u32 mips)
 {
     /* TEX_BUDGET=<n>: cap texture uploads per frame. Off by default -- it was
      * tried against the TDR and does not help, because PERF shows the upload
@@ -3782,18 +3782,22 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, u32 guest_pitch, i
                        rsx_texture_argb_is_rgba());
 
 
-    /* WA2 v84: independent parity check for the snow atlas decoder.
+    /* WA2 v85: independent parity check for the snow atlas decoder.
      * CPU/PPU tracing established that the guest intentionally draws the
      * 32x96 region (0,32)-(32,128) of this 64x128 texture.  Compare the host
      * upload produced above against a second, deliberately independent
      * implementation of RPCS3's convert_linear_swizzle<T,true> scan plus
      * A4R4G4B4 unpacking.  This is observational only: no texels are changed. */
-    if (wa2_diag_on() && !cube && tl.swizzled && tl.base_format == 0x83u &&
+    /* v84 accidentally compared key_off (the resolved EA) with the raw RSX
+     * offset and also inherited the opt-in WA2_WARN_DIAG gate.  raw_off is
+     * carried explicitly now, so this one-shot probe self-arms on the exact
+     * guest texture regardless of cache/address-space resolution. */
+    if (!cube && tl.swizzled && tl.base_format == 0x83u &&
         w == 64u && h == 128u &&
-        ((key_off & 0x0FFFFFFFu) == 0x0368E500u)) {
-        static int snow84_done = 0;
-        if (!snow84_done) {
-            snow84_done = 1;
+        ((raw_off & 0x7FFFFFFFu) == 0x0368E500u)) {
+        static int snow85_done = 0;
+        if (!snow85_done) {
+            snow85_done = 1;
             const u8* src84 = vm_base + off;
             const u32 logw84 = rsx_log2_ceil(w);
             const u32 logh84 = rsx_log2_ceil(h);
@@ -3845,15 +3849,15 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, u32 guest_pitch, i
                 if (offy84 == 0u) offx0_84 += yincr84;
             }
             fprintf(stderr,
-                    "[SNOWTEX84-RPCS3-CMP] off=0x%08X key=0x%08X 64x128 fmt=0x%02X "
+                    "[SNOWTEX85-RPCS3-CMP] ea=0x%08X raw=0x%08X 64x128 fmt=0x%02X "
                     "pitch=%u mismatches=%u first=(%u,%u) cur=%02X%02X%02X%02X "
                     "ref=%02X%02X%02X%02X argbAsRgba=%d\n",
-                    off, key_off, tl.base_format, pitch, mism84, first_x84, first_y84,
+                    off, raw_off, tl.base_format, pitch, mism84, first_x84, first_y84,
                     first_cur84[0], first_cur84[1], first_cur84[2], first_cur84[3],
                     first_ref84[0], first_ref84[1], first_ref84[2], first_ref84[3],
                     rsx_texture_argb_is_rgba());
             fprintf(stderr,
-                    "[SNOWTEX84-CELLS] "
+                    "[SNOWTEX85-CELLS] "
                     "c0=%08X/%08X a=%u/%u c1=%08X/%08X a=%u/%u "
                     "c2=%08X/%08X a=%u/%u c3=%08X/%08X a=%u/%u "
                     "c4=%08X/%08X a=%u/%u c5=%08X/%08X a=%u/%u "
@@ -6351,8 +6355,8 @@ static void render_frame(void)
                 if (dr->tex[_u].off && vp_texture_base_supported(_bf)) {
                     double _tt = perf_on() ? perf_now() : 0.0;
                     int _cube = dr->tex[_u].cube && (dr_cube_mask(dr) & (1u << _u));
-                    int ts = vp_upload_tex_slot(dr->tex[_u].off, dr->tex[_u].w,
-                                                dr->tex[_u].h, dr->tex[_u].fmt, dr->tex[_u].pitch,
+                    int ts = vp_upload_tex_slot(dr->tex[_u].off, dr->tex[_u].raw,
+                                                dr->tex[_u].w, dr->tex[_u].h, dr->tex[_u].fmt, dr->tex[_u].pitch,
                                                 _cube, dr->tex[_u].mips);
                     if (perf_on()) { s_perf_tex += perf_now() - _tt; s_perf_ntex++;
                         s_perf_texbytes += (u64)dr->tex[_u].w * dr->tex[_u].h * 4u; }
@@ -9151,6 +9155,44 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
                       for (u32 i = 0; i < head; i++) fprintf(stderr, "%02X", vm_base[ea+i]);
                       fputc(10, stderr);
                   }
+              }
+          }
+          /* WA2 v85: RPCS3 resolves texture.offset() strictly through
+           * texture.location().  Our compatibility resolver may choose IO
+           * first, so expose both addresses for the exact snow atlas. */
+          if (offset == 0x0368E500u && width == 64u && height == 128u &&
+              base_fmt == 0x83u) {
+              static int snow85_resolve_done = 0;
+              if (!snow85_resolve_done) {
+                  snow85_resolve_done = 1;
+                  u32 loc_bits = tex->format & 3u;
+                  u32 ea_local = cellGcmResolveLocated(1, offset);
+                  u32 ea_main  = cellGcmResolveLocated(0, offset);
+                  u32 ea_io    = cellGcmResolveIO(offset);
+                  u32 ea_rpc3  = (loc_bits == 1u) ? ea_local :
+                                 (loc_bits == 2u) ? ea_main : 0u;
+                  rsx_tex_layout sl85;
+                  rsx_texture_layout_pitched(format, width, height,
+                                             tex->control3 & 0xFFFFu, &sl85);
+                  u32 bytes85 = sl85.row_bytes * sl85.rows;
+                  u32 cs_chosen = (_r && _r < 0xE0000000u) ?
+                                  tex_csum(vm_base + _r, bytes85) : 0u;
+                  u32 cs_rpc3 = (ea_rpc3 && ea_rpc3 < 0xE0000000u) ?
+                                tex_csum(vm_base + ea_rpc3, bytes85) : 0u;
+                  u32 cs_local = (ea_local && ea_local < 0xE0000000u) ?
+                                 tex_csum(vm_base + ea_local, bytes85) : 0u;
+                  u32 cs_main = (ea_main && ea_main < 0xE0000000u) ?
+                                tex_csum(vm_base + ea_main, bytes85) : 0u;
+                  u32 cs_io = (ea_io && ea_io < 0xE0000000u) ?
+                              tex_csum(vm_base + ea_io, bytes85) : 0u;
+                  fprintf(stderr,
+                          "[SNOWTEX85-RESOLVE] raw=0x%08X fmtreg=0x%08X fmt=0x%02X "
+                          "locbits=%u chosen=0x%08X rpc3=0x%08X local=0x%08X main=0x%08X io=0x%08X "
+                          "bytes=%u csum(chosen/rpc3/local/main/io)=%08X/%08X/%08X/%08X/%08X match=%d\n",
+                          offset, tex->format, format, loc_bits, _r, ea_rpc3, ea_local,
+                          ea_main, ea_io, bytes85, cs_chosen, cs_rpc3, cs_local,
+                          cs_main, cs_io, (_r == ea_rpc3));
+                  fflush(stderr);
               }
           }
           s_d3d.cur_texs[unit].off = _r; }
