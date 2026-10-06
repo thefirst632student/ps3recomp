@@ -279,14 +279,6 @@ endif()
 #     default; a PPC fmadd is spelt as one where the lifter means one.
 #   - /bigobj on MSVC. A single lifted file routinely passes the 65,536-section
 #     limit of the default object format.
-# WA2 v78 diagnostic: force every lifted PPU translation unit to call a
-# uniquely-named vm_read32 wrapper.  This is a compile-time redirect only for
-# generated sources; runtime/scaffold files keep calling the normal vm_read32.
-# It lets us prove which memory-read symbol the lifted code actually binds to
-# without editing anything under recompiled/.
-set_source_files_properties(${RECOMP_SOURCES} PROPERTIES
-    COMPILE_DEFINITIONS "vm_read32=vm_read32_trace78")
-
 if(MSVC)
     set_source_files_properties(${RECOMP_SOURCES} PROPERTIES
         COMPILE_OPTIONS "/w;/bigobj")

@@ -1364,6 +1364,50 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
           }
       } }
     uint32_t v; memcpy(&v, vm_base + (uint32_t)a, 4);
+#ifndef NDEBUG
+    /* WA2 v79: v70's snow UVs do NOT come from object+E8..104 when
+     * object+E4 is zero.  0x4C528 branches to loc_0004D188 and reads the
+     * default rectangle from four BSS globals instead.  Trace those reads
+     * unconditionally by EA, plus the E4 selector itself. */
+    {
+        const uint32_t ea79 = (uint32_t)a;
+        const uint32_t guest79 = __builtin_bswap32(v);
+        if (ea79 == 0x01087364u) {
+            static int n79m = 0;
+            if (n79m++ < 16) {
+                extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+                const uint32_t r31 = g_active_ctx ? (uint32_t)g_active_ctx->gpr[31] : 0u;
+                const uint32_t lr  = g_active_ctx ? (uint32_t)g_active_ctx->lr : 0u;
+                fprintf(stderr,
+                        "[SNOWUV79-MODE] n=%d ea=0x%08X guest=0x%08X r31=0x%08X lr=0x%08X\n",
+                        n79m - 1, ea79, guest79, r31, lr);
+                fflush(stderr);
+            }
+        }
+        static const uint32_t uv79ea[4] = {
+            0x0110B200u, 0x0110B208u, 0x0110B210u, 0x0110B218u
+        };
+        int slot79 = -1;
+        for (int i = 0; i < 4; ++i) if (ea79 == uv79ea[i]) { slot79 = i; break; }
+        if (slot79 >= 0) {
+            static int n79r = 0;
+            if (n79r++ < 64) {
+                float f79; memcpy(&f79, &guest79, 4);
+                extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+                extern uint32_t ppu_prof_resolve_host(void*);
+                void* ra79 = __builtin_return_address(0);
+                const uint32_t gfn79 = ppu_prof_resolve_host(ra79);
+                const uint32_t r31 = g_active_ctx ? (uint32_t)g_active_ctx->gpr[31] : 0u;
+                const uint32_t lr  = g_active_ctx ? (uint32_t)g_active_ctx->lr : 0u;
+                fprintf(stderr,
+                        "[SNOWUV79-GLOBAL-READ] n=%d slot=%d ea=0x%08X rawLE=0x%08X "
+                        "guest=0x%08X f=%.9g guest-fn=0x%08X r31=0x%08X lr=0x%08X\n",
+                        n79r - 1, slot79, ea79, v, guest79, f79, gfn79, r31, lr);
+                fflush(stderr);
+            }
+        }
+    }
+#endif
 #if defined(_WIN32) && !defined(NDEBUG)
     /* WA2 v77: unconditional truth probe for the eight snow-object UV dwords.
      * v74 filtered by ppu_prof_resolve_host(__builtin_return_address(0)) and
@@ -1716,11 +1760,11 @@ static inline void wa2_snow_object_uv_hit(uint32_t a, uint32_t v, int width, voi
     /* Arm the page guard only after the initial eight zero stores have fully
      * committed. vm_write32 calls wa2_snow_guard73_arm_after_store() at its
      * tail, avoiding a fault on the zeroing store that triggered the arm. */
-    if (!s_wa2_guard73_armed && !s_wa2_guard73_pending && seen == 0xFFu) {
-        int all_zero = 1;
-        for (int i = 0; i < 8; ++i) if (vals[i] != 0) { all_zero = 0; break; }
-        if (all_zero) s_wa2_guard73_pending = 1;
-    }
+    /* v79: 0x4C528 checks object+0xE4 before these fields.  The snow path
+     * has E4==0 and branches to loc_0004D188, which reads the default UV
+     * rectangle from 0x0110B200/208/210/218 instead.  Do not auto-arm the
+     * obsolete object-page guard; it was watching a source this draw never
+     * reads and could perturb timing for no diagnostic value. */
 
     if (trace_n < 48) {
         float f; memcpy(&f, &v, 4);
@@ -1756,10 +1800,44 @@ static inline void wa2_snow_object_uv_hit(uint32_t a, uint32_t v, int width, voi
 #endif
 }
 
+static inline void wa2_snow_default_uv79_hit(uint32_t a, uint32_t v, int width, void* ra)
+{
+#ifndef NDEBUG
+    if (width != 4) return;
+    static const uint32_t ea79[4] = {
+        0x0110B200u, 0x0110B208u, 0x0110B210u, 0x0110B218u
+    };
+    int slot = -1;
+    for (int i = 0; i < 4; ++i) if (a == ea79[i]) { slot = i; break; }
+    if (slot < 0) return;
+    static int n = 0;
+    if (n >= 64) return;
+    float f; memcpy(&f, &v, 4);
+    const uint32_t fn = ppu_prof_resolve_host(ra);
+    extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+    const uint32_t lr  = g_active_ctx ? (uint32_t)g_active_ctx->lr : 0u;
+    const uint32_t r3  = g_active_ctx ? (uint32_t)g_active_ctx->gpr[3] : 0u;
+    const uint32_t r31 = g_active_ctx ? (uint32_t)g_active_ctx->gpr[31] : 0u;
+    fprintf(stderr,
+            "[SNOWUV79-GLOBAL-WRITE] n=%d slot=%d ea=0x%08X raw=0x%08X f=%.9g "
+            "guest-fn=0x%08X lr=0x%08X r3=0x%08X r31=0x%08X\n",
+            n, slot, a, v, f, fn, lr, r3, r31);
+    if (n < 4 && g_active_ctx) {
+        extern void ppu_dump_guest_stack(ppu_context*, const char*);
+        ppu_dump_guest_stack(g_active_ctx, "snowuv79-global");
+    }
+    ++n;
+    fflush(stderr);
+#else
+    (void)a; (void)v; (void)width; (void)ra;
+#endif
+}
+
 static inline void barrier_watch_hit(uint32_t a, uint32_t v, int width, void* ra)
 {
     wa2_uv_probe_hit(a, v, width, ra);
     wa2_snow_object_uv_hit(a, v, width, ra);
+    wa2_snow_default_uv79_hit(a, v, width, ra);
 #ifdef NDEBUG
     (void)a; (void)v; (void)width; (void)ra;
 #else

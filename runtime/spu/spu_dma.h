@@ -641,32 +641,32 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 }
             }
         }
-        /* WA2 snow-object source trace. v71 saw the PPU memset entry #1 of
-         * the 264-byte render-object table (0x01087280), but no later scalar
-         * PPU store even though +E8..+104 had changed by draw time. Catch an
-         * SPU DMA PUT here because DMA writes bypass every PPU vm_write hook. */
 #ifndef NDEBUG
-        { const uint32_t obj = 0x01087280u;
-          const uint32_t lo = obj + 0xE8u, hi = obj + 0x108u;
-          const uint32_t e = (uint32_t)ea;
-          if (e < hi && e + size > lo) {
-              static int _snow_obj_put_n = 0;
-              if (_snow_obj_put_n++ < 32) {
-                  float f[8];
-                  for (int i = 0; i < 8; ++i) {
-                      uint32_t w; memcpy(&w, vm_base + obj + 0xE8u + (uint32_t)i * 4u, 4);
-                      w = __builtin_bswap32(w); memcpy(&f[i], &w, 4);
-                  }
-                  fprintf(stderr,
-                          "[SNOWOBJ72-SPUPUT] n=%d img=%d pc=0x%05X ea=0x%08X size=0x%X lsa=0x%X "
-                          "objE8=(%.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g)\n",
-                          _snow_obj_put_n - 1, spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK,
-                          e, size, lsa, f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
-                  fflush(stderr);
-              }
-          } }
+        /* WA2 v79: the E4==0 sprite path reads its default UV rectangle from
+         * four BSS globals.  SPU PUT is a host memcpy and bypasses all PPU
+         * vm_write/barrier hooks, so catch any transfer that overlaps them. */
+        {
+            const uint32_t e79 = (uint32_t)ea;
+            const uint32_t end79 = e79 + size;
+            if (e79 < 0x0110B21Cu && end79 > 0x0110B200u) {
+                static int n79 = 0;
+                if (n79++ < 32) {
+                    uint32_t g79[4] = {0,0,0,0};
+                    const uint32_t a79[4] = {0x0110B200u,0x0110B208u,0x0110B210u,0x0110B218u};
+                    for (int i=0;i<4;++i) {
+                        const uint8_t* q = vm_base + a79[i];
+                        g79[i] = ((uint32_t)q[0]<<24)|((uint32_t)q[1]<<16)|((uint32_t)q[2]<<8)|q[3];
+                    }
+                    fprintf(stderr,
+                            "[SNOWUV79-SPUPUT] n=%d img=%d pc=0x%05X ea=0x%08X size=0x%X lsa=0x%05X "
+                            "uv=%08X/%08X/%08X/%08X\n",
+                            n79-1, spu->image_id, (uint32_t)spu->pc, e79, size, lsa,
+                            g79[0],g79[1],g79[2],g79[3]);
+                    fflush(stderr);
+                }
+            }
+        }
 #endif
-
         /* Bink sync-area watch (armed by the PPU barrier probe): log SPU PUTs
          * that touch the per-SPU lane counters. */
         { extern uint32_t g_barrier_sync_watch;
