@@ -1365,6 +1365,37 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
       } }
     uint32_t v; memcpy(&v, vm_base + (uint32_t)a, 4);
 #if defined(_WIN32) && !defined(NDEBUG)
+    /* WA2 v77: unconditional truth probe for the eight snow-object UV dwords.
+     * v74 filtered by ppu_prof_resolve_host(__builtin_return_address(0)) and
+     * produced no hits even though generated code calls this out-of-line
+     * vm_read32 directly.  Do not infer the caller here: these eight EAs are
+     * unique enough for the diagnostic, and logging is capped. */
+    {
+        const uint32_t ea77 = (uint32_t)a;
+        if (ea77 >= WA2_SNOW_OBJ73 + 0xE8u && ea77 <= WA2_SNOW_OBJ73 + 0x104u &&
+            ((ea77 - (WA2_SNOW_OBJ73 + 0xE8u)) & 3u) == 0u) {
+            static int n77 = 0;
+            if (n77++ < 64) {
+                MEMORY_BASIC_INFORMATION mbi77; memset(&mbi77, 0, sizeof(mbi77));
+                SIZE_T q77 = VirtualQuery(vm_base + ea77, &mbi77, sizeof(mbi77));
+                uint32_t snap77[8]; wa2_snow_uv73_read(snap77);
+                fprintf(stderr,
+                        "[SNOWOBJ77-READ] n=%d ea=0x%08X rawLE=0x%08X guest=0x%08X "
+                        "protect=0x%08lX state=0x%08lX type=0x%08lX guardPage=%p "
+                        "uv=%08X/%08X/%08X/%08X/%08X/%08X/%08X/%08X\n",
+                        n77 - 1, ea77, v, __builtin_bswap32(v),
+                        q77 ? (unsigned long)mbi77.Protect : 0ul,
+                        q77 ? (unsigned long)mbi77.State : 0ul,
+                        q77 ? (unsigned long)mbi77.Type : 0ul,
+                        (void*)s_guard_page,
+                        snap77[0], snap77[1], snap77[2], snap77[3],
+                        snap77[4], snap77[5], snap77[6], snap77[7]);
+                fflush(stderr);
+            }
+        }
+    }
+#endif
+#if defined(_WIN32) && !defined(NDEBUG)
     /* WA2 v74: read-side truth probe. v73 armed the object page read-only
      * after zero-init, but no protection fault was observed before 0x4C528
      * later consumed the snow UV rectangle. At the exact eight lfs source
