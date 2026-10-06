@@ -1519,6 +1519,42 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
       else { last=(uint32_t)a; n=0; } }
 #endif
     return __builtin_bswap32(v); }
+
+/* WA2 v78: compile-boundary read probe. eboot_port/CMakeLists.txt renames
+ * vm_read32 to vm_read32_trace78 only while compiling lifted PPU TUs. The
+ * wrapper therefore cannot be bypassed by another vm_read32 definition or
+ * stale generated source, and delegates the actual read unchanged. */
+extern "C" uint32_t vm_read32_trace78(uint64_t a)
+{
+    const uint32_t guest = vm_read32(a);
+#if defined(_WIN32) && !defined(NDEBUG)
+    const uint32_t ea = (uint32_t)a;
+    if (ea >= WA2_SNOW_OBJ73 + 0xE8u && ea <= WA2_SNOW_OBJ73 + 0x104u &&
+        ((ea - (WA2_SNOW_OBJ73 + 0xE8u)) & 3u) == 0u) {
+        static int n78 = 0;
+        if (n78++ < 64) {
+            uint32_t raw = 0; memcpy(&raw, vm_base + ea, 4);
+            MEMORY_BASIC_INFORMATION mbi; memset(&mbi, 0, sizeof(mbi));
+            SIZE_T q = VirtualQuery(vm_base + ea, &mbi, sizeof(mbi));
+            uint32_t snap[8]; wa2_snow_uv73_read(snap);
+            const uint32_t r31 = g_active_ctx ? (uint32_t)g_active_ctx->gpr[31] : 0u;
+            const uint32_t lr  = g_active_ctx ? (uint32_t)g_active_ctx->lr : 0u;
+            fprintf(stderr,
+                    "[SNOWOBJ78-READ] n=%d ea=0x%08X rawLE=0x%08X guest=0x%08X "
+                    "r31=0x%08X lr=0x%08X protect=0x%08lX state=0x%08lX "
+                    "uv=%08X/%08X/%08X/%08X/%08X/%08X/%08X/%08X\n",
+                    n78 - 1, ea, raw, guest, r31, lr,
+                    q ? (unsigned long)mbi.Protect : 0ul,
+                    q ? (unsigned long)mbi.State : 0ul,
+                    snap[0], snap[1], snap[2], snap[3],
+                    snap[4], snap[5], snap[6], snap[7]);
+            fflush(stderr);
+        }
+    }
+#endif
+    return guest;
+}
+
 uint64_t vm_read64(uint64_t a) { if (vm_oob((uint32_t)a,8)) return 0; vm_hotmap((uint32_t)a,8); uint64_t v; memcpy(&v, vm_base + (uint32_t)a, 8);
 #ifndef NDEBUG
 #ifdef VM_SAMPLE_READS
