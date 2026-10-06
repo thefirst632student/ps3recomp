@@ -2291,6 +2291,36 @@ static int vp_get_vs(const rsx_state* st)
     const u8* vuc = st->vp_ucode + vstart;
     u32 vlen = st->vp_ucode_bytes - vstart;
     u32 hash = vp_hash_ucode(vuc, vlen);
+
+    /* v89: RSX output-mask parity probe for WA2's generic sprite pipeline.
+     * RPCS3 gates diffuse/specular/texcoord varyings with
+     * NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK, while our VP decompiler currently
+     * exports o1/o2/o7.. unconditionally.  Record the exact mask even on a VS
+     * cache hit so we can prove whether COL1 is supposed to exist for the
+     * snow/fade draws before changing shader semantics. */
+    if ((st->shader_program & ~1u) == 0x01E08480u) {
+        static u64 seen89[16];
+        static int seen89_n = 0;
+        const u32 om = st->vertex_attrib_output_mask;
+        const u64 key89 = ((u64)hash << 32) | om;
+        int known89 = 0;
+        for (int i = 0; i < seen89_n; i++) if (seen89[i] == key89) known89 = 1;
+        if (!known89 && seen89_n < 16) {
+            seen89[seen89_n++] = key89;
+            const u32 diff89 = om & ((1u << 0) | (1u << 2));
+            const u32 spec89 = om & ((1u << 1) | (1u << 3));
+            const u32 tex089 = om & (1u << 14);
+            fprintf(stderr,
+                    "[SPRITE89-STATE] fp=0x%08X vp_start=%u vp_hash=%08X outmask=%08X "
+                    "diff=%d spec=%d tex0=%d shaderctl=%08X texraw=%08X %ux%u/fmt%02X\n",
+                    st->shader_program, st->transform_program_start, hash, om,
+                    diff89 != 0, spec89 != 0, tex089 != 0, st->shader_control,
+                    s_d3d.cur_texs[0].raw, s_d3d.cur_texs[0].w,
+                    s_d3d.cur_texs[0].h, s_d3d.cur_texs[0].fmt);
+            fflush(stderr);
+        }
+    }
+
     for (int i = 0; i < s_d3d.vp_vs_n; i++)
         if (s_d3d.vp_vs[i].hash == hash) return i;
 
@@ -2325,28 +2355,61 @@ static int vp_get_vs(const rsx_state* st)
             }
         }
     }
-    /* v58: dump only the data-flow relevant to WA2's generic 2D sprite VP.
-     * Observation only: shader text is not modified. */
-    if (wa2_diag_on() && ((st->shader_program & ~1u) == 0x01E08480u)) {
-        static int sprite_vp_dumped = 0;
-        if (!sprite_vp_dumped) {
-            sprite_vp_dumped = 1;
-            fprintf(stderr, "[SPRITE_VP] instrs=%d start=%u hash=0x%08X%c",
-                    ni, st->transform_program_start, hash, 10);
-            const char* _ln = hlsl;
-            while (*_ln) {
-                const char* _e = strchr(_ln, '\n');
-                size_t _len = _e ? (size_t)(_e - _ln) : strlen(_ln);
-                if (_len) {
-                    char _tmp[1024]; size_t _n = _len < sizeof(_tmp)-1 ? _len : sizeof(_tmp)-1;
-                    memcpy(_tmp, _ln, _n); _tmp[_n] = 0;
-                    if (strstr(_tmp, "v[3]") || strstr(_tmp, "o[1]") ||
-                        strstr(_tmp, "Out.col0") || strstr(_tmp, "v[8]") ||
-                        strstr(_tmp, "o[7]") || strstr(_tmp, "Out.t0"))
-                        fprintf(stderr, "[SPRITE_VP] %s%c", _tmp, 10);
-                }
-                if (!_e) break; _ln = _e + 1;
+    /* v89: self-arming VP/output-mask probe for the generic sprite FP.  v88
+     * proved this FP has no inline constants; the remaining unverified input is
+     * COL1, which the FP adds to sampled colour.  RPCS3 suppresses COL1 when
+     * the specular output bits are clear.  Dump raw VP words plus the exact
+     * HLSL paths for o1/o2/o7 and their final varying mappings. */
+    if ((st->shader_program & ~1u) == 0x01E08480u) {
+        static u32 sprite89_vp_hashes[8];
+        static int sprite89_vp_n = 0;
+        int known89 = 0;
+        for (int q = 0; q < sprite89_vp_n; q++)
+            if (sprite89_vp_hashes[q] == hash) known89 = 1;
+        if (!known89 && sprite89_vp_n < 8) {
+            sprite89_vp_hashes[sprite89_vp_n++] = hash;
+            const u32 om = st->vertex_attrib_output_mask;
+            fprintf(stderr,
+                    "[SPRITE89-VP] instrs=%d start=%u hash=%08X outmask=%08X "
+                    "diff=%d spec=%d tex0=%d\n",
+                    ni, st->transform_program_start, hash, om,
+                    (om & ((1u << 0) | (1u << 2))) != 0,
+                    (om & ((1u << 1) | (1u << 3))) != 0,
+                    (om & (1u << 14)) != 0);
+
+            u32 roff89 = 0;
+            for (int ii89 = 0; ii89 < ni && roff89 + 16u <= vlen; ii89++, roff89 += 16u) {
+                const u8* rp89 = vuc + roff89;
+                const u32 d0 = (u32)rp89[0] | ((u32)rp89[1] << 8) | ((u32)rp89[2] << 16) | ((u32)rp89[3] << 24);
+                const u32 d1 = (u32)rp89[4] | ((u32)rp89[5] << 8) | ((u32)rp89[6] << 16) | ((u32)rp89[7] << 24);
+                const u32 d2 = (u32)rp89[8] | ((u32)rp89[9] << 8) | ((u32)rp89[10] << 16) | ((u32)rp89[11] << 24);
+                const u32 d3 = (u32)rp89[12] | ((u32)rp89[13] << 8) | ((u32)rp89[14] << 16) | ((u32)rp89[15] << 24);
+                fprintf(stderr,
+                        "[SPRITE89-RAW] i=%d d=%08X/%08X/%08X/%08X vec=%02X sca=%02X "
+                        "input=%u dstout=%u vmask=%X smask=%X end=%u\n",
+                        ii89, d0, d1, d2, d3,
+                        (d1 >> 22) & 0x1Fu, (d1 >> 27) & 0x1Fu,
+                        (d1 >> 8) & 0xFu, (d3 >> 2) & 0x1Fu,
+                        (d3 >> 13) & 0xFu, (d3 >> 17) & 0xFu, d3 & 1u);
             }
+
+            const char* ln89 = hlsl;
+            while (*ln89) {
+                const char* e89 = strchr(ln89, '\n');
+                size_t len89 = e89 ? (size_t)(e89 - ln89) : strlen(ln89);
+                if (len89) {
+                    char tmp89[1200];
+                    size_t n89 = len89 < sizeof(tmp89)-1 ? len89 : sizeof(tmp89)-1;
+                    memcpy(tmp89, ln89, n89); tmp89[n89] = 0;
+                    if (strstr(tmp89, "o[1]") || strstr(tmp89, "o[2]") ||
+                        strstr(tmp89, "o[7]") || strstr(tmp89, "Out.col0") ||
+                        strstr(tmp89, "Out.col1") || strstr(tmp89, "Out.t0"))
+                        fprintf(stderr, "[SPRITE89-HLSL] %s\n", tmp89);
+                }
+                if (!e89) break;
+                ln89 = e89 + 1;
+            }
+            fflush(stderr);
         }
     }
     if (getenv("VP_DUMP")) { static int _d=0; if (_d++ < 4) {
@@ -7975,6 +8038,53 @@ static void read_vp_vertex(const rsx_state* state, u32 vi, VPSlot* out16)
     }
 }
 
+/* v89: snapshot the actual CPU-fetched vertex inputs for one fade and one snow
+ * draw.  Print every enabled attribute rather than assuming a3/a8; the VP dump
+ * above tells us which source feeds o2/COL1.  Observational only. */
+static void sprite89_vtx_probe(const rsx_state* state, u32 first, u32 count, const char* path)
+{
+    if (!state || ((state->shader_program & ~1u) != 0x01E08480u) || !count) return;
+    u32 tag89 = 0;
+    const char* name89 = NULL;
+    if (s_d3d.cur_texs[0].raw == 0x0368E500u &&
+        s_d3d.cur_texs[0].w == 64u && s_d3d.cur_texs[0].h == 128u &&
+        s_d3d.cur_texs[0].fmt == 0x83u) {
+        tag89 = 1u; name89 = "SNOW";
+    } else if (s_d3d.cur_texs[0].w == 4u && s_d3d.cur_texs[0].h == 4u &&
+               s_d3d.cur_texs[0].fmt == 0x85u && state->blend_enable) {
+        tag89 = 2u; name89 = "FADE";
+    }
+    if (!tag89) return;
+    static u32 seen89 = 0;
+    if (seen89 & tag89) return;
+    seen89 |= tag89;
+
+    u32 amask89 = 0;
+    for (int a89 = 0; a89 < 16; a89++)
+        if (state->vertex_attribs[a89].enabled) amask89 |= 1u << a89;
+    fprintf(stderr,
+            "[SPRITE89-VTX] kind=%s path=%s first=%u count=%u outmask=%08X enabled=%04X\n",
+            name89, path ? path : "?", first, count,
+            state->vertex_attrib_output_mask, amask89);
+
+    u32 nv89 = count < 4u ? count : 4u;
+    for (u32 k89 = 0; k89 < nv89; k89++) {
+        VPSlot vv89[16];
+        read_vp_vertex(state, first + k89, vv89);
+        for (int a89 = 0; a89 < 16; a89++) {
+            if (!(amask89 & (1u << a89))) continue;
+            fprintf(stderr,
+                    "[SPRITE89-ATTR] kind=%s v=%u a%d=(%.9g,%.9g,%.9g,%.9g) "
+                    "type=%u size=%u stride=%u off=%08X\n",
+                    name89, k89, a89, vv89[a89].v[0], vv89[a89].v[1],
+                    vv89[a89].v[2], vv89[a89].v[3],
+                    state->vertex_attribs[a89].type, state->vertex_attribs[a89].size,
+                    state->vertex_attribs[a89].stride, state->vertex_attribs[a89].offset);
+        }
+    }
+    fflush(stderr);
+}
+
 /* VTX_POS=<N>: print the first fetched position of the first N draws. A guest
  * vertex array that resolves to the wrong memory reads as garbage/denormals, and
  * that is indistinguishable from "the shader is wrong" without seeing the input. */
@@ -8103,6 +8213,7 @@ static u32 upload_quads_vp(const rsx_state* state, u32 first, u32 count)
     if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
     if (!state->vertex_attribs[0].enabled) return 0;
     vp_attrs_dbg(state);
+    sprite89_vtx_probe(state, first, count, "quads");
     u32 quads = count / 4;
     u32 maxv = (MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
     if (quads * 6 > maxv) quads = maxv / 6;
@@ -8137,6 +8248,7 @@ static u32 upload_tris_vp(const rsx_state* state, u32 first, u32 count)
     if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
     if (!state->vertex_attribs[0].enabled) return 0;
     vp_attrs_dbg(state);
+    sprite89_vtx_probe(state, first, count, "tris");
     u32 maxv = (MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
     if (count > maxv) { s_drop_draws++;
         { static int _n = 0; if (getenv("VBFULL") && _n++ < 12)
@@ -8203,6 +8315,7 @@ static u32 upload_strip_vp(const rsx_state* state, u32 first, u32 count, int fan
     if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
     if (!state->vertex_attribs[0].enabled) return 0;
     if (count < 3) return 0;
+    sprite89_vtx_probe(state, first, count, "strip");
     u32 tris = count - 2;
     u32 maxv = (MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
     if (tris * 3 > maxv) tris = maxv / 3;
