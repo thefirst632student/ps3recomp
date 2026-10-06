@@ -2761,6 +2761,61 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
     int n = rsx_fp_decompile(vm_base + off, 4096, fp_ctrl, hlsl, sizeof(hlsl));
     if (n <= 0) { static int _e=0; if(_e++<16) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr); return NULL; }
 
+    /* v88: targeted parity probe for WA2's generic sprite/effect FP.  The
+     * D3D12 backend currently keys this PSO with rsx_fp_code_hash(), which
+     * intentionally skips inline CONST payloads, while this path still calls
+     * the legacy non-buffered decompiler above (which emits CONSTs as HLSL
+     * literals).  Dump the exact program/cache identities and generated HLSL
+     * once so we can prove whether that mismatch is active for 0x01E08481.
+     * Logging only: no shader/render state is changed. */
+    if ((fp_addr & ~3u) == 0x01E08480u) {
+        static int sprite88_dumped = 0;
+        if (!sprite88_dumped) {
+            sprite88_dumped = 1;
+            const u32 psz = rsx_fp_program_size(vm_base + off, 4096);
+            u32 full_hash = 2166136261u;
+            for (u32 i = 0; i < psz; i++) { full_hash ^= vm_base[off + i]; full_hash *= 16777619u; }
+            float kvals[64 * 4];
+            memset(kvals, 0, sizeof(kvals));
+            const int nk = rsx_fp_extract_consts(vm_base + off, 4096, kvals, 64);
+            fprintf(stderr,
+                    "[SPRITE88-FP] fp=0x%08X ea=0x%08X bytes=%u instrs=%d exp32=%d codehash=%08X fullhash=%08X nconst=%d buffered_decl=%s\n",
+                    fp_addr, off, psz, n, exp32, uhash, full_hash, nk,
+                    strstr(hlsl, "fp_constants[") ? "yes" : "no");
+            u32 roff = 0, ri = 0, ki = 0;
+            while (roff + 16u <= psz && ri < 64u) {
+                const u8* q = vm_base + off + roff;
+                const u32 w0 = rsx_fp_read_word(q + 0);
+                const u32 w1 = rsx_fp_read_word(q + 4);
+                const u32 w2 = rsx_fp_read_word(q + 8);
+                const u32 w3 = rsx_fp_read_word(q + 12);
+                const u32 op = ((w0 >> 24) & 0x3Fu) | (((w2 >> 31) & 1u) << 6);
+                const int has_k = ((w2 >> 31) & 1u) == 0u &&
+                    (((w1 & 3u) == 2u) || ((w2 & 3u) == 2u) || ((w3 & 3u) == 2u));
+                fprintf(stderr,
+                        "[SPRITE88-RAW] i=%u off=%u op=0x%02X(%s) w=%08X/%08X/%08X/%08X attr=%u tex=%u half=%u mask=0x%X end=%u const=%d\n",
+                        ri, roff, op, rsx_fp_opcode_name(op), w0, w1, w2, w3,
+                        (w0 >> 13) & 0xFu, (w0 >> 17) & 0xFu, (w0 >> 7) & 1u,
+                        (w0 >> 9) & 0xFu, w0 & 1u, has_k);
+                roff += 16u;
+                if (has_k && roff + 16u <= psz) {
+                    const float* k = ki < (u32)(nk > 0 ? nk : 0) ? &kvals[ki * 4] : NULL;
+                    fprintf(stderr,
+                            "[SPRITE88-CONST] k=%u raw=%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X val=(%g,%g,%g,%g)\n",
+                            ki, vm_base[off+roff+0], vm_base[off+roff+1], vm_base[off+roff+2], vm_base[off+roff+3],
+                            vm_base[off+roff+4], vm_base[off+roff+5], vm_base[off+roff+6], vm_base[off+roff+7],
+                            vm_base[off+roff+8], vm_base[off+roff+9], vm_base[off+roff+10], vm_base[off+roff+11],
+                            vm_base[off+roff+12], vm_base[off+roff+13], vm_base[off+roff+14], vm_base[off+roff+15],
+                            k ? k[0] : 0.0f, k ? k[1] : 0.0f, k ? k[2] : 0.0f, k ? k[3] : 0.0f);
+                    roff += 16u; ki++;
+                }
+                ri++;
+                if (w0 & 1u) break;
+            }
+            fprintf(stderr, "[SPRITE88-HLSL-BEGIN]\n%s[SPRITE88-HLSL-END]\n", hlsl);
+        }
+    }
+
     /* WA2 warning-2 FP raw probe.  Dump the exact guest microcode for
      * 0x01BF9101 once, using the same resolved address and byte order consumed
      * by rsx_fp_decompiler.  Logging only; shader behavior is unchanged. */
@@ -4356,8 +4411,33 @@ static void vp_record_cb(u32 slot, int vs_idx, D3D12DrawRecord* dr)
             extern u32 cellGcmResolveLocated(int, u32);
             u32 foff = cellGcmResolveLocated((dr->fp_addr & 0x3u) == 1,
                                              dr->fp_addr & ~0x3u);
+            int sprite88_nk = 0;
             if (vm_base && foff != 0xFFFFFFFFu)
-                rsx_fp_extract_consts(vm_base + foff, 4096, &ts[20], 64);   /* fp_k[64] */
+                sprite88_nk = rsx_fp_extract_consts(vm_base + foff, 4096, &ts[20], 64);   /* fp_k[64] */
+            /* v88: if the sprite FP carries inline constants, report their
+             * per-draw payload identity whenever it changes.  This directly
+             * tests whether a structural/code-only PSO key can reuse HLSL
+             * that baked an older literal value. */
+            if (dr && (dr->fp_addr & ~3u) == 0x01E08480u) {
+                static u32 last_khash = 0;
+                static int have_khash = 0, reports = 0;
+                u32 khash = 2166136261u;
+                for (int _k = 0; _k < sprite88_nk * 4; _k++) {
+                    u32 _bits; memcpy(&_bits, &ts[20 + _k], sizeof(_bits));
+                    for (int _b = 0; _b < 4; _b++) { khash ^= (_bits >> (_b * 8)) & 0xFFu; khash *= 16777619u; }
+                }
+                if (!have_khash || khash != last_khash) {
+                    if (reports < 48) {
+                        fprintf(stderr,
+                                "[SPRITE88-K] frame=%llu slot=%u tex0=0x%08X nconst=%d khash=%08X changed=%d k0=(%g,%g,%g,%g) k1=(%g,%g,%g,%g)\n",
+                                (unsigned long long)s_d3d.frame_count, slot, dr->tex[0].raw,
+                                sprite88_nk, khash, have_khash ? 1 : 0,
+                                ts[20], ts[21], ts[22], ts[23],
+                                ts[24], ts[25], ts[26], ts[27]);
+                    }
+                    reports++; last_khash = khash; have_khash = 1;
+                }
+            }
             /* FPK_DBG=1: the fragment constants as the shader will see them.
              * A program whose only output is fp_k[0].xxxx renders black if
              * those constants never arrive, which looks identical from the
