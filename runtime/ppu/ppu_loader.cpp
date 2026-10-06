@@ -1438,7 +1438,7 @@ uint32_t vm_read32(uint64_t a) { if (vm_oob((uint32_t)a,4)) return 0; ppu_rwatch
                 for (int i = 0; i < 2; ++i) t.in_bits[k++] = wa2_snow80_be32(t.p[1] + (uint32_t)i * 4u);
                 for (int i = 0; i < 4; ++i) t.in_bits[k++] = wa2_snow80_be32(t.p[2] + (uint32_t)i * 4u);
                 for (int i = 0; i < 4; ++i) t.in_bits[k++] = wa2_snow80_be32(t.p[3] + (uint32_t)i * 4u);
-                if (t.seq <= 64u) {
+                if (t.seq <= 4u) {
                     fprintf(stderr,
                             "[SNOWUV81-ENTRY] seq=%u obj=0x%08X desc=0x%08X sp=0x%08X oldsp=0x%08X clip=(%d,%d) "
                             "p=%08X/%08X/%08X/%08X\n",
@@ -1920,28 +1920,41 @@ static inline void wa2_snow_uv80_write_hit(uint32_t a, uint32_t v, int width)
     uint32_t o[16];
     for (int i = 0; i < 16; ++i) o[i] = wa2_snow80_be32(0x0110B200u + (uint32_t)i * 4u);
     o[15] = v;
-    if (t.seq <= 64u) {
-        fprintf(stderr,
-                "[SNOWUV81-RECT] seq=%u desc=0x%08X clip=(%d,%d) "
-                "uv=(%.9g,%.9g)(%.9g,%.9g) alt=(%.9g,%.9g,%.9g,%.9g) "
-                "posX=(%.9g,%.9g,%.9g,%.9g) posY=(%.9g,%.9g,%.9g,%.9g)\n",
-                t.seq, t.desc, (int)t.clip_x, (int)t.clip_y,
-                wa2_snow80_f32(o[0]), wa2_snow80_f32(o[4]),
-                wa2_snow80_f32(o[2]), wa2_snow80_f32(o[6]),
-                wa2_snow80_f32(o[1]), wa2_snow80_f32(o[3]),
-                wa2_snow80_f32(o[5]), wa2_snow80_f32(o[7]),
-                wa2_snow80_f32(o[8]), wa2_snow80_f32(o[9]),
-                wa2_snow80_f32(o[10]), wa2_snow80_f32(o[11]),
-                wa2_snow80_f32(o[12]), wa2_snow80_f32(o[13]),
-                wa2_snow80_f32(o[14]), wa2_snow80_f32(o[15]));
-        if (o[0] == 0x00000000u && o[2] == 0x42000000u &&
-            o[4] == 0x42000000u && o[6] == 0x43000000u) {
-            fprintf(stderr, "[SNOWUV81-TARGET] seq=%u exact vertex UV rectangle 0,32/32,32/0,128/32,128\n", t.seq);
+    const bool target82 =
+        o[0] == 0x00000000u && o[2] == 0x42000000u &&
+        o[4] == 0x42000000u && o[6] == 0x43000000u;
+    if (target82) {
+        static unsigned target82_n = 0;
+        if (target82_n++ < 8u) {
+            fprintf(stderr,
+                    "[SNOWUV82-TARGET] hit=%u seq=%u obj=0x%08X desc=0x%08X clip=(%d,%d) "
+                    "p=%08X/%08X/%08X/%08X uv=(%.9g,%.9g)(%.9g,%.9g)\n",
+                    target82_n - 1u, t.seq, t.obj, t.desc, (int)t.clip_x, (int)t.clip_y,
+                    t.p[0], t.p[1], t.p[2], t.p[3],
+                    wa2_snow80_f32(o[0]), wa2_snow80_f32(o[4]),
+                    wa2_snow80_f32(o[2]), wa2_snow80_f32(o[6]));
+            fprintf(stderr,
+                    "[SNOWUV82-IN] hit=%u A=(%.9g,%.9g) B=(%.9g,%.9g) "
+                    "C=(%.9g,%.9g,%.9g,%.9g) D=(%.9g,%.9g,%.9g,%.9g)\n",
+                    target82_n - 1u,
+                    wa2_snow80_f32(t.in_bits[0]), wa2_snow80_f32(t.in_bits[1]),
+                    wa2_snow80_f32(t.in_bits[2]), wa2_snow80_f32(t.in_bits[3]),
+                    wa2_snow80_f32(t.in_bits[4]), wa2_snow80_f32(t.in_bits[5]),
+                    wa2_snow80_f32(t.in_bits[6]), wa2_snow80_f32(t.in_bits[7]),
+                    wa2_snow80_f32(t.in_bits[8]), wa2_snow80_f32(t.in_bits[9]),
+                    wa2_snow80_f32(t.in_bits[10]), wa2_snow80_f32(t.in_bits[11]));
+            fprintf(stderr,
+                    "[SNOWUV82-OUT] hit=%u raw="
+                    "%08X/%08X/%08X/%08X/%08X/%08X/%08X/%08X/"
+                    "%08X/%08X/%08X/%08X/%08X/%08X/%08X/%08X\n",
+                    target82_n - 1u,
+                    o[0],o[1],o[2],o[3],o[4],o[5],o[6],o[7],
+                    o[8],o[9],o[10],o[11],o[12],o[13],o[14],o[15]);
             extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
             extern void ppu_dump_guest_stack(ppu_context*, const char*);
-            if (g_active_ctx) ppu_dump_guest_stack(g_active_ctx, "snowuv80-target");
+            if (g_active_ctx) ppu_dump_guest_stack(g_active_ctx, "snowuv82-target");
+            fflush(stderr);
         }
-        fflush(stderr);
     }
     t.active = 0u;
 #else
