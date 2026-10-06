@@ -1255,6 +1255,36 @@ uint16_t vm_read16(uint64_t a) { if (vm_oob((uint32_t)a,2)) return 0; ppu_rwatch
       if ((uint32_t)a==last) { if (++n==200000) { fprintf(stderr, "[HOTREAD16] spinning on 0x%08X\n", (uint32_t)a); n=0; } } else { last=(uint32_t)a; n=0; } }
 #endif
     return __builtin_bswap16(v); }
+/* WA2 v76: truth probe for the inline vm_read32 in ppu_memory.h.
+ * Recompiled PPU translation units include that header, so this catches the
+ * eight snow-object dword reads even when generated code has not been re-lifted
+ * with v75. No value is modified. */
+extern "C" void ppu_wa2_vmread_trace76(uint32_t addr, uint32_t raw_le, uint32_t guest_bits)
+{
+#if defined(_WIN32) && !defined(NDEBUG)
+    static int n76 = 0;
+    if (n76++ >= 96) return;
+    MEMORY_BASIC_INFORMATION mbi76; memset(&mbi76, 0, sizeof(mbi76));
+    SIZE_T q76 = VirtualQuery(vm_base + addr, &mbi76, sizeof(mbi76));
+    uint32_t snap76[8]; wa2_snow_uv73_read(snap76);
+    const ppu_context* c76 = g_active_ctx;
+    fprintf(stderr,
+            "[SNOWOBJ76-INLINE-READ] n=%d ea=0x%08X rawLE=0x%08X guest=0x%08X "
+            "r31=0x%08X lr=0x%08X protect=0x%08lX state=0x%08lX type=0x%08lX "
+            "uv=%08X/%08X/%08X/%08X/%08X/%08X/%08X/%08X\n",
+            n76 - 1, addr, raw_le, guest_bits,
+            c76 ? (uint32_t)c76->gpr[31] : 0u, c76 ? (uint32_t)c76->lr : 0u,
+            q76 ? (unsigned long)mbi76.Protect : 0ul,
+            q76 ? (unsigned long)mbi76.State : 0ul,
+            q76 ? (unsigned long)mbi76.Type : 0ul,
+            snap76[0], snap76[1], snap76[2], snap76[3],
+            snap76[4], snap76[5], snap76[6], snap76[7]);
+    fflush(stderr);
+#else
+    (void)addr; (void)raw_le; (void)guest_bits;
+#endif
+}
+
 /* WA2 v75: call-site truth probe for the eight lfs instructions at
  * 0x4D0D4..0x4D168 in func_0004C528. The lifter emits this call with the
  * literal guest PC, avoiding v74's dependence on resolving a host return

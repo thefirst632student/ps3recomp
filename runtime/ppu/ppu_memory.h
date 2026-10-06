@@ -30,6 +30,12 @@ extern "C" {
  * -----------------------------------------------------------------------*/
 extern uint8_t* vm_base;
 
+/* WA2 v76 diagnostic: observe the inline vm_read32 path used by recompiled
+ * guest code.  The previous v74 probe instrumented the out-of-line loader
+ * helper, but generated PPU code includes this header and therefore never
+ * reached that function. */
+void ppu_wa2_vmread_trace76(uint32_t addr, uint32_t raw_le, uint32_t guest_bits);
+
 /* ---------------------------------------------------------------------------
  * Address translation
  * -----------------------------------------------------------------------*/
@@ -80,7 +86,12 @@ static inline uint32_t vm_read32(uint32_t addr)
 {
     uint32_t raw;
     memcpy(&raw, vm_ptr8(addr), sizeof(raw));
-    return ps3_bswap32(raw);
+    const uint32_t guest = ps3_bswap32(raw);
+#ifndef NDEBUG
+    if (addr >= 0x01087368u && addr <= 0x01087384u && ((addr - 0x01087368u) & 3u) == 0u)
+        ppu_wa2_vmread_trace76(addr, raw, guest);
+#endif
+    return guest;
 }
 
 static inline uint64_t vm_read64(uint32_t addr)
