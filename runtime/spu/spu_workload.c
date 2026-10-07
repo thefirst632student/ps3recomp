@@ -16,7 +16,6 @@
 #else
 #include <pthread.h>
 #include <errno.h>
-#include "../platform/win32_compat.h"   /* LONG, InterlockedExchange, Sleep */
 #endif
 
 /* Set by the MFC DMA engine (spu_dma.h) when the cri task (image 22) issues a
@@ -351,85 +350,8 @@ static spu_ts_ls_slot* ts_ls_get(uint32_t taskset_ea, uint32_t taskid)
     return slot;
 }
 
-/* Minimal taskset scheduling for tasks the PPU never created.
- *
- * SPU code can create tasks itself, or mark existing ones ready, and rely on
- * the taskset policy module to schedule them. Tasks created from the PPU are
- * dispatched by our cellSpursCreateTask, but nothing looked at the taskset
- * afterwards, so SPU-scheduled work never ran. Guitar Hero III's Havok task
- * hands the rest of each physics step to other tasks and EXITs, and the step
- * then waits forever.
- *
- * Runs when a task of the taskset returns (our runner returns on the EXIT
- * syscall; waiting tasks park instead). The returning task's ready, pending
- * and enabled bits are cleared, as the real policy does on exit, and every
- * other enabled task that is pending or ready and not already running here is
- * started from its ELF.
- *
- * Taskset layout: bitsets of 16 bytes at +0x10 ready, +0x20 pending,
- * +0x30 enabled (task 0 = MSB of byte 0); task_info[t] at +0x80 + 0x30*t with
- * the ELF EA at +0x14 and the context save EA at +0x1C. */
-#define TS_TRACK 8
-static struct { uint32_t ea; uint8_t running[16]; } s_ts_run[TS_TRACK];
-static volatile LONG s_ts_lock;
-static uint8_t* ts_running(uint32_t taskset_ea)
-{
-    for (int i = 0; i < TS_TRACK; i++) if (s_ts_run[i].ea == taskset_ea) return s_ts_run[i].running;
-    for (int i = 0; i < TS_TRACK; i++) if (!s_ts_run[i].ea) { s_ts_run[i].ea = taskset_ea; return s_ts_run[i].running; }
-    return NULL;
-}
-static void ts_lock(void)   { while (InterlockedExchange(&s_ts_lock, 1)) Sleep(0); }
-static void ts_unlock(void) { InterlockedExchange(&s_ts_lock, 0); }
-
-static void spu_taskset_mark(uint32_t taskset_ea, uint32_t t, int on)
-{
-    if (!taskset_ea || t >= 128) return;
-    ts_lock();
-    uint8_t* r = ts_running(taskset_ea);
-    uint8_t m = (uint8_t)(0x80u >> (t & 7));
-    if (r) { if (on) r[t / 8] |= m; else r[t / 8] &= (uint8_t)~m; }
-    ts_unlock();
-}
-
-static void spu_taskset_task_exited(uint32_t taskset_ea, uint32_t done_task)
-{
-    extern uint8_t* vm_base;
-    extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
-    ts_lock();
-    uint8_t* ts = vm_base + taskset_ea;
-    uint8_t* run = ts_running(taskset_ea);
-    if (done_task < 128) {
-        uint8_t m = (uint8_t)(0x80u >> (done_task & 7));
-        ts[0x10 + done_task / 8] &= (uint8_t)~m;
-        ts[0x20 + done_task / 8] &= (uint8_t)~m;
-        ts[0x30 + done_task / 8] &= (uint8_t)~m;
-        if (run) run[done_task / 8] &= (uint8_t)~m;
-    }
-    for (uint32_t t = 0; t < 128 && run; t++) {
-        uint8_t m = (uint8_t)(0x80u >> (t & 7));
-        if (!(ts[0x30 + t / 8] & m) || (run[t / 8] & m)) continue;
-        if (!((ts[0x10 + t / 8] | ts[0x20 + t / 8]) & m)) continue;
-        const uint8_t* ti = ts + 0x80 + 0x30 * t;
-        uint32_t elf = ((uint32_t)ti[0x14] << 24) | ((uint32_t)ti[0x15] << 16) |
-                       ((uint32_t)ti[0x16] << 8) | ti[0x17];
-        uint32_t ctx = ((uint32_t)ti[0x1C] << 24) | ((uint32_t)ti[0x1D] << 16) |
-                       ((uint32_t)ti[0x1E] << 8) | ti[0x1F];
-        if (!elf) continue;
-        size_t sz = spu_elf_image_size(vm_base + elf, 2u * 1024 * 1024);
-        if (!sz) continue;
-        ts[0x20 + t / 8] &= (uint8_t)~m;                 /* pending -> started */
-        run[t / 8] |= m;
-        fprintf(stderr, "[taskset] start task %u of taskset 0x%08X elf=0x%08X "
-                        "(after task %u exited)\n", t, taskset_ea, elf, done_task);
-        g_ydkj_real_taskset_ea = taskset_ea; g_ydkj_real_taskid = t;
-        spu_workload_dispatch_async(vm_base + elf, (uint32_t)sz, ctx);
-    }
-    ts_unlock();
-}
-
 static void spu_async_run(spu_async_job* j)
 {
-    spu_taskset_mark(j->taskset_ea, j->taskid, 1);
     /* Persistent per-taskset LS: acquire (+serialize) the taskset's LS, or fall
      * back to a fresh per-dispatch LS when disabled / no taskset. */
     spu_ts_ls_slot* ts_slot = NULL;
@@ -769,7 +691,6 @@ static void spu_async_run(spu_async_job* j)
             fprintf(stderr, "[spu_workload] async image=%d RETURNED rc=%d "
                     "(job ran to completion, did not loop)\n", j->image_id, rc);
             spu_serial_release();
-            if (j->taskset_ea) spu_taskset_task_exited(j->taskset_ea, j->taskid);
         }
         /* Persistent LS is retained in its taskset slot for the next task; a
          * per-dispatch LS is freed. */
@@ -791,12 +712,7 @@ static DWORD WINAPI spu_async_thread(LPVOID p) {
      * runaway brsl recursion) can actually reach the STACKOVERFLOW reporter
      * instead of killing the process silently with 0x80000001. */
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
-    spu_async_run((spu_async_job*)p);
-    /* Nothing on this stack may stay in the lock-line reserver set. */
-    { ULONG_PTR lo, hi; GetCurrentThreadStackLimits(&lo, &hi);
-      extern void spu_coh_forget_range(uintptr_t, uintptr_t);
-      spu_coh_forget_range((uintptr_t)lo, (uintptr_t)hi); }
-    return 0;
+    spu_async_run((spu_async_job*)p); return 0;
 }
 #else
 static void* spu_async_thread(void* p) { spu_async_run((spu_async_job*)p); return NULL; }
@@ -813,13 +729,8 @@ int spu_workload_dispatch_job(const uint8_t* image, uint32_t image_size,
     for (unsigned i = 0; i < s_registry_count; i++)
         if (s_registry[i].fp == fp) { fn = s_registry[i].fn; image_id = s_registry[i].image_id; break; }
     if (!fn) {
-        /* Capped: an unlifted job a title dispatches every frame (Tornado
-         * Outbreak's Wwise audio jobs) wrote 2 GB of these in three minutes,
-         * and the logging itself distorts guest timing. */
-        { static unsigned long long miss_n = 0;
-          if (++miss_n <= 32 || miss_n % 100000 == 0)
-            fprintf(stderr, "[spurs-job] dispatch MISS fp=0x%016llX size=%u job=0x%08X (#%llu)\n",
-                    (unsigned long long)fp, image_size, job_ea, miss_n); }
+        fprintf(stderr, "[spurs-job] dispatch MISS fp=0x%016llX size=%u job=0x%08X\n",
+                (unsigned long long)fp, image_size, job_ea);
         /* SPU_DUMP_MISS=<dir>: write the unrecognised image out so it can be
          * lifted and registered. SPURS job binaries are raw code+data blobs
          * the title loads from its own data files -- unlike sys_spu_image
@@ -1016,28 +927,6 @@ void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId)
     { static int _n = 0; if (_n++ < 24)
         fprintf(stderr, "[spu_workload] signal task %u (taskset 0x%08X)\n",
                 taskId, taskset_ea); fflush(stderr); }
-    /* SPU_SIG_STATS=1: signals per second per (taskset, task, caller). */
-    { static int s_on = -1; if (s_on < 0) s_on = getenv("SPU_SIG_STATS") ? 1 : 0;
-      if (s_on) {
-          static uint32_t ts[32], tk[32]; static uintptr_t ca[32]; static unsigned cnt[32];
-          static unsigned long long t0;
-          extern unsigned long long ps3_ms_now(void);
-          const uintptr_t c = (uintptr_t)__builtin_return_address(0);
-          for (int i = 0; i < 32; i++) {
-              if (cnt[i] && ts[i] == taskset_ea && tk[i] == taskId && ca[i] == c) { cnt[i]++; break; }
-              if (!cnt[i] && !ts[i]) { ts[i] = taskset_ea; tk[i] = taskId; ca[i] = c; cnt[i] = 1; break; }
-          }
-          unsigned long long now = ps3_ms_now();
-          if (!t0) t0 = now;
-          if (now - t0 >= 5000) {
-              for (int i = 0; i < 32 && ts[i]; i++) {
-                  fprintf(stderr, "[sig-stats] taskset=0x%08X task=%u caller=%p %.1f/s\n",
-                          ts[i], tk[i], (void*)ca[i], cnt[i] * 1000.0 / (now - t0));
-                  cnt[i] = 0; ts[i] = 0;
-              }
-              t0 = now;
-          }
-      } }
 }
 
 /* WAIT_SIGNAL from the task side (runs ON the task's host thread, called by
@@ -1147,27 +1036,6 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
     for (unsigned i = 0; i < s_registry_count; i++)
         if (s_registry[i].fp == fp) { fn = s_registry[i].fn; image_id = s_registry[i].image_id; break; }
     if (!fn) {
-        /* SPU_DUMP_MISS also applies here. The sync path has written the
-         * unrecognised image out for a while and the async path did not, so a
-         * workload policy module -- which is always dispatched async, being a
-         * persistent worker -- could only ever report a fingerprint you had no
-         * way to resolve. These blobs are not ELFs in the EBOOT, so this dump
-         * is the only place their bytes exist. */
-        { const char* _dir = getenv("SPU_DUMP_MISS");
-          if (_dir && *_dir) {
-              static uint64_t _seen[64]; static unsigned _nseen = 0;
-              unsigned _k = 0;
-              for (; _k < _nseen; _k++) if (_seen[_k] == fp) break;
-              if (_k == _nseen && _nseen < 64) {
-                  char _path[512];
-                  _seen[_nseen++] = fp;
-                  snprintf(_path, sizeof(_path), "%s/spujob_%016llX_%u.bin",
-                           _dir, (unsigned long long)fp, image_size);
-                  FILE* _f = fopen(_path, "wb");
-                  if (_f) { fwrite(image, 1, image_size, _f); fclose(_f);
-                      fprintf(stderr, "[spu_workload] wrote %s\n", _path); }
-              }
-          } }
         fprintf(stderr, "[spu_workload] async dispatch MISS fp=0x%016llX size=%u\n",
                 (unsigned long long)fp, image_size);
         return 0;

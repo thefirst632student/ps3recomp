@@ -957,7 +957,7 @@ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w)
 {
     (void)a; (void)v; (void)w;
 }
-unsigned long long ps3_ms_now(void)              { return 0; }
+uint64_t ps3_ms_now(void)                        { return 0; }
 uint32_t g_ww_lo = 0xFFFFFFFFu, g_ww_hi = 0;
 int      g_resv_store_active = 0;
 int      g_barrier_sync_watch = 0;
@@ -978,8 +978,6 @@ void spurs_pm_build_context(spu_context* c, uint32_t a, uint32_t b, uint32_t d)
 /* Upstream raw-SPU and RSX services are outside this group-start fixture. */
 uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
 uint32_t ps3_spu_image_source_ea(uint32_t ea) { return ea; }
-/* cellSpurs owns this; 0 = "not a SPURS port", the plain lv2 event path. */
-uint32_t spurs_port_queue(uint32_t port)        { (void)port; return 0; }
 void sys_raw_spu_init(lv2_syscall_table* t) { (void)t; }
 void sys_rsx_init(lv2_syscall_table* t) { (void)t; }
 void spu_raw_note_image(uint32_t ea, uint32_t src) { (void)ea; (void)src; }

@@ -73,95 +73,10 @@ void     ps3_load_prx_modules(void) {}
 
 #ifdef _WIN32
 #include <windows.h>
-#include <intrin.h>   /* _ReturnAddress */
 /* timeBeginPeriod: windows.h is included with WIN32_LEAN_AND_MEAN, which
  * excludes the multimedia timer API, so it must be asked for by name -- and
  * AFTER windows.h, since timeapi.h uses UINT and friends. */
 #include <timeapi.h>
-
-/* Process-wide getenv cache. The runtime has ~700 `if (getenv("X"))` diagnostic
- * gates, many on per-draw / per-syscall paths, and the UCRT getenv takes the
- * environment lock and scans every variable each time: profiled at ~30% of
- * GH3's main PPU thread and ~35% of the RSX thread in gameplay. Defining the
- * import slot here (an object in the link beats the import library's lazy
- * definition) routes every dllimport'ed getenv call through this cache.
- * Nothing in the runtime mutates the environment after startup, so a value is
- * looked up once and the pointer stays valid forever. Reads are lock-free:
- * a slot's key is published last, after its value.
- * ponytail: 1024 open-addressed slots, fixed; names past that fall back to the OS lookup. */
-namespace {
-struct EnvSlot { const char* volatile key; const char* val; };
-EnvSlot  s_env[1024];
-SRWLOCK  s_env_lock = SRWLOCK_INIT;
-
-unsigned env_hash(const char* s)
-{
-    unsigned h = 2166136261u;
-    for (; *s; s++) h = (h ^ (unsigned char)(*s >= 'a' && *s <= 'z' ? *s - 32 : *s)) * 16777619u;
-    return h;
-}
-
-const char* env_lookup_os(const char* name)
-{
-    DWORD n = GetEnvironmentVariableA(name, NULL, 0);
-    if (!n) return NULL;
-    char* v = (char*)malloc(n);
-    if (!v || GetEnvironmentVariableA(name, v, n) >= n) { free(v); return NULL; }
-    return v;
-}
-
-char* __cdecl cached_getenv(const char* name)
-{
-    if (!name || !*name) return NULL;
-    const unsigned mask = 1023, h = env_hash(name);
-    for (unsigned i = h & mask, n = 0; n <= mask; n++, i = (i + 1) & mask) {
-        const char* k = s_env[i].key;
-        MemoryBarrier();
-        if (!k) break;
-        if (!_stricmp(k, name)) {
-            /* GETENV_STATS=1: which gate is being polled on a hot path. */
-            static int st = -1;
-            if (st < 0) st = env_lookup_os("GETENV_STATS") ? 1 : 0;
-            if (st) {
-                static unsigned cnt[1024]; static void* ra[1024]; static unsigned long long tot;
-                cnt[i]++; ra[i] = _ReturnAddress();
-                if ((++tot & ((1u << 22) - 1)) == 0) {
-                    const uintptr_t exe = (uintptr_t)GetModuleHandleA(NULL);
-                    for (int r = 0; r < 5; r++) {
-                        unsigned b = 0;
-                        for (unsigned j = 1; j <= mask; j++) if (cnt[j] > cnt[b]) b = j;
-                        if (!cnt[b]) break;
-                        fprintf(stderr, "[getenv-stats] %-28s %u calls  caller rva=0x%llX%c",
-                                s_env[b].key, cnt[b], (unsigned long long)((uintptr_t)ra[b] - exe), 10);
-                        cnt[b] = 0;
-                    }
-                    memset(cnt, 0, sizeof cnt);
-                }
-            }
-            return (char*)s_env[i].val;
-        }
-    }
-    AcquireSRWLockExclusive(&s_env_lock);
-    const char* val = NULL; int found = 0;
-    unsigned i = h & mask, n = 0;
-    for (; n <= mask; n++, i = (i + 1) & mask) {
-        if (!s_env[i].key) break;
-        if (!_stricmp(s_env[i].key, name)) { val = s_env[i].val; found = 1; break; }
-    }
-    if (!found) {
-        val = env_lookup_os(name);
-        if (n <= mask) {
-            s_env[i].val = val;
-            MemoryBarrier();
-            s_env[i].key = _strdup(name);
-        }
-    }
-    ReleaseSRWLockExclusive(&s_env_lock);
-    return (char*)val;
-}
-}
-extern "C" char* (__cdecl* __imp_getenv)(const char*) = cached_getenv;
-
 /* Last-chance crash reporter: vm_base accesses are bounds-guarded, so a real
  * access violation means a HOST pointer deref (e.g. a bad function pointer or a
  * runtime-struct walk). Print the faulting address and the RIP as a module
@@ -590,41 +505,11 @@ extern "C" const char* g_last_hle_name;
 /* Defined with the debug console below; writes to stderr and, when the
  * console is servicing a command, also to its response file. */
 static void dbg_printf(const char* fmt, ...);
-/* While dump_threads holds a thread suspended, dbg_printf formats into this
- * buffer instead of a stream: the suspended thread may own stderr's CRT lock,
- * and writing then deadlocks the watchdog -- and with it every thread that
- * logs. GH3 froze solid (0% CPU, log silent mid-boot) exactly that way. */
-static __declspec(thread) char   s_dbg_capbuf[16384];
-static __declspec(thread) char*  s_dbg_cap = NULL;
-static __declspec(thread) size_t s_dbg_capn = 0;
-
-extern "C" const char* g_hle_inflight[];   /* ppu_hle.cpp; 64 entries */
-extern "C" void ppu_report_guest_lrs(void); /* ppu_loader.cpp */
 
 static void dump_threads(const char* label, HMODULE self)
 {
     dbg_printf( "[WATCHDOG] %s; last HLE call = 0x%08X (%s)\n",
             label, g_last_hle_nid, g_last_hle_name ? g_last_hle_name : "");
-
-    /* Which HLE each guest thread is INSIDE right now.
-     *
-     * ppu_hle.cpp has maintained this array for a while and nothing ever read
-     * it. It is the only way to see a thread parked in an HLE wait:
-     * sys_lwmutex_lock and sys_lwcond_wait are sysPrxForUser handlers, not lv2
-     * syscalls, so PS3_SCBLOCK_PROF cannot see them block, the usleep
-     * histogram cannot see them (they do not usleep), and the sampler just
-     * reports ntdll. A thread stuck and invisible to all three is exactly the
-     * case this answers. */
-    { int any = 0;
-      for (unsigned t = 0; t < 64u; t++) {
-          const char* n = g_hle_inflight[t];
-          if (!n) continue;
-          if (!any) { dbg_printf("[WATCHDOG] guest threads inside an HLE:\n"); any = 1; }
-          dbg_printf("[WATCHDOG]   guest-tid %-3u in %s\n", t, n);
-      }
-      if (!any) dbg_printf("[WATCHDOG] no guest thread is inside an HLE\n"); }
-    dbg_printf("[WATCHDOG] guest threads, by guest lr:\n");
-    ppu_report_guest_lrs();
     DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId();
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     THREADENTRY32 te; te.dwSize = sizeof te;
@@ -634,7 +519,6 @@ static void dump_threads(const char* label, HMODULE self)
             HANDLE th = OpenThread(THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME,
                                    FALSE, te.th32ThreadID);
             if (!th) continue;
-            s_dbg_capn = 0; s_dbg_capbuf[0] = 0; s_dbg_cap = s_dbg_capbuf;
             SuspendThread(th);
             CONTEXT ctx; ctx.ContextFlags = CONTEXT_CONTROL;
             if (GetThreadContext(th, &ctx)) {
@@ -675,9 +559,9 @@ static void dump_threads(const char* label, HMODULE self)
                                         PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)))
                         region_end = (uint64_t)mbi.BaseAddress + mbi.RegionSize;
                     int maxk = (int)((region_end - (uint64_t)sp) / 8);
-                    if (maxk > 0x200000 / 8) maxk = 0x200000 / 8;   /* lifted SPU frames are big */
+                    if (maxk > 0x20000 / 8) maxk = 0x20000 / 8;
                     int found = 0;
-                    for (int k = 0; k < maxk && found < 40; k++) {
+                    for (int k = 0; k < maxk && found < 20; k++) {
                         uint64_t v = sp[k];
                         if (v < (uint64_t)self) continue;
                         HMODULE mm = NULL;
@@ -722,8 +606,6 @@ static void dump_threads(const char* label, HMODULE self)
                 }
             }
             ResumeThread(th);
-            s_dbg_cap = NULL;
-            if (s_dbg_capn) dbg_printf("%s", s_dbg_capbuf);
             CloseHandle(th);
         } while (Thread32Next(snap, &te));
     }
@@ -758,13 +640,6 @@ static void dbg_printf(const char* fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    if (s_dbg_cap) {             /* a thread is suspended: format only, no stream lock */
-        int n = vsnprintf(s_dbg_cap + s_dbg_capn, sizeof s_dbg_capbuf - s_dbg_capn, fmt, ap);
-        if (n > 0) s_dbg_capn += (size_t)n;
-        if (s_dbg_capn >= sizeof s_dbg_capbuf) s_dbg_capn = sizeof s_dbg_capbuf - 1;
-        va_end(ap);
-        return;
-    }
     if (s_dbg_out) { va_list c; va_copy(c, ap); vfprintf(s_dbg_out, fmt, c); va_end(c); }
     vfprintf(stderr, fmt, ap);
     va_end(ap);
@@ -815,80 +690,6 @@ static void dbg_knobs(const char* prefix)
     dbg_printf("  (%d set; docs/DIAGNOSTICS.md lists all of them)%c", n, 10);
 }
 
-/* "prof <host-tid> [sec]": sample ONE thread at ~1 kHz and unwind it through
- * .pdata (exact, unlike dump_threads' stack scan), then print the hottest
- * functions exclusive (leaf) and inclusive (anywhere on the stack), keyed by
- * function start. exe entries print as rva=; resolve against the link map.
- * Only lock-free work happens while the thread is suspended.
- * ponytail: fixed 4096-slot tables; a thread touching more functions drops the rest. */
-#define PROF_SLOTS 4096
-static uint64_t s_prof_key[3][PROF_SLOTS];
-static uint32_t s_prof_ct[3][PROF_SLOTS];
-static void prof_hit(int tab, uint64_t key)
-{
-    for (uint32_t i = (uint32_t)((key >> 4) * 2654435761u) % PROF_SLOTS, n = 0; n < PROF_SLOTS;
-         n++, i = (i + 1) % PROF_SLOTS) {
-        if (s_prof_key[tab][i] == key) { s_prof_ct[tab][i]++; return; }
-        if (!s_prof_key[tab][i]) { s_prof_key[tab][i] = key; s_prof_ct[tab][i] = 1; return; }
-    }
-}
-static void dbg_prof(DWORD tid, unsigned sec)
-{
-    /* Suspending ourselves never resumes: the console would hang for good. */
-    if (tid == GetCurrentThreadId()) { dbg_printf("  tid %lu is the console%c", (unsigned long)tid, 10); return; }
-    HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
-    if (!h) { dbg_printf("  cannot open tid %lu%c", (unsigned long)tid, 10); return; }
-    memset(s_prof_key, 0, sizeof s_prof_key); memset(s_prof_ct, 0, sizeof s_prof_ct);
-    const uintptr_t exe = (uintptr_t)GetModuleHandleA(NULL);
-    unsigned samples = 0;
-    const ULONGLONG end = GetTickCount64() + sec * 1000ull;
-    while (GetTickCount64() < end) {
-        if (SuspendThread(h) == (DWORD)-1) break;
-        CONTEXT c; c.ContextFlags = CONTEXT_FULL;
-        if (GetThreadContext(h, &c)) {
-            samples++;
-            uint64_t seen[24]; int ns = 0, got = 0;
-            for (int d = 0; d < 24 && c.Rip; d++) {
-                DWORD64 base = 0;
-                PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(c.Rip, &base, NULL);
-                uint64_t key = rf ? base + rf->BeginAddress : c.Rip;
-                if (d == 0) prof_hit(0, key);
-                /* first exe frame of a sample whose leaf is in a DLL: who called out */
-                if (!got && (uintptr_t)(key - exe) < 0x40000000u) { got = 1; if (d > 0) prof_hit(2, key); }
-                int dup = 0; for (int k = 0; k < ns; k++) dup |= seen[k] == key;
-                if (!dup) { seen[ns++] = key; prof_hit(1, key); }
-                if (!rf) break;                       /* leaf without unwind data: stop */
-                void* hd; DWORD64 ef;
-                RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c.Rip, rf, &c, &hd, &ef, NULL);
-            }
-        }
-        ResumeThread(h);
-        Sleep(1);
-    }
-    CloseHandle(h);
-    dbg_printf("  prof tid %lu: %u samples over %us%c", (unsigned long)tid, samples, sec, 10);
-    for (int tab = 0; tab < 3; tab++) {
-        static const char* tn[3] = { "exclusive", "inclusive", "exe caller of DLL leaf" };
-        dbg_printf("  --- %s ---%c", tn[tab], 10);
-        for (int rank = 0; rank < 40; rank++) {
-            uint32_t best = 0; int bi = -1;
-            for (int k = 0; k < PROF_SLOTS; k++) if (s_prof_ct[tab][k] > best) { best = s_prof_ct[tab][k]; bi = k; }
-            if (bi < 0) break;
-            uint64_t key = s_prof_key[tab][bi];
-            HMODULE m = NULL; char path[MAX_PATH] = "?";
-            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                               (LPCSTR)key, &m);
-            if (m) GetModuleFileNameA(m, path, sizeof path);
-            const char* b = strrchr(path, 92); b = b ? b + 1 : path;
-            if ((uintptr_t)m == exe) dbg_printf("  %5.1f%%  rva=0x%llX%c", 100.0 * best / (samples ? samples : 1),
-                                                (unsigned long long)(key - exe), 10);
-            else dbg_printf("  %5.1f%%  %s+0x%llX%c", 100.0 * best / (samples ? samples : 1), b,
-                            (unsigned long long)(key - (uintptr_t)m), 10);
-            s_prof_ct[tab][bi] = 0;
-        }
-    }
-}
-
 static DWORD WINAPI debug_console(LPVOID param)
 {
     const char* path = (const char*)param;
@@ -923,7 +724,6 @@ static DWORD WINAPI debug_console(LPVOID param)
 
         if (!strcmp(verb, "help")) {
             dbg_printf("  threads          stacks of every guest thread, symbolised%c", 10);
-            dbg_printf("  prof <tid> [s]   sample one host thread ~1kHz, hottest functions%c", 10);
             dbg_printf("  hle              last HLE call the runtime dispatched%c", 10);
             dbg_printf("  stat             flips, HLE breadcrumb, uptime%c", 10);
             dbg_printf("  mem <hex> [len]  hexdump guest memory%c", 10);
@@ -931,49 +731,6 @@ static DWORD WINAPI debug_console(LPVOID param)
             dbg_printf("  knobs [prefix]   diagnostics this run was started with%c", 10);
         } else if (!strcmp(verb, "threads")) {
             dump_threads("console", self);
-        } else if (!strcmp(verb, "find32") && sscanf(cmd, "%*s %x", &a) == 1) {
-            /* find32 <hex>: every aligned big-endian u32 equal to <hex> in committed
-             * guest memory below 0xC0000000 (first 4096 hits). */
-            const uint32_t be = ((a & 0xFF) << 24) | ((a & 0xFF00) << 8) | ((a >> 8) & 0xFF00) | (a >> 24);
-            int hits = 0;
-            for (uintptr_t p = 0; p < 0xC0000000u && hits < 4096 && vm_base; ) {
-                MEMORY_BASIC_INFORMATION mi;
-                if (!VirtualQuery(vm_base + p, &mi, sizeof mi)) break;
-                const uintptr_t end = (uintptr_t)((uint8_t*)mi.BaseAddress + mi.RegionSize) - (uintptr_t)vm_base;
-                if (mi.State == MEM_COMMIT && !(mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
-                    for (uintptr_t q = p & ~3u; q + 4 <= end && q < 0xC0000000u && hits < 4096; q += 4)
-                        if (*(const uint32_t*)(vm_base + q) == be) { dbg_printf("  0x%08X%c", (unsigned)q, 10); hits++; }
-                p = end;
-            }
-            dbg_printf("  %d hit(s)%c", hits, 10);
-        } else if (!strcmp(verb, "qbset") && sscanf(cmd, "%*s %x %x", &a, &b) == 2) {
-            /* qbset <name-crc> <value>: set every integer QB struct member with
-             * that name. A member is 16 bytes: xx 01|81 00 00 | name | value | next,
-             * big-endian (GH3: bot_play, unlocked). Prints how many it set. */
-            const uint32_t be_name = ((a & 0xFF) << 24) | ((a & 0xFF00) << 8) | ((a >> 8) & 0xFF00) | (a >> 24);
-            const uint32_t be_val  = ((b & 0xFF) << 24) | ((b & 0xFF00) << 8) | ((b >> 8) & 0xFF00) | (b >> 24);
-            unsigned n = 0;
-            for (uintptr_t p = 0; p < 0xC0000000u && vm_base; ) {
-                MEMORY_BASIC_INFORMATION mi;
-                if (!VirtualQuery(vm_base + p, &mi, sizeof mi)) break;
-                const uintptr_t end = (uintptr_t)((uint8_t*)mi.BaseAddress + mi.RegionSize) - (uintptr_t)vm_base;
-                if (mi.State == MEM_COMMIT && (mi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)))
-                    for (uintptr_t q = (p + 4) & ~3u; q + 8 <= end; q += 4)
-                        if (*(const uint32_t*)(vm_base + q) == be_name) {
-                            /* type word: any flags byte, then 0x01 or 0x81 (integer), 00 00;
-                             * only 0/1 values change -- an unlocked tag is a flag. */
-                            const uint8_t* t = vm_base + q - 4;
-                            const uint32_t v = *(const uint32_t*)(vm_base + q + 4);
-                            if ((t[1] == 0x01 || t[1] == 0x81) && !t[2] && !t[3] &&
-                                (v == 0 || v == 0x01000000u)) {
-                                *(uint32_t*)(vm_base + q + 4) = be_val; n++;
-                            }
-                        }
-                p = end;
-            }
-            dbg_printf("  qbset 0x%08X = %u: %u member(s)%c", a, b, n, 10);
-        } else if (!strcmp(verb, "prof") && sscanf(cmd, "%*s %u %u", &a, &b) >= 1) {
-            dbg_prof((DWORD)a, b ? b : 5);
         } else if (!strcmp(verb, "hle")) {
             dbg_printf("  last HLE = 0x%08X (%s)%c", g_last_hle_nid,
                        g_last_hle_name ? g_last_hle_name : "", 10);
@@ -1206,25 +963,11 @@ int main(int argc, char** argv)
 #ifdef _WIN32
     { extern void ps3_sampler_start(void); ps3_sampler_start(); } /* PS3_SAMPLE=<ms> */
 #endif
-    /* PS3_MAIN_STACK_LV2=1: give the main thread its stack where lv2 does, in
-     * the 0xD0000000 stack region (the first allocation there, which is also
-     * what sys_ppu_thread_get_stack_information already reports for it).
-     * Guest code can tell: Tornado Outbreak's SPU memcpy (func_000D60E0) copies
-     * on the PPU when the destination shares the stack's top nibble, then waits
-     * for an SPU reply only the SPU path sends -- with the stack at 0x0FF00000,
-     * every low address "is on the stack" and the boot hangs. Opt-in until the
-     * regression gate has run with it on. */
-    uint32_t stack_top = STACK_TOP;
-    { const char* ms = getenv("PS3_MAIN_STACK_LV2");
-      if (ms && *ms && *ms != '0') {
-          uint32_t base = vm_stack_allocate(&g_vm_stack_alloc, VM_PPU_STACK_SIZE);
-          if (base) stack_top = base + VM_PPU_STACK_SIZE;
-      } }
-    printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n", entry, stack_top);
+    printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n", entry, STACK_TOP);
 #ifdef _WIN32
     fprintf(stderr, "[boot] MAIN guest thread tid=%lu\n", (unsigned long)GetCurrentThreadId());
 #endif
-    int rc = ppu_run(entry, stack_top);
+    int rc = ppu_run(entry, STACK_TOP);
     printf("\n[boot] ppu_run returned %d (entry function unwound)\n", rc);
     /* A guest that called sys_process_exit never reaches this line: that path
      * ends in the host exit(). Getting here means the entry function returned

@@ -255,7 +255,7 @@ void ps3_ww_report_inline(uint32_t a, uint64_t v, int w)
 {
     (void)a; (void)v; (void)w;
 }
-unsigned long long ps3_ms_now(void)                    { return 0; }
+uint64_t ps3_ms_now(void)                              { return 0; }
 uint32_t g_ww_lo = 0xFFFFFFFFu, g_ww_hi = 0;
 int      g_resv_store_active = 0;
 uint32_t g_barrier_sync_watch = 0;

@@ -55,3 +55,8 @@ int spu_dispatch_frame_by_queue(uint32_t comp_queue, uint32_t work_ea)
  * never read back. */
 uint32_t g_spu_pending_evt[3];
 int      g_spu_pending_evt_valid;
+
+int cellVdec_is_seq_active(void)
+{
+    return 1;
+}

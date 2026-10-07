@@ -54,24 +54,37 @@ static void sys_initialize_tls(ppu_context* ctx)
             block, (uint32_t)ctx->gpr[13], seg_addr, seg_size, mem_size);
 }
 
-/* sys_time_get_system_time() -> microseconds since boot, REAL time.
- * This was a fake counter advancing 1 ms PER CALL ("so callers see time
- * progress") -- so any guest clock built on it ran at call-rate, not
- * wall-time. LBP's Bink movie clock (sysGetSystemTime import 0x8461E528
- * lands here) paced the intro at ~1/10th speed: video decoded at <1 fps,
- * the audio preload threshold took forever to fill (movie stayed silent),
- * and every frontend animation timed off it crawled. */
-static void sys_time_get_system_time(ppu_context* ctx)
+/* One shared guest system-time clock.  HLE modules such as cellAudio must
+ * stamp guest-visible events in the SAME domain as sys_time_get_system_time;
+ * using an absolute host QPC value in one module and a boot-relative value
+ * here makes timestamp deltas wrong by the host uptime. */
+extern "C" uint64_t ps3_system_time_us(void)
 {
 #ifdef _WIN32
-    static LARGE_INTEGER s_freq, s_base;
-    if (!s_freq.QuadPart) { QueryPerformanceFrequency(&s_freq); QueryPerformanceCounter(&s_base); }
-    LARGE_INTEGER now; QueryPerformanceCounter(&now);
-    ctx->gpr[3] = (uint64_t)((now.QuadPart - s_base.QuadPart) * 1000000ull / (uint64_t)s_freq.QuadPart);
+    struct qpc_clock_state {
+        LARGE_INTEGER freq;
+        LARGE_INTEGER base;
+        qpc_clock_state() {
+            QueryPerformanceFrequency(&freq);
+            QueryPerformanceCounter(&base);
+        }
+    };
+    static qpc_clock_state s_clock;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return (uint64_t)((now.QuadPart - s_clock.base.QuadPart) * 1000000ull /
+                      (uint64_t)s_clock.freq.QuadPart);
 #else
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    ctx->gpr[3] = (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
 #endif
+}
+
+/* sys_time_get_system_time() -> microseconds in the shared guest clock. */
+static void sys_time_get_system_time(ppu_context* ctx)
+{
+    ctx->gpr[3] = ps3_system_time_us();
 }
 
 /* sys_process_is_stack(u32 addr) -> 1 if addr is in the stack region. We model
@@ -534,7 +547,6 @@ static void hle_cellGcmInitBody(ppu_context* ctx)
  * every receive/poll would-block. errno lives in a guest scratch cell since
  * _sys_net_errno_loc returns a POINTER the game dereferences. */
 #define SYS_NET_EWOULDBLOCK_V 35
-extern "C" void ps3_net_host_register(unsigned int (*guest_alloc)(unsigned int, unsigned int));
 static uint32_t g_net_errno_ea = 0;
 static void hle_net_errno_loc(ppu_context* ctx)
 {
@@ -770,41 +782,6 @@ static void sys_spinlock_initialize(ppu_context* ctx)
     if (ea) _InterlockedExchange(spin_word(ea), 0);
 }
 
-/* Who currently holds each locked word, so a spin that never ends can name the
- * holder instead of just burning a core in silence.
- *
- * A spinlock has no timeout and no failure return, so a lock that is never
- * released is invisible: the thread sits in Sleep(0) at 100% of a core, a
- * sampling profiler attributes every sample to ntdll, and NOTHING says which
- * address or which holder. Guitar Hero III deadlocks exactly this way during
- * its heap bring-up and presented as "all threads idle in ntdll" while pinning
- * a core -- two facts that only make sense together once the lock is named.
- *
- * Small fixed table, linear scan: contention here is rare by construction (a
- * guest spinlock section is a few instructions), and a miss just means the
- * report says "unknown" rather than being wrong. */
-#define SPIN_OWNER_MAX 64
-static struct { uint32_t ea; unsigned long tid; } s_spin_owner[SPIN_OWNER_MAX];
-
-static void spin_note_acquire(uint32_t ea)
-{
-    for (int i = 0; i < SPIN_OWNER_MAX; i++)
-        if (s_spin_owner[i].ea == 0 || s_spin_owner[i].ea == ea) {
-            s_spin_owner[i].ea = ea; s_spin_owner[i].tid = GetCurrentThreadId(); return;
-        }
-}
-static void spin_note_release(uint32_t ea)
-{
-    for (int i = 0; i < SPIN_OWNER_MAX; i++)
-        if (s_spin_owner[i].ea == ea) { s_spin_owner[i].ea = 0; s_spin_owner[i].tid = 0; return; }
-}
-static unsigned long spin_owner_of(uint32_t ea)
-{
-    for (int i = 0; i < SPIN_OWNER_MAX; i++)
-        if (s_spin_owner[i].ea == ea) return s_spin_owner[i].tid;
-    return 0;
-}
-
 static void sys_spinlock_lock(ppu_context* ctx)
 {
     uint32_t ea = (uint32_t)ctx->gpr[3];
@@ -816,30 +793,13 @@ static void sys_spinlock_lock(ppu_context* ctx)
     for (unsigned n = 0; !spin_try(ea); n++) {
         if (n < 64) YieldProcessor();
         else        Sleep(0);
-        /* Report once per stuck lock, well past any legitimate section. */
-        if (n == 200000) {
-            unsigned long owner = spin_owner_of(ea);
-            unsigned long me    = GetCurrentThreadId();
-            static int reported = 0;
-            if (reported++ < 8)
-                fprintf(stderr,
-                        "[spinlock] STUCK on 0x%08X after 200k spins: guest lr=0x%08X, "
-                        "held by tid %lu, this is tid %lu%s\n",
-                        ea, (uint32_t)ctx->lr, owner, me,
-                        (owner && owner == me)
-                          ? "  <== SELF-DEADLOCK: this thread already holds it"
-                          : (owner ? "" : "  (holder unknown -- released without us seeing it?)"));
-        }
     }
-    spin_note_acquire(ea);
 }
 
 static void sys_spinlock_trylock(ppu_context* ctx)
 {
     uint32_t ea = (uint32_t)ctx->gpr[3];
-    int got = (ea && spin_try(ea));
-    if (got) spin_note_acquire(ea);
-    ctx->gpr[3] = got
+    ctx->gpr[3] = (ea && spin_try(ea))
                 ? 0                                            /* CELL_OK */
                 : (uint64_t)(int64_t)(int32_t)0x8001000Au;     /* EBUSY   */
 }
@@ -847,9 +807,7 @@ static void sys_spinlock_trylock(ppu_context* ctx)
 static void sys_spinlock_unlock(ppu_context* ctx)
 {
     uint32_t ea = (uint32_t)ctx->gpr[3];
-    if (!ea) return;
-    spin_note_release(ea);
-    _InterlockedExchange(spin_word(ea), 0);
+    if (ea) _InterlockedExchange(spin_word(ea), 0);
 }
 
 extern "C" void ppu_sysprx_register(void)
@@ -857,10 +815,6 @@ extern "C" void ppu_sysprx_register(void)
     ps3_hle_register_ctx(0x15BAE46Bu, "_cellGcmInitBody", hle_cellGcmInitBody);
     ps3_hle_register_ctx(0xEBE5F72Fu, "_sys_spu_image_import", hle_sys_spu_image_import);
 
-    /* PS3_NET_ONLINE: real host sockets (libs/network/sysNet.c). Registered
-     * first because the first registration of a NID wins, so these shadow the
-     * offline model below; without the variable nothing changes. */
-    if (getenv("PS3_NET_ONLINE")) ps3_net_host_register(gcm_guest_alloc);
     /* sys_net offline model (NIDs from PSL1GHT libnet exports). Covers every
      * sys_net NID LBP imports so none fall to the unresolved-NID default. */
     ps3_hle_register_ctx(0x6005CDE1u, "_sys_net_errno_loc",     hle_net_errno_loc);

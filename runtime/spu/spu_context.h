@@ -38,17 +38,36 @@ extern "C" {
  * Fires from every SPU image's spu_ls_read128/write128. Cheap: one cached
  * compare on the hot path when disabled.
  * -----------------------------------------------------------------------*/
-/* The check sits on every spu_ls_read128/write128, so the disabled case must
- * be one load and a branch: it was a real call (the function-local statics
- * kept it out of line) and ~9% of GH3's FMOD mixer task. The list lives in
- * spu_channels.c; g_spu_ls_watch_n is -1 until the first check reads the env. */
-extern int g_spu_ls_watch_n;
-void spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc, uint32_t lr);
-unsigned* spu_ls_watch_list(int* out_n);   /* the armed lines (n may be 0) */
+#define SPU_WATCH_MAX 4
+static inline unsigned* spu_ls_watch_list(int* out_n) {
+    static int init = 0; static unsigned addr[SPU_WATCH_MAX]; static int n = 0;
+    if (!init) {
+        init = 1;
+        const char* e = getenv("SPU_LS_WATCH");
+        while (e && *e && n < SPU_WATCH_MAX) {
+            addr[n++] = (unsigned)strtoul(e, (char**)&e, 0) & ~0xFu;
+            while (*e == ',' || *e == ' ') e++;
+        }
+    }
+    *out_n = n;
+    return addr;
+}
 static inline void spu_ls_watch_hit2(uint32_t lsa, int is_write, const uint8_t* p,
                                      uint32_t pc, uint32_t lr) {
-    if (__builtin_expect(g_spu_ls_watch_n == 0, 1)) return;
-    spu_ls_watch_slow(lsa, is_write, p, pc, lr);
+    int n; unsigned* w = spu_ls_watch_list(&n);
+    if (!n) return;
+    uint32_t a = lsa & (SPU_LS_MASK & ~0xFu);
+    for (int i = 0; i < n; i++) {
+        if (w[i] == a) {
+            fprintf(stderr, "[spu-watch %s 0x%05X pc=0x%05X lr=0x%05X] "
+                "%02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                is_write ? "WR" : "rd", a, pc, lr,
+                p[0],p[1],p[2],p[3], p[4],p[5],p[6],p[7],
+                p[8],p[9],p[10],p[11], p[12],p[13],p[14],p[15]);
+            fflush(stderr);
+            break;
+        }
+    }
 }
 static inline void spu_ls_watch_hit(uint32_t lsa, int is_write, const uint8_t* p) {
     spu_ls_watch_hit2(lsa, is_write, p, 0, 0);
@@ -125,43 +144,9 @@ static inline void spu_ls_watch_hit(uint32_t lsa, int is_write, const uint8_t* p
 /* ---------------------------------------------------------------------------
  * Channel state
  * -----------------------------------------------------------------------*/
-/* Channel capacity. Most SPU channels are genuinely one deep, but the PPU->SPU
- * inbound mailbox is FOUR on hardware, and a title that sends a multi-word
- * message writes the words back to back after checking the free-slot count. A
- * one-deep channel drops all but one of them, and the SPU then blocks forever
- * on a message it half received -- silently, because nothing is wrong with
- * either side. The Orange Box sends CB.SPU descriptors of two words from one
- * call site and FIVE from another -- one more than the mailbox is deep, so a
- * whole message never fits at once and the sender has to poll free slots while
- * the SPU drains, exactly as on hardware. (The rcv_evt[4] queue below is the
- * same problem, solved once ad hoc for sys_spu_thread_receive_event's
- * four-word reply.) */
-/* Capacity is NOT the hardware depth, deliberately.
- *
- * Hardware is four deep and back-pressures the writer: the PPU polls the
- * free-slot count and its store stalls until there is room. We cannot model
- * that half -- an MMIO store into the problem-state window is a plain memory
- * write on the host, already committed by the time the handler runs, so there
- * is no way to refuse it. Anything that does not fit is simply lost.
- *
- * Losing one word of a multi-word descriptor desynchronises the reader
- * permanently: it takes the words it did get, then waits for a word that has
- * already been and gone. The Orange Box sends CB.SPU bursts of two words and
- * of five -- one more than hardware depth -- and its worker reads a long
- * sequence across several call sites, so a single lost word strands it.
- *
- * So buffer generously and let the free-slot count keep advertising the
- * hardware depth (SPU_IN_MBOX_HW_DEPTH): a guest that polls sees the numbers it
- * expects, and a guest that does not poll still cannot lose data. */
-#define SPU_CHANNEL_CAP      64
-#define SPU_IN_MBOX_HW_DEPTH 4
-
 typedef struct spu_channel {
-    uint32_t value;   /* head: the value the next read returns */
-    uint32_t count;   /* number of valid entries, 0..SPU_CHANNEL_CAP */
-    uint32_t q[SPU_CHANNEL_CAP];
-    uint32_t head;
-    volatile long lock;  /* spu_channel_write/read: producer and consumer are different host threads */
+    uint32_t value;
+    uint32_t count;   /* number of valid entries (0 or 1 for most channels) */
 } spu_channel;
 
 /* ---------------------------------------------------------------------------
@@ -266,7 +251,6 @@ typedef struct spu_context {
     uint32_t resv_ea;          /* reserved 128-byte line EA, aligned (0 = none) */
     int      resv_valid;
     uint32_t atomic_stat;      /* last atomic op result -> MFC_RdAtomicStat */
-    uint64_t dbg_getllar;      /* SPU_PUTLLC_WHY: GETLLARs issued      */
     uint8_t  resv_line[128];   /* snapshot of the line at GETLLAR time */
 
     /* SPURS policy-module run mode (spurs_policy.c): nonzero while a lifted
@@ -374,22 +358,6 @@ typedef struct spu_context {
     uint64_t list_stall_ea_base[32];      /* ea base (hi32 carries), per tag */
     uint32_t list_stall_cmd[32];          /* base (non-list) MFC command, per tag */
 
-    /* Register file saved when an interrupt is taken, restored at its iret
-     * (spu_drain.c). Per context: it used to be an 8-slot global table claimed
-     * without a lock, and two SPU threads taking interrupts at once could take
-     * the same slot -- one lost its save and returned from the handler with
-     * the handler's registers. */
-    int      irq_saved;
-    uint32_t irq_resume_pc;
-    u128     irq_gpr[128];
-
-    /* Return pc of the innermost spu_drain_call (0 = none). The interpreter
-     * rejoins there: a return point sits mid-function, so it is no lifted
-     * entry, and without this the interpreter ran a job's return straight on
-     * through the caller's code until the next lifted entry -- GH3's job
-     * manager then ran its buffer loop a second time on the job's registers
-     * and died in its own assert (the song-freeze). */
-    uint32_t drain_ret_pc;
 } spu_context;
 
 /* Reserved LS addresses (inside the kernel area, below the 0xA00 policy-module
@@ -475,26 +443,9 @@ static inline void spu_ls_write32(spu_context* ctx, uint32_t lsa, uint32_t val)
 #define SPU_LS_FAST 1
 #endif
 
-/* Debug probes of spu_ls_read128, out of line: inlined they kept every LS
- * load a real call (~10% of GH3's FMOD mixer task). g_spu_ls_probe is -1
- * until the first call reads SPU_LS_LOWREAD, then 0/1. */
-
-/* The diagnostic gates the inline helpers below read. Defined here rather than
- * in spu_channels.c, as one merged definition per program (selectany / weak),
- * so every target that includes this header links whether or not it builds
- * spu_channels.c -- the SPU unit tests and sync_stress do not. */
-#if defined(_MSC_VER)
-#  define SPU_GATE __declspec(selectany)
-#else
-#  define SPU_GATE __attribute__((weak))
-#endif
-SPU_GATE int g_spu_ls_probe   = -1;  /* spu_ls_read_probe (SPU_LS_LOWREAD)      */
-SPU_GATE int g_spu_smc_watch  = -1;  /* spu_ls_write_probe_smc (SPU_SMC_WATCH)  */
-SPU_GATE int g_wws_code_probe = 0;   /* WWS code-buffer resolution, capped      */
-SPU_GATE int g_wws_read_probe = 0;
-static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context* ctx, uint32_t lsa)
+static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 {
-    if (g_spu_ls_probe < 0) g_spu_ls_probe = getenv("SPU_LS_LOWREAD") ? 1 : 0;
+    u128 v;
     /* SPU_LS_LOWREAD=1: a job that reads its OWN first bytes as data is
      * dereferencing a null base -- the job binary loads at LS 0, so [NULL+off]
      * returns its own instruction words. Report each distinct low address once,
@@ -528,13 +479,6 @@ static __attribute__((noinline, cold)) void spu_ls_read_probe(const spu_context*
                     off >> 6, (off >> 2) & 0xF, off);
         }
     }
-}
-
-static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
-{
-    u128 v;
-    if (__builtin_expect(g_spu_ls_probe != 0, 0) || (ctx->image_id == 2 && ctx->policy_mode))
-        spu_ls_read_probe(ctx, lsa);
     lsa &= SPU_LS_MASK & ~0xFu;
     const uint8_t* p = &ctx->ls[lsa];
     spu_ls_watch_hit2(lsa, 0, p, (uint32_t)ctx->pc & SPU_LS_MASK,
@@ -556,8 +500,16 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
     return v;
 }
 
-static __attribute__((noinline, cold)) void spu_ls_write_probe_pre(spu_context* ctx, uint32_t lsa, u128 val)
+static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 {
+    lsa &= SPU_LS_MASK & ~0xFu;
+    uint8_t* p = &ctx->ls[lsa];
+    /* WWS code-buffer probe: LBP's ChangeLoadToRunJob dispatches to LS[0x1320]
+     * (= lsaJobCodeBuffer in LBP's layout) + entryOffset. When TecRunJob writes
+     * that code-buffer LS address, dump the RunJob decision inputs so we can see
+     * why it resolves to an empty buffer: the resolved address, the whole
+     * bufferSetArray (0xDF0), and the live loadCommands (0xC00) whose RunJob
+     * command (commandNum==5) names the code buffer set. */
     if (lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode) {
         extern int g_wws_code_probe;   /* defined in spu_channels.c, capped */
         if (g_wws_code_probe < 6) {
@@ -584,12 +536,22 @@ static __attribute__((noinline, cold)) void spu_ls_write_probe_pre(spu_context* 
             #undef _RD32
         }
     }
-}
-/* SPU_SMC_WATCH, out of line: g_spu_smc_watch is -1 until read, then 0/1. */
-extern int g_spu_smc_watch;
-static __attribute__((noinline, cold)) void spu_ls_write_probe_smc(spu_context* ctx, uint32_t lsa, const uint8_t* p)
-{
-    if (g_spu_smc_watch < 0) g_spu_smc_watch = getenv("SPU_SMC_WATCH") ? 1 : 0;
+#if SPU_LS_FAST
+    uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]);
+    uint32_t w2 = SPU_BSWAP32(val._u32[2]), w3 = SPU_BSWAP32(val._u32[3]);
+    memcpy(p,      &w0, 4); memcpy(p + 4,  &w1, 4);
+    memcpy(p + 8,  &w2, 4); memcpy(p + 12, &w3, 4);
+#else
+    for (int i = 0; i < 4; i++) {
+        uint32_t w = val._u32[i];
+        p[i*4]     = (uint8_t)(w >> 24);
+        p[i*4 + 1] = (uint8_t)(w >> 16);
+        p[i*4 + 2] = (uint8_t)(w >>  8);
+        p[i*4 + 3] = (uint8_t)w;
+    }
+#endif
+    spu_ls_watch_hit2(lsa, 1, p, (uint32_t)ctx->pc & SPU_LS_MASK,
+                      ctx->gpr[0]._u32[0] & SPU_LS_MASK);
     /* SPU_SMC_WATCH=<img>: self-modification detector. Log any store whose
      * target LS line falls inside that image's CODE segment (the segment
      * bounds come from SPU_SMC_LO/HI, default the pm_wwsjob range 0xA00..
@@ -607,38 +569,6 @@ static __attribute__((noinline, cold)) void spu_ls_write_probe_smc(spu_context* 
                       ctx->image_id, lsa, (uint32_t)ctx->pc & SPU_LS_MASK,
                       p[0], p[1], p[2], p[3]);
       } }
-}
-
-static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
-{
-    lsa &= SPU_LS_MASK & ~0xFu;
-    uint8_t* p = &ctx->ls[lsa];
-    /* WWS code-buffer probe: LBP's ChangeLoadToRunJob dispatches to LS[0x1320]
-     * (= lsaJobCodeBuffer in LBP's layout) + entryOffset. When TecRunJob writes
-     * that code-buffer LS address, dump the RunJob decision inputs so we can see
-     * why it resolves to an empty buffer: the resolved address, the whole
-     * bufferSetArray (0xDF0), and the live loadCommands (0xC00) whose RunJob
-     * command (commandNum==5) names the code buffer set. */
-    if (lsa == 0x1320 && ctx->image_id == 2 && ctx->policy_mode)
-        spu_ls_write_probe_pre(ctx, lsa, val);
-#if SPU_LS_FAST
-    uint32_t w0 = SPU_BSWAP32(val._u32[0]), w1 = SPU_BSWAP32(val._u32[1]);
-    uint32_t w2 = SPU_BSWAP32(val._u32[2]), w3 = SPU_BSWAP32(val._u32[3]);
-    memcpy(p,      &w0, 4); memcpy(p + 4,  &w1, 4);
-    memcpy(p + 8,  &w2, 4); memcpy(p + 12, &w3, 4);
-#else
-    for (int i = 0; i < 4; i++) {
-        uint32_t w = val._u32[i];
-        p[i*4]     = (uint8_t)(w >> 24);
-        p[i*4 + 1] = (uint8_t)(w >> 16);
-        p[i*4 + 2] = (uint8_t)(w >>  8);
-        p[i*4 + 3] = (uint8_t)w;
-    }
-#endif
-    spu_ls_watch_hit2(lsa, 1, p, (uint32_t)ctx->pc & SPU_LS_MASK,
-                      ctx->gpr[0]._u32[0] & SPU_LS_MASK);
-    if (__builtin_expect(g_spu_smc_watch != 0, 0))
-        spu_ls_write_probe_smc(ctx, lsa, p);
 }
 
 /* ---------------------------------------------------------------------------
@@ -681,58 +611,16 @@ static inline u128 spu_make_preferred_u32(uint32_t val)
 /* ---------------------------------------------------------------------------
  * Channel read/write helpers
  * -----------------------------------------------------------------------*/
-/* `value` stays the head, and `count` the number of entries, so the many places
- * that read those two fields directly keep working unchanged.
- *
- * Write and read are serialised by a per-channel spinlock. A mailbox has its
- * producer and consumer on different host threads (PPU MMIO store vs the SPU's
- * rdch), and unlocked `count++` / `count--` lose updates: Tornado Outbreak's
- * raw SPU consumed one mailbox word while the PPU queued the next, count landed
- * on 0 with a word still queued, and the PPU waited forever for a reply to a
- * command the SPU never saw. The reader could also see the new count before
- * the new value. Plain reads of `count` elsewhere stay lock-free. */
-#if defined(_MSC_VER) && !defined(__clang__)
-#include <intrin.h>
-#define SPU_CH_LOCK(ch)   while (_InterlockedExchange(&(ch)->lock, 1)) _mm_pause()
-#define SPU_CH_UNLOCK(ch) _InterlockedExchange(&(ch)->lock, 0)
-#else
-#define SPU_CH_LOCK(ch)   while (__atomic_exchange_n(&(ch)->lock, 1, __ATOMIC_ACQUIRE)) {}
-#define SPU_CH_UNLOCK(ch) __atomic_store_n(&(ch)->lock, 0, __ATOMIC_RELEASE)
-#endif
-
 static inline void spu_channel_write(spu_channel* ch, uint32_t val)
 {
-    SPU_CH_LOCK(ch);
-    if (ch->count >= SPU_CHANNEL_CAP) {
-        /* Full. Hardware does not accept the write at all -- the sender polls
-         * the free-slot count first -- so the NEW word is what is lost.
-         *
-         * Dropping the oldest instead silently REORDERS the queue, which is
-         * worse than losing a word: a reader taking a fixed-length message off
-         * the mailbox then gets a prefix of one message spliced to the tail of
-         * the next, and every field after the splice is garbage that still
-         * looks plausible. The Orange Box sends CB.SPU a five-word descriptor
-         * from five consecutive call sites -- one more than the mailbox is
-         * deep -- so it meets this on every send. */
-        SPU_CH_UNLOCK(ch);
-        return;
-    }
-    ch->q[(ch->head + ch->count) % SPU_CHANNEL_CAP] = val;
-    ch->value = ch->q[ch->head];
-    ch->count++;
-    SPU_CH_UNLOCK(ch);
+    ch->value = val;
+    ch->count = 1;
 }
 
 static inline uint32_t spu_channel_read(spu_channel* ch)
 {
-    SPU_CH_LOCK(ch);
     uint32_t val = ch->value;
-    if (ch->count) {
-        ch->head = (ch->head + 1u) % SPU_CHANNEL_CAP;
-        if (ch->count > 1) ch->value = ch->q[ch->head];
-        ch->count--;
-    }
-    SPU_CH_UNLOCK(ch);
+    ch->count = 0;
     return val;
 }
 

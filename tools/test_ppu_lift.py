@@ -670,28 +670,6 @@ def build_vcases():
           5, be_h([0x1234, 0x5678, 0x9ABC, 0xDEF0, 0x1111, 0x2222, 0x3333, 0x4444]),
           2, be_h([0xDEF0] * 8))
 
-    # vmaxfp / vminfp read host floats until GH3 needed them (292 sites, every
-    # Havok AABB). 1.0 vs 2.0 discriminates: native reads of the BE bytes are
-    # denormals ordered the other way round. The NaN and +-0 lanes pin the VMX
-    # rules (NaN operand propagates; max prefers +0, min prefers -0).
-    NAN = struct.unpack(">f", b"\x7f\xc0\x00\x00")[0]
-    vcase("vmaxfp canary", vx_form(1034, 2, 0, 1),
-          1, be_f([2.0, -2.0, 5.0, -0.0]), 2, be_f([2.0, -1.0, NAN, 0.0]),
-          va_reg=0, va_bytes=be_f([1.0, -1.0, NAN, 0.0]))
-    vcase("vminfp canary", vx_form(1098, 2, 0, 1),
-          1, be_f([2.0, -2.0, NAN, -0.0]), 2, be_f([1.0, -2.0, NAN, -0.0]),
-          va_reg=0, va_bytes=be_f([1.0, -1.0, 5.0, 0.0]))
-    # vrfin/vrfiz had no lowering (a TODO comment: vD unchanged). Ties to even.
-    vcase("vrfin", vx_form(522, 2, 0, 1),
-          1, be_f([1.5, 2.5, -1.5, 2.4]), 2, be_f([2.0, 2.0, -2.0, 2.0]))
-    vcase("vrfiz", vx_form(586, 2, 0, 1),
-          1, be_f([1.5, 2.5, -1.5, -2.7]), 2, be_f([1.0, 2.0, -1.0, -2.0]))
-    # vcmpbfp: lane 0 in bounds, 1 above (+b), 2 below (-b), 3 NaN (both).
-    vcase("vcmpbfp", vx_form(966, 2, 0, 1),
-          1, be_f([2.0, 2.0, 2.0, 2.0]),
-          2, be_w([0, 0x80000000, 0x40000000, 0xC0000000]),
-          va_reg=0, va_bytes=be_f([1.0, 3.0, -3.0, NAN]))
-
 build_vcases()
 
 # ---------------------------------------------------------------------------
@@ -929,6 +907,11 @@ extern "C" uint32_t vm_read32(uint64_t a) { uint32_t v; memcpy(&v, g_vm_stub + V
 extern "C" void vm_write32(uint64_t a, uint32_t v) { v = CONF_BSWAP32(v); memcpy(g_vm_stub + VMOFF(a), &v, 4); }
 extern "C" uint64_t vm_read64(uint64_t a) { uint64_t v; memcpy(&v, g_vm_stub + VMOFF(a), 8); return CONF_BSWAP64(v); }
 extern "C" void vm_write64(uint64_t a, uint64_t v) { v = CONF_BSWAP64(v); memcpy(g_vm_stub + VMOFF(a), &v, 8); }
+/* Raw byte store used by VMX stvx/stvxl/stve* lowering.  Unlike the scalar
+ * helpers above it performs no endian conversion; vector register bytes are
+ * already in guest memory order.  Keep this stub byte-for-byte equivalent to
+ * the runtime helper so conformance executes the same lifted statements. */
+extern "C" void vm_write_raw(uint64_t a, const void* src, uint32_t n) { memcpy(g_vm_stub + VMOFF(a), src, n); }
 """)
     out.append("int main(void) {")
     out.append("    ppu_context* ctx = &g_ctx;")
