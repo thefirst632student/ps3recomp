@@ -42,6 +42,7 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/time.h>
+#include <sys/stat.h>   /* GetFileAttributesA */
 #if defined(__APPLE__)
 /* <sys/ucontext.h>, not <ucontext.h>: the latter is the deprecated
  * makecontext/swapcontext family and refuses to compile without _XOPEN_SOURCE,
@@ -863,6 +864,13 @@ static void unpark_thread_locked(ps3_obj* t) { sem_post(&t->park_go); }
 static int thread_stoppable_locked(const ps3_obj* t)
 {
     return t->started && !t->done;
+}
+
+DWORD GetFileAttributesA(const char* path)
+{
+    struct stat st;
+    if (!path || stat(path, &st) != 0) return INVALID_FILE_ATTRIBUTES;
+    return S_ISDIR(st.st_mode) ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
 }
 
 DWORD ResumeThread(HANDLE h)

@@ -934,9 +934,24 @@ static void test_msvc_compat(void)
     CHECK((void*)_ReturnAddress() != NULL);
 }
 
+/* GetFileAttributesA: existence and directory-ness, through stat(). */
+static void test_file_attributes(void)
+{
+    char path[] = "/tmp/ps3recomp_w32attrXXXXXX";
+    const int fd = mkstemp(path);
+    CHECK(fd >= 0);
+    if (fd >= 0) close(fd);
+    CHECK(GetFileAttributesA(path) == FILE_ATTRIBUTE_NORMAL);
+    CHECK(GetFileAttributesA("/tmp") == FILE_ATTRIBUTE_DIRECTORY);
+    unlink(path);
+    CHECK(GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES);
+    CHECK(GetFileAttributesA(NULL) == INVALID_FILE_ATTRIBUTES);
+}
+
 int main(void)
 {
     test_interlocked();
+    test_file_attributes();
     test_threads_and_cs();
     test_thread_lifecycle();
     test_events();

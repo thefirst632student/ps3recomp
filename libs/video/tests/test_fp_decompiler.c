@@ -264,6 +264,42 @@ int main(void)
                    hs == rsx_fp_structural_hash(single, sizeof single, seed));
     }
 
+    /* Test 10: IFE with an else branch. The IFE's SRC1/SRC2 hold the else and
+     * end addresses in words; each side must land in its own HLSL block, not
+     * run one after the other (Crazy Taxi's uber shader drew the city black
+     * that way). @0 IFE(cc0.x > 0) else=@32 end=@48; @16 MOV r0,COL0;
+     * @32 MOV r0,COL1; @48 LIF r1,r0 END. */
+    {
+        u8 prog[64];
+        const u32 exec_gt_x = (1u << 20);   /* exec_if gr, cond swizzle x */
+        put_word(prog +  0, OPC(0x02));
+        put_word(prog +  4, exec_gt_x);
+        put_word(prog +  8, (1u << 31) | (32u >> 2));   /* branch, else */
+        put_word(prog + 12, 48u >> 2);                  /* end */
+        put_word(prog + 16, OPC(0x01) | OUTMASK_ALL | INSRC(1));
+        put_word(prog + 20, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 24, 0);
+        put_word(prog + 28, 0);
+        put_word(prog + 32, OPC(0x01) | OUTMASK_ALL | INSRC(2));
+        put_word(prog + 36, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 40, 0);
+        put_word(prog + 44, 0);
+        put_word(prog + 48, OPC(0x3C) | OUTMASK_ALL | OUTREG(1) | END);
+        put_word(prog + 52, T_TEMP | REG(0) | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 56, 0);
+        put_word(prog + 60, 0);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        const char* ife  = strstr(hlsl, "    if (cc0.x > 0.0) {\n");
+        const char* then = strstr(hlsl, "input.col0");
+        const char* els  = strstr(hlsl, "    } else {\n");
+        const char* alt  = strstr(hlsl, "input.col1");
+        const char* lif  = strstr(hlsl, "float4(1.0, ");
+        check_true("ife_order", ife && then && els && alt && lif &&
+                                ife < then && then < els && els < alt && alt < lif);
+        check_absent("ife_not_skipped", hlsl, "flow-control op skipped");
+        check_absent("lif_handled", hlsl, "unhandled FP opcode");
+    }
+
     printf("\n===========================================\n");
     printf("Results: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

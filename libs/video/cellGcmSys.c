@@ -720,6 +720,9 @@ void cellGcmSetWaitFlip(void)
     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
 }
 
+/* NID: 0xDF6476BD. Same wait semantics without libgcm's command-buffer space check. */
+void cellGcmSetWaitFlipUnsafe(void) { cellGcmSetWaitFlip(); }
+
 /* NID: 0x51C9D62B */
 void cellGcmResetFlipStatus(void)
 {
@@ -2884,6 +2887,14 @@ CellGcmReportData* cellGcmGetReportDataAddress(u32 index)
         return NULL;
     }
     return &s_report_data[index];
+}
+
+/* NID: 0x99D397AC. Return the value written by NV4097_GET_REPORT. */
+u32 cellGcmGetReport(u32 type, u32 index)
+{
+    (void)type;
+    if (index >= CELL_GCM_MAX_REPORT_COUNT) return 0;
+    return s_report_data[index].value;
 }
 
 /* NID: 0x97FC4B73 */

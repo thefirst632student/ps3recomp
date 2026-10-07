@@ -183,7 +183,6 @@ s32 sys_get_random_number(void* buf, u64 size);
 s32 console_putc(s32 ch);
 s32 console_getc(void);
 s32 console_write(const void* buf, u32 len);
-s32 _sys_spu_printf_initialize(u32 unk1, u32 unk2);
 
 /* ---------------------------------------------------------------------------
  * Process info

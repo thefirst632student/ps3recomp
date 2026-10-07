@@ -25,8 +25,7 @@ float rsx_rd_half_be(const u8* p)
     float o; memcpy(&o, &f, 4); return o;
 }
 
-static void rsx_fetch_attrib_impl(const rsx_state* st, int idx, u32 vi,
-                                  u32 base_index, float out[4])
+void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
 {
     /* A disabled attribute array feeds the CONSTANT vertex attribute register
      * (NV4097_SET_VERTEX_DATA4F_M), not zero -- same rule as glColor4f with
@@ -50,10 +49,7 @@ static void rsx_fetch_attrib_impl(const rsx_state* st, int idx, u32 vi,
      * attrib9 is DIVIDE -- without it attrib9 advanced every vertex and the
      * instanced cubes drew with garbage transforms (only the baseplate,
      * which isn't instanced, survived). */
-    /* Match rsx_vertex_element_index(): indexed base applies to ordinary
-     fetches in a 20-bit element domain. Frequency-divided attributes use
-     the raw vertex ID, so base_index intentionally does not participate. */
-    u32 ei = (vi + base_index) & 0x000FFFFFu;
+    u32 ei = vi;
     if (a->frequency > 1) {
         static int nofreq = -1;                 /* VP_NOFREQ: instancing kill-switch */
         if (nofreq < 0) nofreq = getenv("VP_NOFREQ") ? 1 : 0;
@@ -72,11 +68,7 @@ static void rsx_fetch_attrib_impl(const rsx_state* st, int idx, u32 vi,
      * 0x11104480, which is empty -- so every INDEXED mesh fetched zeros and
      * collapsed to the origin, while non-indexed geometry whose arrays lie
      * outside the shadowed pages drew fine. */
-    /* RSX adds BASE_OFFSET to the attribute byte offset and masks that sum
-     * to 28 bits before adding the per-element stride. */
-    u32 array_base = (st->vertex_data_base_offset +
-                      (a->offset & 0x7FFFFFFFu)) & 0x0FFFFFFFu;
-    u32 off = array_base + ei * a->stride;
+    u32 off = (a->offset & 0x7FFFFFFFu) + ei * a->stride;
     const u8* p = vm_base + ((a->offset & 0x80000000u)
         ? cellGcmResolveLocated(0, off)   /* MAIN:  IO offset table          */
         : cellGcmResolveLocated(1, off)); /* LOCAL: VRAM, never the IO table */
@@ -114,14 +106,4 @@ static void rsx_fetch_attrib_impl(const rsx_state* st, int idx, u32 vi,
         for (u32 k = 0; k < n; k++) out[k] = rsx_rd_bef(p + k * 4);
         break;
     }
-}
-
-void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4])
-{
-    rsx_fetch_attrib_impl(st, idx, vi, 0u, out);
-}
-
-void rsx_fetch_attrib_indexed(const rsx_state* st, int idx, u32 vi, float out[4])
-{
-    rsx_fetch_attrib_impl(st, idx, vi, st->vertex_data_base_index, out);
 }

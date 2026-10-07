@@ -336,6 +336,10 @@ void spu_trace_dump(uint32_t at) {
 }
 
 uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
+    return spu_interp_run_until(ctx, start_lsa, 0);
+}
+
+uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
     ctx->pc = start_lsa & 0x3FFFC;
     ctx->status = SPU_STATUS_RUNNING;
     uint64_t steps = 0;
@@ -371,7 +375,8 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
          * functions (image_id >= 0). image_id < 0 = pure interpretation: an
          * un-lifted image (e.g. a title's raw SPU jobs) must never rejoin
          * another image's functions that happen to share an LS address. */
-        if (ctx->image_id >= 0 && spu_lifted_lookup(ctx, ctx->pc)) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
+        /* ponytail: pc-only match; a recursive call through the same site would stop early -- compare r1 too if one shows up. */
+        if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa) || spu_lifted_lookup(ctx, ctx->pc))) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
         g_spu_interp_last_pc = ctx->pc;
         if (_g1>0) {
             int inr = (ctx->pc >= 0x26E80u && ctx->pc < 0x26F14u);

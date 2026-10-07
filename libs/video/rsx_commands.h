@@ -109,8 +109,6 @@ extern "C" {
 /* Vertex attributes */
 #define NV4097_SET_VERTEX_DATA_ARRAY_FORMAT     0x00001740
 #define NV4097_SET_VERTEX_DATA_ARRAY_OFFSET     0x00001680
-#define NV4097_SET_VERTEX_DATA_BASE_OFFSET      0x00001738
-#define NV4097_SET_VERTEX_DATA_BASE_INDEX       0x0000173C
 
 /* Texture */
 #define NV4097_SET_TEXTURE_OFFSET               0x00001A00
@@ -126,9 +124,6 @@ extern "C" {
  * Its low 20 bits are the row pitch of a linear texture and the rest is the
  * depth of a 3D one. */
 #define NV4097_SET_TEXTURE_CONTROL3             0x00001840
-/* Fragment input texcoord dimensionality override: 10 registers, one per
- * TEX0..TEX9. Bit 0 marks the input as a 2D coordinate on NV4097. */
-#define NV4097_SET_TEX_COORD_CONTROL            0x00000B40
 
 /* Vertex textures: four units of eight words at 0x0900 + unit*0x20. The block
  * is laid out like a fragment unit's with one substitution -- CONTROL3 sits
@@ -159,10 +154,9 @@ extern "C" {
 #define NV4097_SET_TRANSFORM_PROGRAM_START      0x00001EA0
 #define NV4097_SET_TRANSFORM_PROGRAM            0x00000B80
 #define NV4097_SET_TRANSFORM_CONSTANT_LOAD      0x00001EFC
-/* Vertex constants occupy exactly 32 method dwords (8 vec4s) beginning at
- * 0x1F00. SET_FREQUENCY_DIVIDER_OPERATION begins at 0x1FC0; extending the
- * constant window into that range corrupts constants with raster state.
- * Slot = transform_constant_load + (reg/4); lane = reg%4. */
+/* Vertex constants are written as up to 64 dwords (16 vec4s) per command,
+ * starting at 0x1F00. Slot = transform_constant_load + (reg/4); lane = reg%4.
+ * The hardware supports 512 vec4 constants total in the vertex register file. */
 #define NV4097_SET_TRANSFORM_CONSTANT           0x00001F00
 #define RSX_MAX_VERTEX_CONSTANTS                512
 
@@ -303,19 +297,9 @@ typedef struct rsx_state {
      * reads as the identity crossbar -- lets a backend resolve, upload and
      * cache both kinds through one path. */
     rsx_texture_state vertex_textures[RSX_MAX_VERTEX_TEXTURES];
-    /* NV4097_SET_TEX_COORD_CONTROL[0..9]. RPCS3 treats bit 0 as the
-     * per-fragment-program 2D texcoord override mask. Keep the raw words
-     * even before the HLSL path consumes them so titles cannot silently
-     * lose this piece of sampler/shader state. */
-    u32 tex_coord_control[10];
 
     /* Vertex attributes */
     rsx_vertex_attrib vertex_attribs[RSX_MAX_VERTEX_ATTRIBS];
-    /* NV4097_SET_VERTEX_DATA_BASE_OFFSET / BASE_INDEX. RSX adds the
-     * byte base to every array offset (then masks to 28 bits), while the
-     * element base applies only to indexed vertex IDs (20-bit domain). */
-    u32 vertex_data_base_offset;
-    u32 vertex_data_base_index;
     /* Constant ("current") vertex attributes -- NV4097_SET_VERTEX_DATA4F_M and
      * friends. When an attribute array is DISABLED, the hardware feeds every
      * vertex this register rather than zero, exactly like glColor4f with the

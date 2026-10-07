@@ -11,7 +11,6 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #ifdef _WIN32
 #include <io.h>
 #define PS3_ISATTY_STDERR() _isatty(_fileno(stderr))
@@ -44,37 +43,6 @@ static __inline int ps3_log_verbose(void)
         else   v = !PS3_ISATTY_STDERR();
     }
     return v;
-}
-
-
-/* High-frequency trace policy.
- *
- * Redirecting stderr is intentionally NOT enough to make hot per-event traces
- * full-rate.  Those call sites can execute tens of thousands of times per
- * second and contend on the process-wide FILE lock.  Default is sampled;
- * explicitly request full fidelity with PS3_HOTLOG=full (or 1), or silence hot
- * sites with PS3_HOTLOG=off (or 0).  Low-rate/error diagnostics are unaffected.
- */
-#ifdef __cplusplus
-static inline int ps3_log_hot_mode(void)
-#else
-static __inline int ps3_log_hot_mode(void)
-#endif
-{
-    enum { PS3_HOTLOG_OFF = 0, PS3_HOTLOG_THROTTLE = 1, PS3_HOTLOG_FULL = 2 };
-    static int mode = -1;
-    if (mode < 0) {
-        const char* e = getenv("PS3_HOTLOG");
-        if (!e || !*e || strcmp(e, "throttle") == 0 || strcmp(e, "sample") == 0)
-            mode = PS3_HOTLOG_THROTTLE;
-        else if (e[0] == '0' || strcmp(e, "off") == 0 || strcmp(e, "quiet") == 0)
-            mode = PS3_HOTLOG_OFF;
-        else if (e[0] == '1' || strcmp(e, "full") == 0 || strcmp(e, "verbose") == 0)
-            mode = PS3_HOTLOG_FULL;
-        else
-            mode = PS3_HOTLOG_THROTTLE;
-    }
-    return mode;
 }
 
 #endif /* PS3_LOG_H */

@@ -336,12 +336,8 @@ static const char* input_expr(u32 input_src)
         "input.tc4", "input.tc5", "input.tc6", "input.tc7" };
     switch (input_src) {
     case 0x0: return "input.position"; /* WPOS */
-    /* NV_fragment_program2 / RSX semantics: fragment input COLOR0/COLOR1
-     * are clamped to [0,1] when read. RPCS3 applies the same clamp at source
-     * load time. Leaving these interpolants unclamped makes additive/crossfade
-     * programs amplify interpolation overshoot across long transitions. */
-    case 0x1: return "saturate(input.col0)"; /* COL0 */
-    case 0x2: return "saturate(input.col1)"; /* COL1 */
+    case 0x1: return "input.col0";     /* COL0 */
+    case 0x2: return "input.col1";     /* COL1 */
     case 0x3: return "input.fog";      /* FOGC */
     default:
         if (input_src >= 0x4 && input_src <= 0xB) return tc[input_src - 0x4]; /* TC0..7 */
@@ -463,7 +459,24 @@ static int rsx_fp_decompile_internal(
     u32 off = 0;
     u32 constant_slot = 0;
 
+    /* Open IFE/LOOP/REP blocks: the byte offset each one's else branch starts
+     * at (0 = none) and where it ends. See the branch case below. */
+    enum { FP_MAX_BLOCKS = 32 };
+    u32 blk_else[FP_MAX_BLOCKS], blk_end[FP_MAX_BLOCKS];
+    int blk_loop[FP_MAX_BLOCKS];
+    int n_blk = 0, n_loop = 0, loops_open = 0;
+
     while (off + 16 <= max_bytes) {
+        /* Close blocks ending here, innermost first, then open an else. Ends
+         * before elses, as RPCS3's FragmentProgramDecompiler::Decompile does. */
+        while (n_blk > 0 && blk_end[n_blk - 1] == off) {
+            out_puts(&o, "    }\n");
+            loops_open -= blk_loop[--n_blk];
+        }
+        if (n_blk > 0 && blk_else[n_blk - 1] == off) {
+            out_puts(&o, "    } else {\n");
+            blk_else[n_blk - 1] = 0;
+        }
         u32 w0 = rsx_fp_read_word(ucode + off + 0);
         u32 w1 = rsx_fp_read_word(ucode + off + 4);
         u32 w2 = rsx_fp_read_word(ucode + off + 8);
@@ -539,8 +552,59 @@ static int rsx_fp_decompile_internal(
         if (has_k)
             constant_slot++;
 
+        /* Flow control: SRC1.branch set, and OPDEST's opcode field selects
+         * BRK/CAL/IFE/LOOP/REP/RET (RPCS3 RSXFragmentProgram.h, 0x40..0x45).
+         * IFE carries the else and end addresses in SRC1/SRC2 [0:30] as word
+         * offsets; LOOP/REP carry end/init/increment counters in SRC1 [2:9],
+         * [10:17], [19:26] and the end address in SRC2. The condition is the
+         * exec_if test on the first component of the condition swizzle.
+         * Skipping these ran both sides of every if/else: Crazy Taxi's uber
+         * material shader then overwrote its lit colour with a COLOR0 the
+         * vertex program never writes, and the whole city drew black. */
         if (is_branch) {
-            out_puts(&o, "    /* TODO: branch/flow-control op skipped */\n");
+            char cond[64], line[160];
+            if (is_uncond)
+                snprintf(cond, sizeof cond, "true");
+            else if (is_never)
+                snprintf(cond, sizeof cond, "false");
+            else
+                snprintf(cond, sizeof cond, "cc%u.%c %s 0.0", cc_read, cswz[0], cmp_op);
+            const u32 end_at = (w3 & 0x7FFFFFFFu) << 2;
+            switch (opcode) {
+            case 0x02: /* IFE */
+            case 0x03: /* LOOP */
+            case 0x04: /* REP */
+                if (n_blk == FP_MAX_BLOCKS || end_at <= off) {
+                    out_puts(&o, "    /* TODO: malformed flow-control op skipped */\n");
+                    break;
+                }
+                if (opcode == 0x02) {
+                    const u32 else_at = (w2 & 0x7FFFFFFFu) << 2;
+                    blk_else[n_blk] = else_at != end_at ? else_at : 0;
+                    blk_loop[n_blk] = 0;
+                    snprintf(line, sizeof line, "    if (%s) {\n", cond);
+                } else {
+                    const u32 end_n = (w2 >> 2) & 0xFFu, init = (w2 >> 10) & 0xFFu;
+                    const u32 inc = (w2 >> 19) & 0xFFu;
+                    blk_else[n_blk] = 0;
+                    blk_loop[n_blk] = 1;
+                    snprintf(line, sizeof line,
+                             "    if (%s) [loop] for (int _l%d = %u; _l%d < %u; _l%d += %u) {\n",
+                             cond, n_loop, init, n_loop, end_n, n_loop, inc ? inc : 1u);
+                    n_loop++;
+                    loops_open++;
+                }
+                blk_end[n_blk++] = end_at;
+                out_puts(&o, line);
+                break;
+            case 0x00: /* BRK */
+                snprintf(line, sizeof line, "    if (%s) break;\n", cond);
+                if (loops_open) out_puts(&o, line);
+                break;
+            default:   /* CAL / RET: no subroutine support yet */
+                out_puts(&o, "    /* TODO: CAL/RET flow-control op skipped */\n");
+                break;
+            }
             if (w0 & FP_END) break;
             continue;
         }
@@ -593,6 +657,12 @@ static int rsx_fp_decompile_internal(
         case OP_DP2: snprintf(rhs, sizeof(rhs), "dot((%s).xy, (%s).xy)", a, b); break;
         case OP_NRM: snprintf(rhs, sizeof(rhs), "float4(normalize((%s).xyz), 1.0)", a); break;
         case OP_LRP: snprintf(rhs, sizeof(rhs), "lerp((%s), (%s), (%s))", c, b, a); break;
+        /* Lighting coefficients: (1, y, y > 0 ? 2^w : 0, 1) (RPCS3
+         * FragmentProgramDecompiler, RSX_FP_OPCODE_LIF). */
+        case OP_LIF:
+            snprintf(rhs, sizeof(rhs),
+                     "float4(1.0, (%s).y, (%s).y > 0.0 ? exp2((%s).w) : 0.0, 1.0)", a, a, a);
+            break;
         /* Texture/branch fences: ordering hints with no result -- no-op. */
         case OP_FENCT: case OP_FENCB: rhs[0] = '\0'; handled = 0; break;
         case OP_SLT: snprintf(rhs, sizeof(rhs), "(float4)((%s) <  (%s))", a, b); break;
@@ -628,6 +698,18 @@ static int rsx_fp_decompile_internal(
                          "rsx_tex[%u].Sample(rsx_samp[%u], (%s).xy / (%s).w)",
                          tex_unit, tex_unit, a, a);
             break;
+        case OP_TXB: case OP_TXL: {
+            /* Biased / explicit-LOD sample; bias or LOD is src1.x (RPCS3
+             * TEXTURE_SAMPLE2D_BIAS / _LOD). GH3's fret buttons and fret lines
+             * are TXB: unhandled, they sampled nothing and output alpha 0. */
+            const int cube = (tex_cube_mask >> tex_unit) & 1u;
+            char tn[32];
+            snprintf(tn, sizeof(tn), tex_cube_mask ? "rsx_tex%u" : "rsx_tex[%u]", tex_unit);
+            snprintf(rhs, sizeof(rhs), "%s.%s(rsx_samp[%u], (%s).%s, (%s).x)", tn,
+                     opcode == OP_TXB ? "SampleBias" : "SampleLevel", tex_unit, a,
+                     cube ? "xyz" : "xy", b);
+            break;
+        }
         case OP_KIL:
             /* Fragment kill. Predicated by the same exec_if condition as any
              * other instruction (RPCS3 FragmentProgramDecompiler case
@@ -737,6 +819,9 @@ static int rsx_fp_decompile_internal(
 
         if (w0 & FP_END) break;
     }
+    /* A block whose end address is at or past END never saw it: close it. */
+    while (n_blk-- > 0)
+        out_puts(&o, "    }\n");
 
     /* Fragment color output register selection. The NV40 hardware picks the
      * output from the SHADER_CONTROL word's 32_BITS_EXPORTS bit, not from

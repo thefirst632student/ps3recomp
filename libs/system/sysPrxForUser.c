@@ -1142,13 +1142,6 @@ s32 console_write(const void* buf, u32 len)
     return CELL_OK;
 }
 
-s32 _sys_spu_printf_initialize(u32 unk1, u32 unk2)
-{
-    (void)unk1;
-    (void)unk2;
-    return CELL_OK;
-}
-
 /* ---------------------------------------------------------------------------
  * Process info
  * -----------------------------------------------------------------------*/

@@ -94,119 +94,32 @@ void ps3_vfs_ps3game_fallback(char* path, size_t cap)
     struct stat st;
     if (!path || !*path || stat(path, &st) == 0)
         return;
-
-    char norm[1024];
-    strncpy(norm, path, sizeof(norm) - 1);
-    norm[sizeof(norm) - 1] = '\0';
-    for (char* c = norm; *c; c++) if (*c == '\\') *c = '/';
-
-    /* Find /USRDIR in the path */
-    const char* u = strstr(norm, "/USRDIR");
-    if (!u) u = strstr(norm, "/usrdir");
-    if (!u) {
-        /* Non-USRDIR paths (e.g. PARAM.SFO, ICON0.PNG): drop /PS3_GAME/ if present */
-        char* p = strstr(norm, "/PS3_GAME/");
-        if (!p) p = strstr(norm, "/ps3_game/");
-        if (p) {
-            char alt[1024];
-            size_t head = (size_t)(p - norm);
-            if (head + 1 < sizeof(alt)) {
-                memcpy(alt, norm, head);
-                snprintf(alt + head, sizeof(alt) - head, "/%s", p + 10);
-                if (stat(alt, &st) == 0) {
-                    snprintf(path, cap, "%s", alt);
-                    return;
-                }
-            }
-        }
+    char* p = strstr(path, "/PS3_GAME/");
+    if (!p) {
+        /* The reverse: sys_fs flattens any "USRDIR/" path to <root>/USRDIR/...,
+         * which misses on a disc-layout tree. GH3's Bink movies (ATVI, INTRO --
+         * the attract loop) opened as <root>/USRDIR/DATA/MOVIES and failed. */
+        char* u = strstr(path, "/USRDIR/");
+        if (!u) u = strstr(path, "\\USRDIR\\");
+        if (!u) return;
+        char alt[1024];
+        size_t head = (size_t)(u - path);
+        if (head + 10 + strlen(u) >= sizeof alt) return;
+        memcpy(alt, path, head);
+        snprintf(alt + head, sizeof alt - head, "/PS3_GAME%s", u);
+        fs_normalize_sep(alt);
+        if (stat(alt, &st) == 0) snprintf(path, cap, "%s", alt);
         return;
     }
-
-    const char* sub = u + 7; /* "/subpath" or "" */
-
-    /* Extract root by stripping /PS3_GAME or /game/<dir> before /USRDIR */
-    char root[1024];
-    size_t prefix_len = (size_t)(u - norm);
-    if (prefix_len >= sizeof(root)) prefix_len = sizeof(root) - 1;
-    memcpy(root, norm, prefix_len);
-    root[prefix_len] = '\0';
-
-    char* pg = strstr(root, "/PS3_GAME");
-    if (!pg) pg = strstr(root, "/ps3_game");
-    if (pg && pg[9] == '\0') {
-        *pg = '\0';
-    } else {
-        char* g = strstr(root, "/game/");
-        if (!g) g = strstr(root, "/GAME/");
-        if (g) {
-            *g = '\0';
-        }
-    }
-
     char alt[1024];
-
-    /* 1. Try <root>/PS3_GAME/USRDIR<subpath> */
-    snprintf(alt, sizeof(alt), "%s/PS3_GAME/USRDIR%s", root, sub);
-    if (stat(alt, &st) == 0) {
-        snprintf(path, cap, "%s", alt);
+    size_t head = (size_t)(p - path);
+    if (head + 1 >= sizeof alt)
         return;
-    }
-
-    /* 2. Try <root>/game/BLJM60571/USRDIR<subpath> */
-    snprintf(alt, sizeof(alt), "%s/game/BLJM60571/USRDIR%s", root, sub);
-    if (stat(alt, &st) == 0) {
-        snprintf(path, cap, "%s", alt);
+    memcpy(alt, path, head);
+    snprintf(alt + head, sizeof alt - head, "/%s", p + 10);
+    if (stat(alt, &st) != 0)
         return;
-    }
-
-#ifdef _WIN32
-    {
-        char search[1024];
-        snprintf(search, sizeof(search), "%s/game/*", root);
-        struct __finddata64_t fd;
-        intptr_t h = _findfirst64(search, &fd);
-        if (h != -1) {
-            do {
-                if (fd.name[0] == '.') continue;
-                if (fd.attrib & _A_SUBDIR) {
-                    snprintf(alt, sizeof(alt), "%s/game/%s/USRDIR%s", root, fd.name, sub);
-                    if (stat(alt, &st) == 0) {
-                        _findclose(h);
-                        snprintf(path, cap, "%s", alt);
-                        return;
-                    }
-                }
-            } while (_findnext64(h, &fd) == 0);
-            _findclose(h);
-        }
-    }
-#else
-    {
-        char gpath[1024];
-        snprintf(gpath, sizeof(gpath), "%s/game", root);
-        DIR* d = opendir(gpath);
-        if (d) {
-            struct dirent* de;
-            while ((de = readdir(d)) != NULL) {
-                if (de->d_name[0] == '.') continue;
-                snprintf(alt, sizeof(alt), "%s/game/%s/USRDIR%s", root, de->d_name, sub);
-                if (stat(alt, &st) == 0) {
-                    closedir(d);
-                    snprintf(path, cap, "%s", alt);
-                    return;
-                }
-            }
-            closedir(d);
-        }
-    }
-#endif
-
-    /* 3. Try flattened <root>/USRDIR<subpath> */
-    snprintf(alt, sizeof(alt), "%s/USRDIR%s", root, sub);
-    if (stat(alt, &st) == 0) {
-        snprintf(path, cap, "%s", alt);
-        return;
-    }
+    snprintf(path, cap, "%s", alt);
 }
 
 void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_size)
@@ -372,7 +285,6 @@ int64_t sys_fs_open(ppu_context* ctx)
     char host_path[1024];
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
 
-#ifndef NDEBUG
     { extern char* getenv(const char*); if (getenv("FLOW_TITLEOPEN") && ps3_path && strstr(ps3_path, "Titles")) {
         size_t _l = strlen(ps3_path);
         fprintf(stderr, "[TITLEOPEN] path='%s' (len=%zu, ends_slash=%d) guest_lr=0x%08X\n",
@@ -396,7 +308,6 @@ int64_t sys_fs_open(ppu_context* ctx)
         }
     } }
 
-#endif
     /* NPDRM: a file that begins "NPD\0" is an EDAT, and on hardware the guest never
      * sees its ciphertext -- sceNpDrmIsAvailable primes the kernel and cellFsOpen
      * returns plaintext. Decrypt once into a cache file and open that instead, so
@@ -555,6 +466,12 @@ int64_t sys_fs_read(ppu_context* ctx)
 
     void* buf = vm_to_host(buf_addr);
     long pos_before = ftell(f->fp);
+    /* The VM commits pages on first user-mode touch; a read the CRT hands to
+     * the kernel (anything past its 4 KB buffer) into a still-reserved page
+     * fails instead, and fread comes back short. GH3's Bink reader saw that
+     * as a read error on every movie and never decoded a frame -- solid green
+     * video. ppu_fs.cpp fs_prefault is the same fix for cellFs. */
+    if (size) vm_commit(buf_addr, (uint32_t)size);
     size_t nread = fread(buf, 1, (size_t)size, f->fp);
 
     /* PS3_FSTRACE=<n>: every nth read, the fd and the file offset it came from.

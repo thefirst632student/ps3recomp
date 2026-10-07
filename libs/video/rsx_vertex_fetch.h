@@ -68,10 +68,6 @@ float rsx_rd_half_be(const u8* p);  /* 2-byte IEEE half -> float  */
  */
 void rsx_fetch_attrib(const rsx_state* st, int idx, u32 vi, float out[4]);
 
-/* Indexed-draw variant: applies NV4097_SET_VERTEX_DATA_BASE_INDEX with
- * the RSX 20-bit element-index semantics before ordinary vertex fetch. */
-void rsx_fetch_attrib_indexed(const rsx_state* st, int idx, u32 vi, float out[4]);
-
 #ifdef __cplusplus
 }
 #endif

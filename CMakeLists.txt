@@ -301,7 +301,14 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
         # the base ISA and Clang fuses by default there. A PPC fmadd is
         # spelt as one where the lifter means one.
         -ffp-contract=off
+        # Upstream latest: make Release/RelWithDebInfo optimization explicit;
+        # some clang-cl caches otherwise leave release builds at /Od.
+        $<$<CONFIG:Release,RelWithDebInfo>:-O2>
     )
+    # Upstream SSE4.1 fast path is valid on x86-64 only; keep ARM/macOS builds portable.
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+        target_compile_options(ps3recomp_runtime PRIVATE -msse4.1)
+    endif()
 elseif(MSVC)
     # Real cl.exe -- clang-cl reports its id as Clang and is handled above.
     #

@@ -180,6 +180,50 @@ static inline u128 spu_selb(u128 a, u128 b, u128 c) {
  *   sel & 0xC0 == 0xC0 -> 0xFF
  *   sel & 0xC0 == 0x80 -> 0x00
  *   otherwise           -> concat{a,b}[sel & 0x1F] */
+#if defined(__SSE4_1__)
+#include <smmintrin.h>
+/* pshufb version: one of the hottest SPU ops (~11% of GH3's FMOD mixer task
+ * as the byte loop). SPU byte P lives at host byte SPU_W(P), i.e. the bytes
+ * of each 32-bit word reversed, so swap into SPU order, select, swap back. */
+static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
+    const __m128i sw = _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12);
+    __m128i A, B, C; memcpy(&A, &a, 16); memcpy(&B, &b, 16); memcpy(&C, &c, 16);
+    A = _mm_shuffle_epi8(A, sw); B = _mm_shuffle_epi8(B, sw); C = _mm_shuffle_epi8(C, sw);
+    const __m128i idx = _mm_and_si128(C, _mm_set1_epi8(0x0F));
+    const __m128i fromb = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8(0x10)), _mm_set1_epi8(0x10));
+    __m128i r = _mm_blendv_epi8(_mm_shuffle_epi8(A, idx), _mm_shuffle_epi8(B, idx), fromb);
+    /* Special selectors: 10x -> 0x00, 110 -> 0xFF, 111 -> 0x80. */
+    const __m128i m80 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0x80)), _mm_set1_epi8((char)0x80));
+    const __m128i mC0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0xC0)), _mm_set1_epi8((char)0xC0));
+    const __m128i mE0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8((char)0xE0)), _mm_set1_epi8((char)0xE0));
+    const __m128i special = _mm_blendv_epi8(mC0, _mm_set1_epi8((char)0x80), mE0);
+    r = _mm_shuffle_epi8(_mm_blendv_epi8(r, special, m80), sw);
+    u128 out; memcpy(&out, &r, 16); return out;
+}
+/* The byte loop stays as the reference (tests/test_spu_shufb.c checks both). */
+static inline u128 spu_shufb_ref(u128 a, u128 b, u128 c) {
+    /* shufb is defined on SPU byte positions. Our u128 is host-native LE, so SPU
+     * byte P lives at _u8[SPU_W(P)]; map every access (the concat source, the
+     * control, and the result) through SPU_W so a control supplied as an immediate
+     * (ila/il) or an LS-loaded constant -- already in true SPU byte order -- is
+     * interpreted correctly. The cbd/chd/cwd/cdd generators below produce true
+     * SPU-byte-order selectors to match. */
+    uint8_t cat[32];
+    for (int j=0;j<16;j++) cat[j]    = a._u8[SPU_W(j)];   /* concat SPU byte j  = a SPU byte j */
+    for (int j=0;j<16;j++) cat[16+j] = b._u8[SPU_W(j)];   /* concat SPU byte 16+j = b SPU byte j */
+    u128 r;
+    for (int t=0;t<16;t++) {                              /* result SPU byte t */
+        uint8_t s = c._u8[SPU_W(t)];                      /* control SPU byte t */
+        uint8_t v;
+        if      ((s & 0xE0)==0xE0) v=0x80;
+        else if ((s & 0xC0)==0xC0) v=0xFF;
+        else if ((s & 0xC0)==0x80) v=0x00;
+        else                       v=cat[s & 0x1F];       /* concat SPU byte (s & 0x1F) */
+        r._u8[SPU_W(t)] = v;
+    }
+    return r;
+}
+#else
 static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
     /* shufb is defined on SPU byte positions. Our u128 is host-native LE, so SPU
      * byte P lives at _u8[SPU_W(P)]; map every access (the concat source, the
@@ -202,6 +246,8 @@ static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
     }
     return r;
 }
+#define spu_shufb_ref spu_shufb
+#endif
 
 /* ---- shift / rotate immediate (word lanes) ---- */
 static inline u128 spu_shli(u128 a, int sh)  { u128 r; sh&=0x3F; for(int i=0;i<4;i++) r._u32[i]=(sh>31)?0:(a._u32[i]<<sh); return r; }

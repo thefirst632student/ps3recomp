@@ -395,6 +395,24 @@ Gave the project its first CI and its second platform, in **v0.9.0**.
 - **Build failure report with a full log** (#89) — the kind of report that can
   actually be acted on.
 
+### gabryboy12-ai — [@gabryboy12-ai](https://github.com/gabryboy12-ai)
+- **Put Linux and macOS back on the build** (#191) — three recent commits had
+  reached for Win32 API that GCC/Clang builds do not have (a bare
+  `__declspec(thread)`, `LONG`/`InterlockedExchange`/`Sleep` outside `_WIN32`,
+  and `GetFileAttributesA` in two diagnostic gates), so master stopped building
+  off Windows. Fixed each the way the file already did it, and gave the compat
+  layer a POSIX `GetFileAttributesA` with a test.
+
+---
+
+## Third-party code
+
+- **ATRAC3 / ATRAC3plus decoders** (`third_party/at3_standalone`, used by
+  `cellAtrac`) — from [FFmpeg](https://ffmpeg.org/), as extracted to a
+  standalone library by the [PPSSPP](https://github.com/hrydgard/ppsspp) project
+  (`ext/at3_standalone`). LGPL-2.1-or-later, kept as a separable component; see
+  its `README.txt` and `COPYING.LGPLv2.1`.
+
 ---
 
 ## A note on AI-assisted contributions

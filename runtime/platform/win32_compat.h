@@ -797,6 +797,16 @@ void   _endthreadex(unsigned code);
 BOOL   GetExitCodeThread(HANDLE h, DWORD* code);
 DWORD  ResumeThread(HANDLE h);
 DWORD  SuspendThread(HANDLE h);
+
+/* GetFileAttributesA reports what stat() can: whether the path exists, and
+ * whether it is a directory -- all its callers here ask (diagnostic gates on a
+ * file's presence). Defined in win32_compat.c so this header keeps out of
+ * <sys/stat.h>, whose st_atime/st_mtime/st_ctime macros would rewrite fields
+ * of those names (CellFsStat's) in every file that includes it. */
+#define INVALID_FILE_ATTRIBUTES  ((DWORD)0xFFFFFFFFu)
+#define FILE_ATTRIBUTE_DIRECTORY 0x00000010u
+#define FILE_ATTRIBUTE_NORMAL    0x00000080u
+DWORD  GetFileAttributesA(const char* path);
 BOOL   SetThreadPriority(HANDLE h, int priority);
 int    GetThreadPriority(HANDLE h);
 DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask);
