@@ -901,6 +901,53 @@ static u32 s_fifo_getoff  = 0;
 static u32 s_last_ring_off = 0;   /* last offset the walker actually consumed */
 static u32 s_fifo_calloff = 0;
 
+/* v93: authoritative, low-overhead flip/FIFO telemetry.  These accessors
+ * expose the host flip queue itself instead of inferring frame boundaries
+ * from textures, clears, or draw patterns.  They are diagnostic only. */
+u32 cellGcm_flip_submit_count(void)
+{
+    return s_flip_submit_count;
+}
+
+u32 cellGcm_flip_queue_depth(void)
+{
+    u32 depth;
+    AcquireSRWLockShared(&s_flip_q_lock);
+    depth = (s_flip_q_tail + GCM_FLIP_QUEUE_CAP - s_flip_q_head) % GCM_FLIP_QUEUE_CAP;
+    ReleaseSRWLockShared(&s_flip_q_lock);
+    return depth;
+}
+
+u32 cellGcm_flip_head_boundary(void)
+{
+    u32 boundary = 0xFFFFFFFFu;
+    AcquireSRWLockShared(&s_flip_q_lock);
+    if (s_flip_q_head != s_flip_q_tail)
+        boundary = s_flip_q[s_flip_q_head].boundary;
+    ReleaseSRWLockShared(&s_flip_q_lock);
+    return boundary;
+}
+
+u32 cellGcm_flip_head_ready(void)
+{
+    u32 ready = 0;
+    AcquireSRWLockShared(&s_flip_q_lock);
+    if (s_flip_q_head != s_flip_q_tail)
+        ready = s_flip_q[s_flip_q_head].ready ? 1u : 0u;
+    ReleaseSRWLockShared(&s_flip_q_lock);
+    return ready;
+}
+
+u32 cellGcm_fifo_get_offset(void)
+{
+    return s_fifo_getoff;
+}
+
+u32 cellGcm_fifo_live_put(void)
+{
+    return vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+}
+
 /* ---------------------------------------------------------------------------
  * 2D transfer engines (FIFO subchannels != 0).
  *
