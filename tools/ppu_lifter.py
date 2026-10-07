@@ -470,6 +470,10 @@ def _last_line_is_terminator(body_lines: list[str]) -> bool:
         if s.endswith(":"):
             continue
         t = s.rstrip(";")
+        # Conditional branches fall through when not taken. Treating them as a
+        # terminator drops the fall-through tail of split functions.
+        if t.startswith("if ("):
+            return False
         return (t.startswith("return") or "goto " in t or
                 t.startswith("func_") or t.startswith("lv2_syscall") or
                 "{ func_" in t or t.startswith("{ g_trampoline_fn"))
@@ -809,11 +813,13 @@ class PPULifter:
                 if (_off, _m.group(1)) in _saved_slots:
                     _reg_snap.add(_reg)
                     func.body_lines[_i] = f"    ctx->gpr[{_reg}] = _cs_{_reg};"
-                elif not _has_stdu and _write_counts[_off] == 0 and not _off_escapes(_off):
+                elif (not _has_stdu and _write_counts[_off] == 0 and not _off_escapes(_off)
+                        and _reg not in _reg_snap and _mem_snap.setdefault(_reg, _off) == _off):
                     # pure tail-entry: the save lives in the original function, so
                     # this body never writes the slot; snapshot from memory at entry.
                     # (Skip slots whose address escaped to a callee -- see above.)
-                    _mem_snap.setdefault(_reg, _off)
+                    # One snapshot per register: a load of the same register from a
+                    # DIFFERENT slot is a spill reload and stays a real load.
                     func.body_lines[_i] = f"    ctx->gpr[{_reg}] = _cs_{_reg};"
         if _reg_snap or _mem_snap:
             _decls = [f"    uint64_t _cs_{_n} = ctx->gpr[{_n}];"
@@ -3397,7 +3403,53 @@ class PPULifter:
 # CLI
 # ---------------------------------------------------------------------------
 
-def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
+def _const_base_targets(win, rC, read_u32, text_lo, text_hi, bctr_addr):
+    """Landing sites of a table-less computed jump (see discover_jump_tables).
+
+    Walks `win` backward from the bctr: the newest definition of rC must be
+    `add rC,rC,rOff`, and every earlier one must fold to a constant
+    (`addis`/`addi` onto rC, ending at `li`/`lis`). Anything else defining rC
+    means this is not the idiom. Returns every address from the base through
+    the first unconditional terminator (at most 64), or None.
+    """
+    const, have_add = 0, False
+    for w in reversed(win):
+        ops = [x.strip() for x in w.operands.split(',')]
+        if w.mnemonic == 'mtctr' or not ops or ops[0] != rC:
+            continue
+        m = w.mnemonic
+        try:
+            if m == 'add' and not have_add and rC in ops[1:3]:
+                have_add = True
+            elif m in ('addis', 'addi') and have_add and len(ops) == 3 and ops[1] == rC:
+                const += int(ops[2], 0) << (16 if m == 'addis' else 0)
+            elif m in ('li', 'lis') and have_add and len(ops) == 2:
+                const += int(ops[1], 0) << (16 if m == 'lis' else 0)
+                break
+            else:
+                return None
+        except ValueError:
+            return None
+    else:
+        return None
+    base = const & 0xFFFFFFFF
+    # A real landing run sits right next to its dispatcher.
+    if not (text_lo <= base < text_hi) or base & 3 or abs(base - bctr_addr) > 0x1000:
+        return None
+    targets = []
+    for k in range(64):
+        a = base + 4 * k
+        v = read_u32(a)
+        if v is None:
+            return None
+        targets.append(a)
+        # blr, bctr, or `b` without link ends the run
+        if v in (0x4E800020, 0x4E800420) or (v >> 26 == 18 and not v & 1):
+            return targets
+    return None
+
+
+def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts=None):
     """Find `mtctr rX; bctr` switch dispatchers and read their jump tables.
 
     Handles both absolute tables (entry = case address) and base-relative
@@ -3406,6 +3458,16 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
     mtctr r0; bctr`). These computed `bctr` targets are invisible to static
     branch-target discovery, so without this the switch cases never get lifted
     and the runtime indirect-call lands on an unlifted address.
+
+    func_starts: optional sorted function entry addresses. When given, the
+    backward scans for the table base stop at the enclosing function's entry
+    instead of the nearest preceding `blr` -- an early-return `blr` between the
+    prologue and the dispatch otherwise hides a base register the prologue
+    loaded. (GH3 func_0074715C: `lwz r30,0x3B80(r2)` in the prologue, an early
+    `blr`, then `lwz r11,-0x7FA8(r30)` at the switch. Dropped, the switch lifted
+    to an indirect tail call; the case bodies then restored r25 from their OWN
+    entry snapshot, handing the caller a vtable pointer in r25 -- the "vtable
+    used as an object" that sent startup into an 82 MB memset.)
 
     Returns {dispatcher_addr: sorted [case target addrs]}.
     """
@@ -3422,17 +3484,64 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
             print(f"  [JT_DEBUG 0x{addr:X}] {msg}")
     tables = {}
     n = len(all_insns)
+    import bisect as _bisect
+    _addrs = [x.addr for x in all_insns] if func_starts else None
+    def _scan_lo(i):
+        """Index of the first instruction the base scans may look at."""
+        if func_starts:
+            k = _bisect.bisect_right(func_starts, all_insns[i].addr) - 1
+            # A "start" the previous instruction falls into is a split point,
+            # not an entry (GH3 0x0076571C: find_functions cut a 0x440-frame
+            # function in two, and the switch base register is loaded in the
+            # first half). Keep walking back to a start that follows a
+            # terminator.
+            while k > 0:
+                j = _bisect.bisect_left(_addrs, func_starts[k])
+                if j == 0 or all_insns[j - 1].mnemonic in ('b', 'blr', 'bctr', 'ba'):
+                    break
+                k -= 1
+            if k >= 0:
+                return _bisect.bisect_left(_addrs, func_starts[k])
+        for _k in range(i - 1, -1, -1):
+            if all_insns[_k].mnemonic == 'blr':
+                return _k + 1
+        return 0
+    def _live(lo, i):
+        """all_insns[lo:i] minus blocks that end in `blr` -- they return, so
+        they cannot flow into the dispatch at i. Scanning backward straight
+        through them latches an epilogue's `ld r30,0xA0(r1)` restore as the
+        "nearest definition" of the base register. A dead block starts at the
+        nearest branch target at or before its blr, or just after a branch."""
+        seg = all_insns[lo:i]
+        targets = set()
+        for x in seg:
+            if x.mnemonic.startswith('b') and x.mnemonic not in ('blr', 'bctr', 'bctrl', 'blrl'):
+                last = x.operands.split(',')[-1].strip()
+                if last.startswith('0x'):
+                    try:
+                        targets.add(int(last, 16))
+                    except ValueError:
+                        pass
+        def _ends_block(x):     # a branch that does not return to the next insn
+            return x.mnemonic.startswith('b') and x.mnemonic not in ('bl', 'bctrl', 'blrl')
+        out, k = [], len(seg) - 1
+        while k >= 0:
+            if seg[k].mnemonic == 'blr':
+                # back to the block's first insn: a branch target, or the insn
+                # right after another branch (fallthrough entry)
+                while k > 0 and seg[k].addr not in targets and not _ends_block(seg[k - 1]):
+                    k -= 1
+                k -= 1
+                continue
+            out.append(seg[k]); k -= 1
+        out.reverse()
+        return out
     for i in range(n):
         if all_insns[i].mnemonic != 'bctr':
             continue
         _dbg(all_insns[i].addr, "bctr found")
         win = all_insns[max(0, i - 30):i]
-        _clo = 0
-        for _k in range(i - 1, -1, -1):
-            if all_insns[_k].mnemonic == 'blr':
-                _clo = _k + 1
-                break
-        win_cand = all_insns[_clo:i]
+        win_cand = _live(_scan_lo(i), i)
         # the ctr source register (last mtctr before the bctr)
         rC = None
         for w in reversed(win):
@@ -3442,6 +3551,17 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
                 break
         _dbg(all_insns[i].addr, f"rC={rC}")
         if rC is None:
+            continue
+        # Constant-base computed jump, no table: `li rC,lo; addis rC,rC,hi;
+        # add rC,rC,rOff; mtctr rC; bctr` enters a straight-line run at
+        # base + rOff. The SDK memset does this to land in its unrolled
+        # `stdu` tail (Resistance func_000E6B80: base 0xE6BE4, 8 entries);
+        # unhandled, every short memset became an unresolved indirect call
+        # that stored nothing. The landing sites are every instruction from
+        # the base up to and including the run's terminator.
+        cb = _const_base_targets(win, rC, read_u32, text_lo, text_hi, all_insns[i].addr)
+        if cb:
+            tables[all_insns[i].addr] = cb
             continue
         # the indexed table load
         lwzx = next((w for w in reversed(win) if w.mnemonic == 'lwzx'), None)
@@ -3548,8 +3668,8 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
             # window the result is unchanged.
             for w in reversed(win_cand):
                 a = [x.strip() for x in w.operands.split(',')]
-                if not a or a[0] != cand:
-                    continue                    # not a definition of cand
+                if not a or a[0] != cand or w.mnemonic.startswith(('st', 'lf')):
+                    continue                    # not a GPR def: a store READS it; ppu_disasm names lfs/lfd's FPR target rN
                 if w.mnemonic in ('lwz', 'ld') and len(a) == 2 and '(r2)' in a[1]:
                     disp = mem_disp(a[1]); r_base = cand
                     base_is_ld = (w.mnemonic == 'ld')
@@ -3572,12 +3692,12 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
                     # widen to the enclosing function -- bounded by the nearest
                     # preceding blr, so the scan cannot drift into the previous
                     # function and latch a stale base.
-                    _scan, _resolved = win, False
+                    _scan, _resolved = _live(max(0, i - 30), i), False
                     for _pass in (0, 1):
                         for w2 in reversed(_scan):
                             b = [x.strip() for x in w2.operands.split(',')]
-                            if not b or b[0] != _mid:
-                                continue
+                            if not b or b[0] != _mid or w2.mnemonic.startswith(('st', 'lf')):
+                                continue        # stores (std r30,..(r1)) read, not define
                             if w2.mnemonic in ('lwz', 'ld') and len(b) == 2 and '(r2)' in b[1]:
                                 disp = mem_disp(b[1]); r_base = cand
                                 base_is_ld = (w2.mnemonic == 'ld')
@@ -3586,12 +3706,7 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
                             break
                         if _resolved or _pass:
                             break
-                        _lo = 0
-                        for _k in range(i - 1, -1, -1):
-                            if all_insns[_k].mnemonic == 'blr':
-                                _lo = _k + 1
-                                break
-                        _scan = all_insns[_lo:i]
+                        _scan = _live(_scan_lo(i), i)
                 break                           # first definition of cand wins/loses
             if disp is not None:
                 _bases.append((r_base, disp, base_is_ld, disp2, disp2_is_ld))
@@ -3600,6 +3715,7 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
             continue
         toc_candidates = toc if isinstance(toc, (list, tuple)) else [toc]
         best = []
+        best_key = (0, 0)
         for r_base, disp, base_is_ld, disp2, disp2_is_ld in _bases:
             # offset table iff an `add rC, *, r_base` combines the loaded value + base
             is_offset = any(
@@ -3720,8 +3836,15 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi):
                         # into unrelated data.
                         break
                 _dbg(all_insns[i].addr, f"decoded {len(targets)} targets")
-                if len(targets) > len(best):
-                    best = targets
+                # Rank by targets NEAR the bctr first: case blocks belong to the
+                # dispatcher's own function. A wrong TOC can decode a bogus
+                # table with more "valid" in-text targets megabytes away (MAG
+                # func 0xBB32A0: the main TOC read 7 garbage cases at 0x31398
+                # and beat the real 5-entry inline table right after the bctr).
+                _here = all_insns[i].addr
+                _key = (sum(1 for t in targets if abs(t - _here) < 0x40000), len(targets))
+                if _key > best_key:
+                    best, best_key = targets, _key
         if best:
             tables[all_insns[i].addr] = sorted(set(best))
     return tables
@@ -4174,7 +4297,8 @@ def main() -> None:
                     toc_candidates.append(t)
             if len(toc_candidates) > 1:
                 print(f"  TOC candidates: {', '.join(hex(t) for t in toc_candidates)}")
-            tables = discover_jump_tables(all_insns, _read_u32, toc_candidates, text_lo, text_hi)
+            tables = discover_jump_tables(all_insns, _read_u32, toc_candidates, text_lo, text_hi,
+                                          func_starts=sorted(s for s, _ in func_bounds))
             jt_dispatchers = tables
             for ts in tables.values():
                 jt_targets.update(ts)
