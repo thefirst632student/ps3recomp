@@ -5927,18 +5927,21 @@ static void render_frame(void)
         u32 epoch_first_change = 0xFFFFFFFFu;
         u32 logo_n = 0;
         float logo_amin = 2.0f, logo_amax = -1.0f;
-        /* v94: CPU-only snow geometry continuity probe.  Track the first
-         * vertex of draws that bind the actual 0x0368E500 snow texture.
-         * No GPU readback, waits, Present/DWM calls, or render-state changes. */
-        enum { SNOW94_MAX = 512 };
-        static float snow94_prev_x[SNOW94_MAX], snow94_prev_y[SNOW94_MAX];
-        static u32 snow94_prev_n = 0, snow94_prev_epoch = 0;
-        static u32 snow94_log_n = 0;
-        float snow94_x[SNOW94_MAX], snow94_y[SNOW94_MAX];
-        u32 snow94_n = 0, snow94_epoch = 0, snow94_state_mismatch = 0;
-        int snow94_have_ref = 0;
-        u32 snow94_ref_blend = 0, snow94_ref_fp = 0, snow94_ref_rt = 0;
-        u32 snow94_ref_addr = 0, snow94_ref_ctrl0 = 0, snow94_ref_filter = 0;
+        /* v95: authoritative snow batch/boundary probe.  Do not infer frame
+         * boundaries from texture identities beyond selecting the actual snow
+         * texture itself.  Record only batch structure and the real flip/FIFO
+         * boundary state; no GPU waits/readbacks or render-state changes. */
+        static u32 snow95_prev_n = 0, snow95_prev_epoch = 0;
+        static u32 snow95_prev_draws = 0;
+        static u32 snow95_prev_head = 0xFFFFFFFFu;
+        static u32 snow95_log_n = 0;
+        u32 snow95_n = 0, snow95_epoch = 0, snow95_runs = 0;
+        u32 snow95_first = 0xFFFFFFFFu, snow95_last = 0;
+        u32 snow95_run_len[4] = {0, 0, 0, 0};
+        u32 snow95_last_idx = 0xFFFFFFFFu, snow95_state_mismatch = 0;
+        int snow95_have_ref = 0;
+        u32 snow95_ref_blend = 0, snow95_ref_fp = 0, snow95_ref_rt = 0;
+        u32 snow95_ref_addr = 0, snow95_ref_ctrl0 = 0, snow95_ref_filter = 0;
 
         for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; ++_d) {
             const D3D12DrawRecord* _r = &s_d3d.draws[_d];
@@ -5956,36 +5959,39 @@ static void render_frame(void)
                 (_r->tex[0].raw == 0x0368E500u) ||
                 ((_r->tex[0].off & 0x0FFFFFFFu) == 0x0368E500u) ||
                 (_bf == 0x83u && _r->tex[0].w == 64u && _r->tex[0].h == 128u);
+            const int _snow95_tex =
+                (_r->tex[0].raw == 0x0368E500u) ||
+                ((_r->tex[0].off & 0x0FFFFFFFu) == 0x0368E500u);
             const int _snow_fp = ((_r->fp_addr & ~1u) == 0x01E08480u);
             const int _logo_fp = ((_r->fp_addr & ~1u) == 0x01BF9100u);
 
-            if (_snow_tex && !_r->is_clear && _r->is_vp &&
-                s_d3d.vp_vb_mapped && _r->vertex_count) {
-                const float* _sv = (const float*)((const char*)s_d3d.vp_vb_mapped
-                    + (u64)s_d3d.vp_parity * MAX_VERTICES * 256u
-                    + _r->vb_byte_offset);
-                if (snow94_n < SNOW94_MAX) {
-                    snow94_x[snow94_n] = _sv[0];
-                    snow94_y[snow94_n] = _sv[1];
-                    snow94_n++;
+            if (_snow95_tex && !_r->is_clear && _r->is_vp && _r->vertex_count) {
+                if (!snow95_have_ref) {
+                    snow95_have_ref = 1;
+                    snow95_epoch = _r->flip_ready_epoch;
+                    snow95_ref_blend = _r->blend_key;
+                    snow95_ref_fp = _r->fp_addr;
+                    snow95_ref_rt = _r->rt_off;
+                    snow95_ref_addr = _r->tex[0].address;
+                    snow95_ref_ctrl0 = _r->tex[0].control0;
+                    snow95_ref_filter = _r->tex[0].filter;
+                } else if (_r->flip_ready_epoch != snow95_epoch ||
+                           _r->blend_key != snow95_ref_blend ||
+                           _r->fp_addr != snow95_ref_fp || _r->rt_off != snow95_ref_rt ||
+                           _r->tex[0].address != snow95_ref_addr ||
+                           _r->tex[0].control0 != snow95_ref_ctrl0 ||
+                           _r->tex[0].filter != snow95_ref_filter) {
+                    snow95_state_mismatch++;
                 }
-                if (!snow94_have_ref) {
-                    snow94_have_ref = 1;
-                    snow94_epoch = _r->flip_ready_epoch;
-                    snow94_ref_blend = _r->blend_key;
-                    snow94_ref_fp = _r->fp_addr;
-                    snow94_ref_rt = _r->rt_off;
-                    snow94_ref_addr = _r->tex[0].address;
-                    snow94_ref_ctrl0 = _r->tex[0].control0;
-                    snow94_ref_filter = _r->tex[0].filter;
-                } else if (_r->flip_ready_epoch != snow94_epoch ||
-                           _r->blend_key != snow94_ref_blend ||
-                           _r->fp_addr != snow94_ref_fp || _r->rt_off != snow94_ref_rt ||
-                           _r->tex[0].address != snow94_ref_addr ||
-                           _r->tex[0].control0 != snow94_ref_ctrl0 ||
-                           _r->tex[0].filter != snow94_ref_filter) {
-                    snow94_state_mismatch++;
+                if (snow95_first == 0xFFFFFFFFu) snow95_first = _d;
+                snow95_last = _d;
+                if (snow95_last_idx == 0xFFFFFFFFu || _d != snow95_last_idx + 1u) {
+                    snow95_runs++;
                 }
+                if (snow95_runs >= 1u && snow95_runs <= 4u)
+                    snow95_run_len[snow95_runs - 1u]++;
+                snow95_last_idx = _d;
+                snow95_n++;
             }
 
             if ((_snow_tex || _snow_fp) && !_r->is_clear) {
@@ -6027,45 +6033,50 @@ static void render_frame(void)
             }
         }
 
-        if (snow94_n) {
-            u32 common = snow94_n < snow94_prev_n ? snow94_n : snow94_prev_n;
-            u32 jump32 = 0, jump128 = 0, same = 0;
-            float sum_l1 = 0.0f, max_l1 = 0.0f;
-            int comparable = snow94_prev_n && snow94_epoch == snow94_prev_epoch + 1u;
-            if (comparable) {
-                for (u32 _i = 0; _i < common; ++_i) {
-                    float dx = snow94_x[_i] - snow94_prev_x[_i];
-                    float dy = snow94_y[_i] - snow94_prev_y[_i];
-                    float ax = dx < 0.0f ? -dx : dx;
-                    float ay = dy < 0.0f ? -dy : dy;
-                    float l1 = ax + ay;
-                    sum_l1 += l1;
-                    if (l1 > max_l1) max_l1 = l1;
-                    if (l1 > 32.0f) jump32++;
-                    if (l1 > 128.0f) jump128++;
-                    if (dx == 0.0f && dy == 0.0f) same++;
-                }
+        if (snow95_n) {
+            extern unsigned cellGcm_flip_request_count(void);
+            extern unsigned cellGcm_flip_submit_count(void);
+            extern unsigned cellGcm_flip_queue_depth(void);
+            extern unsigned cellGcm_flip_head_boundary(void);
+            extern unsigned cellGcm_flip_head_ready(void);
+            extern unsigned cellGcm_fifo_get_offset(void);
+            extern unsigned cellGcm_fifo_live_put(void);
+            const u32 _fr95 = cellGcm_flip_request_count();
+            const u32 _fs95 = cellGcm_flip_submit_count();
+            const u32 _fq95 = cellGcm_flip_queue_depth();
+            const u32 _fh95 = cellGcm_flip_head_boundary();
+            const u32 _fhr95 = cellGcm_flip_head_ready();
+            const u32 _fg95 = cellGcm_fifo_get_offset();
+            const u32 _fp95 = cellGcm_fifo_live_put();
+            const int _cmp95 = snow95_prev_n && snow95_epoch == snow95_prev_epoch + 1u;
+            const u32 _dn95 = snow95_n > snow95_prev_n ?
+                snow95_n - snow95_prev_n : snow95_prev_n - snow95_n;
+            const int _head_wrap95 = (_fh95 != 0xFFFFFFFFu &&
+                snow95_prev_head != 0xFFFFFFFFu && _fh95 < snow95_prev_head);
+            const int _an95 = (_cmp95 && _dn95 > 8u) || snow95_runs != 1u ||
+                snow95_state_mismatch || _head_wrap95 || s_present_origin != 3;
+            const int _emit95 = snow95_log_n < 16u ||
+                ((s_d3d.frame_count % 120u) == 0u) || _an95;
+            if (_emit95) {
+                fprintf(stderr,
+                    "[SNOW95-BATCH] frame=%u origin=%d scanout=%d epoch=%u n=%u "
+                    "prevEpoch=%u prevN=%u dN=%u draws=%u prevDraws=%u runs=%u "
+                    "r=%u/%u/%u/%u first=%u last=%u stateMismatch=%u "
+                    "ready=%u submitted=%u qdepth=%u head=0x%08X prevHead=0x%08X "
+                    "headReady=%u headWrap=%d get=0x%08X put=0x%08X%c",
+                    (unsigned)s_d3d.frame_count, s_present_origin, s_present_this_frame,
+                    snow95_epoch, snow95_n, snow95_prev_epoch, snow95_prev_n, _dn95,
+                    (unsigned)s_d3d.draw_count, snow95_prev_draws, snow95_runs,
+                    snow95_run_len[0], snow95_run_len[1], snow95_run_len[2], snow95_run_len[3],
+                    snow95_first, snow95_last, snow95_state_mismatch,
+                    _fr95, _fs95, _fq95, _fh95, snow95_prev_head, _fhr95,
+                    _head_wrap95, _fg95, _fp95, 10);
+                snow95_log_n++;
             }
-            {
-                int anomaly = comparable && common >= 8u && jump128 * 4u > common;
-                int emit = snow94_log_n < 16u || ((s_d3d.frame_count % 120u) == 0u) ||
-                           anomaly || snow94_state_mismatch;
-                if (emit) {
-                    fprintf(stderr,
-                        "[SNOW94-MOTION] frame=%u epoch=%u n=%u prevEpoch=%u prevN=%u "
-                        "cmp=%d common=%u meanL1=%.3f maxL1=%.3f jump32=%u jump128=%u "
-                        "same=%u stateMismatch=%u%c",
-                        (unsigned)s_d3d.frame_count, snow94_epoch, snow94_n,
-                        snow94_prev_epoch, snow94_prev_n, comparable, common,
-                        common && comparable ? (double)(sum_l1 / (float)common) : 0.0,
-                        (double)max_l1, jump32, jump128, same, snow94_state_mismatch, 10);
-                    snow94_log_n++;
-                }
-            }
-            memcpy(snow94_prev_x, snow94_x, snow94_n * sizeof(float));
-            memcpy(snow94_prev_y, snow94_y, snow94_n * sizeof(float));
-            snow94_prev_n = snow94_n;
-            snow94_prev_epoch = snow94_epoch;
+            snow95_prev_n = snow95_n;
+            snow95_prev_epoch = snow95_epoch;
+            snow95_prev_draws = s_d3d.draw_count;
+            if (_fh95 != 0xFFFFFFFFu) snow95_prev_head = _fh95;
         }
 
         if (snow_n) {
