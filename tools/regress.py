@@ -335,6 +335,14 @@ def run_port(port, build=True, shots=False):
     # a gate run with it on would be measuring a different program.
     env.setdefault("PS3_VERBOSE", "0")
 
+    # `clean`: paths under the port dir removed before every run. State a run
+    # leaves behind -- a save -- sends the next one down another path: the
+    # Simpsons golden autosaves from an empty save dir, and over its own save
+    # it loads instead, which the diff reports as AutoSave2 LOST.
+    for rel in port.get("clean", []):
+        target = os.path.normpath(os.path.join(pdir, rel))
+        if os.path.commonpath([pdir, target]) == pdir and target != pdir:
+            shutil.rmtree(target, ignore_errors=True)
     expect = port.get("expect", "timeout")
     # A render run is far slower than the headless one -- a real backend, and for
     # Rubber Ducky an SPU interpreter costing ~16M instructions a frame. Its

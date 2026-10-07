@@ -158,6 +158,7 @@ render_env = { RSX_LIVE_DRAW = "1" }
 [[port]]
 name    = "simpsons"
 dir     = "../ps3games/simpsons"
+clean   = ["gamedata/dev_hdd0/home/00000001/savedata"]   # golden starts with no save
 cmd     = ["build-gate/simpsons", "vfs/PS3_GAME/USRDIR/EBOOT.elf"]
 timeout = 90
 expect  = "timeout"

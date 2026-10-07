@@ -60,6 +60,19 @@ def fnv1a64(b):
         h = ((h ^ x) * 1099511628211) & 0xFFFFFFFFFFFFFFFF
     return h
 
+def text_fp(b):
+    """Fingerprint of the executable PT_LOAD's file bytes -- what lands in local
+    store. A raw SPU whose program the PPU streams in by proxy DMA never hands
+    the runtime the ELF, only these bytes (runtime/spu/spu_raw.c)."""
+    phoff, phes, phn = be32(b, 0x1C), be16(b, 0x2A), be16(b, 0x2C)
+    for i in range(phn):
+        o = phoff + i * phes
+        if be32(b, o) == 1 and be32(b, o + 0x18) & 1:
+            off, fsz = be32(b, o + 4), be32(b, o + 0x10)
+            return fnv1a64(b[off:off + fsz])
+    return None
+
+
 def is_spu_elf(b):
     return (len(b) >= 0x34 and b[0:4] == b"\x7fELF"
             and b[4] == 1 and b[5] == 2  # ELFCLASS32, ELFDATA2MSB
@@ -124,6 +137,7 @@ def main():
         extra_funcs[k.strip()] = v.strip()
 
     imgs = []  # (img, prefix, fingerprint, e_entry)
+    text_fps = {}  # img -> executable-segment fingerprint
     for e in elfs:
         b = open(e, "rb").read()
         if not is_spu_elf(b):
@@ -152,6 +166,7 @@ def main():
         sz = img_size(b)
         e_entry = be32(b, 0x18)
         imgs.append((img, prefix, fnv1a64(b[:sz]), e_entry))
+        text_fps[img] = text_fp(b)
 
     if not imgs:
         sys.exit("[build_spu_workloads] no SPU images lifted")
@@ -187,6 +202,8 @@ def main():
     for i, (img, prefix, fp, ent) in enumerate(imgs, 1):
         L.append(f"    spu_begin_image({i}); {prefix}spu_recomp_register();")
         L.append(f"    spu_workload_register_img(0x{fp:016X}ULL, {prefix}spu_func_{ent:08X}, {i}, \"{img}\");")
+        if text_fps.get(img):  # same entry, keyed by the text segment (raw SPU proxy-DMA load)
+            L.append(f"    spu_workload_register_img(0x{text_fps[img]:016X}ULL, {prefix}spu_func_{ent:08X}, {i}, \"{img}.text\");")
     L.append("    spu_begin_image(0);")
     L.append("}")
     if args.constructor:
