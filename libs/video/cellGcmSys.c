@@ -2108,7 +2108,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
                 vm_write32(jmp_at, 0x20000000u | io_begin);   /* JUMP -> begin */
                 vm_write32(ctx + 0x8, begin);                 /* current = begin */
                 vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_begin);  /* put */
-                s_fifo_getoff = io_begin;                          /* get */
+                /* Preserve the consumer GET.  It must finish the old tail and
+                 * execute the JUMP we just planted before arriving at begin.
+                 * Rewinding GET here skips that ordering point while already
+                 * recorded draws remain live, so post-wrap commands can be
+                 * appended to the same host render batch (WA2 snow flicker). */
                 put = io_begin;
                 static int n = 0;
                 if (n++ < 8)
